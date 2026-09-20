@@ -1,45 +1,33 @@
 #!/bin/bash
 # Edge image: Caddy with DigitalOcean DNS plugin for wildcard TLS.
-# Builds Caddy from source with the DNS plugin compiled in.
-# Replaces do-ops/edge/Dockerfile.caddy (Docker build) with native LXC build.
+# Downloads pre-built Caddy binary with the DO DNS plugin from the download API.
+# Replaces do-ops/edge/Dockerfile.caddy with native LXC build.
 set -euo pipefail
 
-CADDY_VERSION="${CADDY_VERSION:-2.10.0}"
-
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
-  ca-certificates curl gnupg golang-go
+apt-get install -y -qq --no-install-recommends ca-certificates curl
 
-# Build Caddy with DO DNS plugin
-cd /tmp
-git clone --depth 1 --branch "v$CADDY_VERSION" https://github.com/caddyserver/caddy.git
-cd caddy/cmd/caddy
-
-# Add the DigitalOcean DNS plugin
-cat >> main.go <<'EOF'
-import _ "github.com/caddy-dns/digitalocean"
-EOF
-
-go mod edit -require github.com/caddy-dns/digitalocean@latest
-go mod tidy
-
-CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/caddy
+# Download Caddy with DO DNS plugin (pre-built, no Go toolchain needed)
+curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com%2Fcaddy-dns%2Fdigitalocean" \
+  -o /usr/local/bin/caddy
+chmod +x /usr/local/bin/caddy
 
 # Verify
 /usr/local/bin/caddy version
-/usr/local/bin/caddy list-modules | grep -q "dns.providers.digitalocean" \
+/usr/local/bin/caddy list-modules 2>&1 | grep -q "dns.providers.digitalocean" \
   && echo "digitalocean DNS plugin: OK" \
   || (echo "digitalocean DNS plugin: MISSING" >&2; exit 1)
 
 # Install supporting files
-mkdir -p /etc/caddy /etc/caddy/sites
+mkdir -p /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy
 
-# Create non-root user for Caddy
-useradd --system --shell /usr/sbin/nologin --home /var/lib/caddy caddy
-mkdir -p /var/lib/caddy /var/log/caddy
+# Create user for caddy
+useradd --system --shell /usr/sbin/nologin --home /var/lib/caddy caddy 2>/dev/null || true
 chown caddy:caddy /var/lib/caddy /var/log/caddy
 
-# Systemd service for Caddy inside LXC
+# Systemd service — Caddy needs the DO_API_TOKEN env var for DNS-01.
+# incus config set environment.* does NOT propagate to systemd services,
+# so we use an EnvironmentFile.
 cat > /etc/systemd/system/caddy.service <<'SVC'
 [Unit]
 Description=Caddy web server (opsavor edge)
@@ -48,6 +36,7 @@ After=network.target
 [Service]
 User=caddy
 Group=caddy
+EnvironmentFile=-/etc/default/edge
 ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
 ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 Restart=on-failure
@@ -60,8 +49,9 @@ SVC
 
 systemctl enable caddy
 
-# Cleanup build toolchain (keeps image small)
-apt-get purge -y golang-go
-apt-get autoremove -y
+# Placeholder env file — the actual token is injected at launch time
+echo "DO_API_TOKEN=CHANGE_ME" > /etc/default/edge
+
+# Cleanup
 apt-get clean
-rm -rf /var/lib/apt/lists/* /tmp/caddy /root/go
+rm -rf /var/lib/apt/lists/*

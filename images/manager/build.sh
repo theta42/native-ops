@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REF="${1:?usage: build.sh <ref>}"
-REPO_URL="${MANAGER_REPO:-https://git.opsavor.app/opsavor/management.git}"
+REPO_URL="${MANAGER_REPO:-ssh://gitea@git.theta42.com:2222/opsavor/management.git}"
 
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends ca-certificates curl git
@@ -18,12 +18,11 @@ npm ci --production 2>/dev/null || npm install --production
 
 # Create non-root user
 useradd --system --shell /usr/sbin/nologin manager
+mkdir -p /app/.data
 chown -R manager:manager /app
 
-# Incus API access: the manager needs the incus CLI + unix socket access
-apt-get install -y -qq incus-client
-
-# Systemd service
+# Systemd service — env vars must come from a file or Environment= lines,
+# NOT from incus config set (which only affects exec sessions).
 cat > /etc/systemd/system/manager.service <<'SVC'
 [Unit]
 Description=Opsavor fleet manager
@@ -36,7 +35,7 @@ WorkingDirectory=/app
 ExecStart=/usr/bin/node server.mjs
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=-/app/.data/env
+EnvironmentFile=-/etc/default/manager
 
 [Install]
 WantedBy=multi-user.target
