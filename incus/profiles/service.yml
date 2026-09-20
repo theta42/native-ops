@@ -1,0 +1,9 @@
+# Service profile: internal tooling (gitea, plane, bookstack).
+# Generous limits; individual containers override as needed.
+config:
+  limits.cpu: "2"
+  limits.memory: 2GB
+  security.nesting: "true"
+description: Internal services (gitea, plane, bookstack)
+devices: {}
+name: service

@@ -1,0 +1,41 @@
+# Incus initialization preseed for opsavor-node-1.
+# Non-interactive: sudo incus admin init --preseed < incus/preseed.yml
+#
+# ZFS pool on the root disk (160GB droplet). On larger nodes or dedicated
+# hardware with a second disk, point the source at that device instead.
+
+config:
+  core.https_address: "[::]:8443"
+  # Trust password is set interactively after init, not baked in.
+
+networks:
+  - name: incusbr0
+    type: bridge
+    config:
+      ipv4.address: 10.0.100.1/24
+      ipv4.nat: "true"
+      ipv6.address: none
+      dns.mode: managed
+
+storage_pools:
+  - name: default
+    driver: zfs
+    config:
+      source: rpool/incus
+
+profiles:
+  - name: default
+    config:
+      limits.cpu: "1"
+      limits.memory: 512MB
+    devices:
+      eth0:
+        name: eth0
+        network: incusbr0
+        type: nic
+      root:
+        path: /
+        pool: default
+        type: disk
+
+cluster: null

@@ -1,0 +1,67 @@
+#!/bin/bash
+# Provision a fresh Debian VPS as an Incus host.
+# Idempotent: safe to re-run. Installs Incus, initializes ZFS + bridge,
+# applies profiles from this repo, and locks down the host firewall.
+#
+# Usage: ./scripts/provision-host.sh
+# Requires: root, Debian 13, curl, git
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+echo "[provision] Installing Incus..."
+
+# Zabbly repository (official Incus stable)
+if [ ! -f /etc/apt/keyrings/zabbly.asc ]; then
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+fi
+
+if [ ! -f /etc/apt/sources.list.d/zabbly-incus-stable.list ]; then
+  . /etc/os-release
+  echo "deb [signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/stable ${VERSION_CODENAME} main" \
+    > /etc/apt/sources.list.d/zabbly-incus-stable.list
+fi
+
+apt-get update -qq
+apt-get install -y -qq incus incus-client incus-tools zfsutils-linux nftables ufw
+
+# Initialize Incus (idempotent — skips if already initialized)
+if ! incus info >/dev/null 2>&1; then
+  echo "[provision] Initializing Incus..."
+  incus admin init --preseed < "$REPO_DIR/incus/preseed.yml"
+else
+  echo "[provision] Incus already initialized, skipping init."
+fi
+
+# Apply profiles
+echo "[provision] Applying profiles..."
+for profile_file in "$REPO_DIR"/incus/profiles/*.yml; do
+  profile_name=$(basename "$profile_file" .yml)
+  if incus profile show "$profile_name" >/dev/null 2>&1; then
+    echo "  updating profile: $profile_name"
+    incus profile edit "$profile_name" < "$profile_file" || true
+  else
+    echo "  creating profile: $profile_name"
+    incus profile create "$profile_name" </dev/null 2>/dev/null || true
+    incus profile edit "$profile_name" < "$profile_file" || true
+  fi
+done
+
+# Firewall (host level)
+echo "[provision] Configuring firewall..."
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp comment "SSH"
+ufw allow 80/tcp comment "HTTP"
+ufw allow 443/tcp comment "HTTPS"
+# 8443 for Incus API (multi-host phase). Commented out for single-node.
+# ufw allow 8443/tcp comment "Incus API"
+ufw --force enable
+
+echo "[provision] Host provisioning complete."
+echo ""
+echo "Next steps:"
+echo "  1. Verify: incus info"
+echo "  2. Build base image: ./scripts/build-image.sh base"
+echo "  3. Launch edge + manager: ./scripts/deploy-manager.sh"

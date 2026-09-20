@@ -1,0 +1,16 @@
+# Edge profile: Caddy reverse proxy.
+# Needs public port access (80/443 proxied through host) and minimal memory.
+config:
+  limits.cpu: "1"
+  limits.memory: 256MB
+description: Caddy edge proxy with public port forwarding
+devices:
+  http:
+    connect: tcp:127.0.0.1:80
+    listen: tcp:0.0.0.0:80
+    type: proxy
+  https:
+    connect: tcp:127.0.0.1:443
+    listen: tcp:0.0.0.0:443
+    type: proxy
+name: edge

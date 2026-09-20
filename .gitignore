@@ -1,0 +1,17 @@
+# Secrets — never commit
+*.env
+.env
+*.pem
+*.key
+
+# Generated edge sites (written by manager)
+edge/sites/*.caddy
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.tar.gz
+*.tar
+/tmp/

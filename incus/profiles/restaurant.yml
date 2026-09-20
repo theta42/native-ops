@@ -1,0 +1,9 @@
+# Restaurant profile: per-site Next.js app.
+# Needs enough RAM for Next.js standalone + SQLite, nesting for node internals.
+config:
+  limits.cpu: "1"
+  limits.memory: 1GB
+  security.nesting: "true"
+description: Per-restaurant Next.js standalone + SQLite instance
+devices: {}
+name: restaurant

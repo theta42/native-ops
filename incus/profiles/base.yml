@@ -1,0 +1,18 @@
+# Base profile: applied to every container.
+# Least privilege: no nesting, no privileged mode, capped resources.
+config:
+  limits.cpu: "1"
+  limits.memory: 512MB
+  security.nesting: "false"
+  security.privileged: "false"
+description: Baseline resource limits for all containers
+devices:
+  eth0:
+    name: eth0
+    network: incusbr0
+    type: nic
+  root:
+    path: /
+    pool: default
+    type: disk
+name: base

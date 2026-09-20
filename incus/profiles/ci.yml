@@ -1,0 +1,14 @@
+# CI profile: Gitea Actions runner and image builds.
+# Needs nesting for running containers inside (image build pipeline).
+config:
+  limits.cpu: "2"
+  limits.memory: 4GB
+  security.nesting: "true"
+  security.privileged: "true"
+description: CI runner and image builder (needs privileged for Incus-in-Incus image builds)
+devices:
+  incus-socket:
+    path: /var/lib/incus/unix.socket
+    source: /var/lib/incus/unix.socket
+    type: disk
+name: ci
