@@ -59,6 +59,15 @@ ufw allow 443/tcp comment "HTTPS"
 # ufw allow 8443/tcp comment "Incus API"
 ufw --force enable
 
+# CRITICAL: UFW blocks Incus bridge traffic by default (drops DHCP and
+# forwarded packets). These rules allow containers on incusbr0 to reach
+# the host (DHCP, DNS) and be NATed out to the internet.
+ufw allow in on incusbr0 comment "Incus bridge input"
+ufw route allow in on incusbr0 comment "Incus bridge forward in"
+ufw route allow out on incusbr0 comment "Incus bridge forward out"
+ufw route allow in on incusbr0 out on eth0 comment "Incus bridge NAT out"
+ufw reload
+
 echo "[provision] Host provisioning complete."
 echo ""
 echo "Next steps:"
