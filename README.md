@@ -585,6 +585,76 @@ To change BookStack's public URL later: `incus exec bookstack -- vi
 entrypoint only ever WRITES that file on the volume's first boot, so this
 is the one supported way to change it afterward.
 
+#### Google Workspace SSO for BookStack
+
+BookStack's login method is one of `standard`, `ldap`, `saml2`, or `oidc` —
+exclusive, not layered (switching to `oidc` replaces the password login
+form entirely, it doesn't add a button alongside it). Google Workspace
+accounts authenticate via OIDC; Google itself, not BookStack, is what
+restricts sign-in to your Workspace domain.
+
+**1. Create the OAuth client in Google Cloud Console** (needs a Google
+Cloud project belonging to the Workspace org — a personal/consumer Google
+account can't create an "Internal" app):
+
+- APIs & Services → OAuth consent screen → User type: **Internal**. This
+  is the actual domain restriction — an Internal app can only be signed
+  into by accounts in your Workspace org; there is no equivalent setting
+  on the BookStack side (`app/Config/oidc.php` has no domain/`hd` option).
+- APIs & Services → Credentials → Create Credentials → OAuth client ID →
+  Application type: Web application.
+- Authorized redirect URI: `https://wiki.opsavor.work/oidc/callback`
+- Save; copy the Client ID and Client Secret.
+
+**2. Configure BookStack** — edit the persisted config, not the image:
+
+```sh
+incus exec bookstack -- vi /data/env
+```
+
+Add:
+
+```
+AUTH_METHOD=oidc
+OIDC_CLIENT_ID=<client id from Google Cloud>
+OIDC_CLIENT_SECRET=<client secret from Google Cloud>
+```
+
+(`OIDC_ISSUER`, `OIDC_ISSUER_DISCOVER`, `OIDC_NAME`, `OIDC_DISPLAY_NAME_CLAIMS`,
+and `OIDC_END_SESSION_ENDPOINT` all default to working Google values in
+`bookstack-entrypoint.sh` — only override them in `/data/env` if you need
+something different.) Then:
+
+```sh
+incus restart bookstack
+```
+
+**3. First real login and admin access.** A newly-provisioned OIDC user
+gets BookStack's default role, not Admin — there's no Workspace group
+sync configured (`OIDC_USER_TO_GROUPS` needs group claims in the ID token,
+which Google's default OIDC scopes don't include). After your first
+Google login creates your user row, promote it directly:
+
+```sh
+incus exec bookstack -- bash -c "cd /var/www/bookstack && php artisan tinker --execute=\"
+\\\$u = \\\\BookStack\\\\Users\\\\Models\\\\User::where('email','you@yourdomain.com')->first();
+\\\$u->attachRole(\\\\BookStack\\\\Users\\\\Models\\\\Role::where('system_name','admin')->first());
+\\\$u->save();
+\""
+```
+
+**Recovery**: switching `AUTH_METHOD` to `oidc` removes the password
+login form from `/login` entirely — there's no UI fallback if the OIDC
+setup is wrong. Recovery is always available directly on the host,
+regardless of what `/login` shows:
+`incus exec bookstack -- mysql --socket=/run/mysqld/mysqld.sock -D
+bookstack -e "..."` against the `users` table, or set `AUTH_METHOD=standard`
+back in `/data/env` and `incus restart bookstack` to get the password form
+back. The seeded default admin (`admin@admin.com`) is NOT left on its
+well-known default password on this instance — it was rotated the same
+way (`php artisan tinker`, `Hash::make()`) the first time this was set up;
+the new one is saved at `/root/.bookstack-admin-pw.tmp` on the host.
+
 ### Migrate a restaurant between nodes (Phase 2)
 
 ```sh

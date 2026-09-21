@@ -66,6 +66,14 @@ set -a
 . "$DATA_DIR/env"
 set +a
 
+# AUTH_METHOD/OIDC_* are OPERATOR-supplied, not auto-generated: unlike
+# APP_KEY/DB_PASSWORD above, nothing here writes them into $DATA_DIR/env
+# on first boot. To enable SSO, add AUTH_METHOD=oidc plus OIDC_CLIENT_ID
+# and OIDC_CLIENT_SECRET to $DATA_DIR/env directly (see README "Google
+# Workspace SSO for BookStack") and `incus restart bookstack` — this
+# script re-sources that file on every boot, so whatever's there just
+# flows through into the real .env below. Defaults below match a Google
+# Workspace OIDC setup; override any of them the same way if needed.
 cat > /var/www/bookstack/.env <<ENVEOF
 APP_ENV=production
 APP_DEBUG=false
@@ -75,6 +83,14 @@ DB_HOST=localhost
 DB_DATABASE=bookstack
 DB_USERNAME=bookstack
 DB_PASSWORD=${DB_PASSWORD}
+AUTH_METHOD=${AUTH_METHOD:-standard}
+OIDC_NAME=${OIDC_NAME:-Google Workspace}
+OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-null}
+OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-null}
+OIDC_ISSUER=${OIDC_ISSUER:-https://accounts.google.com}
+OIDC_ISSUER_DISCOVER=${OIDC_ISSUER_DISCOVER:-true}
+OIDC_DISPLAY_NAME_CLAIMS=${OIDC_DISPLAY_NAME_CLAIMS:-name}
+OIDC_END_SESSION_ENDPOINT=${OIDC_END_SESSION_ENDPOINT:-true}
 ENVEOF
 chown www-data:www-data /var/www/bookstack/.env
 chmod 640 /var/www/bookstack/.env
