@@ -44,10 +44,10 @@ TimeoutStartSec=60
 WantedBy=multi-user.target
 SVC
 
-# NOT enabled here on purpose — see images/bookstack/build.sh and
-# AGENTS.md "Manager -> Incus control plane" gotchas for why: incus launch
-# boots the container immediately, before deploy-gitea.sh attaches the
-# persistent volume. deploy-gitea.sh runs `systemctl enable --now gitea`
+# NOT enabled here on purpose — see AGENTS.md "Manager -> Incus control
+# plane" gotchas for why: incus launch boots the container immediately,
+# before deploy-gitea.sh attaches the persistent volume. deploy-gitea.sh
+# runs `systemctl enable --now gitea`
 # itself, after the volume is attached; the entrypoint also independently
 # refuses to do anything until `mountpoint -q /data` is true.
 

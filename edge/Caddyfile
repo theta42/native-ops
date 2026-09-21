@@ -40,13 +40,15 @@ plane.opsavor.app {
 	reverse_proxy plane:80
 }
 
-# BookStack documentation.
+# Docs — BookStack retired (its editing/admin UX was bad enough to ask for
+# a replacement, same reason wiki.opsavor.work moved off it); this domain
+# now serves the same Wiki.js instance so old links keep working.
 docs.opsavor.app {
 	tls {
 		dns digitalocean {env.DO_API_TOKEN}
 	}
 	import strip-forged-identity
-	reverse_proxy bookstack:80
+	reverse_proxy wikijs:3000
 }
 
 # Restaurant white-labels. Wildcard cert; per-site blocks come from

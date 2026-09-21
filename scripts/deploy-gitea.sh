@@ -11,9 +11,9 @@
 # `incus restart gitea` (see README "Google Workspace SSO for Gitea").
 #
 # gitea.service is NOT enabled in the image: this script starts it
-# explicitly, AFTER attaching the data volume, matching
-# deploy-bookstack.sh — see that script and native-ops AGENTS.md for the
-# launch race this avoids.
+# explicitly, AFTER attaching the data volume — see native-ops AGENTS.md
+# for the launch race this avoids (incus launch boots the container
+# before the persistent volume is attached).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"

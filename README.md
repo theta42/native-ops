@@ -47,7 +47,7 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │    ├─ manage.opsavor.app → manager.incus:3001         vX.Y.Z
   │    ├─ git.opsavor.app    → gitea.incus:3000    (published to local
   │    ├─ plane.opsavor.app  → plane.incus:3001      image store)
-  │    ├─ wiki.opsavor.app   → bookstack.incus:80
+  │    ├─ docs.opsavor.app   → wikijs.incus:3000
   │    ├─ *.opsavor.app (LE wildcard, DO DNS-01)
   │    └─ /opt/sites/<slug>.caddy (manager-written via incus file push)
   │
@@ -65,14 +65,16 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │    a systemd service, not a separate Incus instance; see "CI/CD" below)
   │
   ├─ plane         10.0.100.14   Project management
-  ├─ bookstack     10.0.100.15   Internal wiki/docs
+  ├─ wikijs        10.0.100.1x   Internal wiki/docs (wiki.opsavor.work +
+  │                                docs.opsavor.app)
   │
   ├─ rest-sicily   10.0.100.101  Next.js standalone + SQLite (:3000)
   ├─ rest-<slug>   10.0.100.1xx  one container per restaurant
   │                                ↑ replaced on update, never patched
   │
-  └─ ZFS volumes (custom, on pool `default`):
-       manager-data, gitea-data, plane-data, bookstack-data,
+  └─ custom storage volumes (on the `default` pool — `dir` driver, not ZFS;
+     see "Storage" below):
+       manager-data, gitea-data, plane-data, wikijs-data, wikijs-db-data,
        rest-sicily-data, rest-<slug>-data
 ```
 
@@ -118,7 +120,7 @@ Provisioned by `incus/preseed.yml` (non-interactive `incus admin init
 |---|---|---|---|---|---|
 | `base` | 1 | 512MB | no | no | inherited by everything |
 | `edge` | 1 | 256MB | no | no | Caddy + proxy devices for :80/:443 |
-| `service` | 2 | 2GB | yes | no | gitea, plane, bookstack |
+| `service` | 2 | 2GB | yes | no | gitea, plane, wikijs |
 | `ci` | 2 | 4GB | yes | **yes** | ct-runner (Incus-in-Incus for image builds) |
 | `restaurant` | 1 | 1GB | yes | no | per-site Next.js + SQLite |
 
@@ -131,7 +133,7 @@ privileged container on the host.
 | project | containers | purpose |
 |---|---|---|
 | `default` | edge, manager, gitea, ct-runner | core platform |
-| `services` | plane, bookstack | internal tooling |
+| `services` | plane, wikijs | internal tooling |
 | `tenants` | rest-sicily, rest-\<slug\> | customer workload isolation |
 
 Projects provide RBAC scoping: a leaked tenant token cannot read the
@@ -147,7 +149,7 @@ scoped to `default + tenants`.
 | `gitea` | default | base, service | 10.0.100.12 | 2C / 2GB | :3000 (via edge Caddy) |
 | `ct-runner` | default | base, ci | 10.0.100.13 | 2C / 4GB | outbound-only |
 | `plane` | services | base, service | 10.0.100.14 | 2C / 2GB | :3001 (via edge Caddy) |
-| `bookstack` | services | base, service | 10.0.100.15 | 1C / 1GB | :80 (via edge Caddy) |
+| `wikijs` | services | base, service | 10.0.100.1x | 1C / 1GB | :3000 (via edge Caddy) |
 | `rest-sicily` | tenants | base, restaurant | 10.0.100.101 | 1C / 1GB | :3000 (via edge Caddy) |
 | `rest-<slug>` | tenants | base, restaurant | 10.0.100.1xx | 1C / 1GB | :3000 (via edge Caddy) |
 
@@ -169,7 +171,6 @@ the local image store (`incus image list`).
 | `opsavor-restaurant` | `opsavor-base` | `images/restaurant/` — `npm ci && npm run build` + standalone | ct-runner |
 | `opsavor-gitea` | `opsavor-base` | `images/gitea/` — Gitea binary + config | ct-runner |
 | `opsavor-plane` | `opsavor-base` | `images/plane/` — Plane distribution | one-time manual |
-| `opsavor-bookstack` | `opsavor-base` | `images/bookstack/` — BookStack + PHP | one-time manual |
 
 ### Build pipeline (no Docker)
 
@@ -220,8 +221,10 @@ bridge DNS becomes cluster-aware automatically once OVN is configured.
 
 ## Storage
 
-**Pool**: ZFS on `rpool/incus` (the droplet's root disk). Datasets are
-snapshottable, compressible, and quota-able natively.
+**Pool**: `default`, `dir` driver, on the droplet's root disk — not ZFS.
+`zfs-dkms` fails to build against DO's custom kernel (see the day-1 gotcha
+in `9-20-2026_todo.md`); `dir` still supports per-volume snapshots (rsync-
+based, not copy-on-write), which is what `scripts/snapshot-all.sh` uses.
 
 **Custom volumes** (one per service that has persistent data):
 
@@ -229,25 +232,31 @@ snapshottable, compressible, and quota-able natively.
 |---|---|---|
 | `manager-data` | manager at `/app/.data` | fleet.db |
 | `gitea-data` | gitea at `/data` | repos, DB, config |
-| `plane-data` | plane at `/app/data` | uploads, attachments |
-| `bookstack-data` | bookstack at `/var/www/bookstack` | uploads, DB |
+| `plane-db-data` / `plane-minio-data` / `plane-mq-data` / `plane-redis-data` | plane's Postgres/MinIO/RabbitMQ/Valkey containers | Plane's own state |
+| `wikijs-data` / `wikijs-db-data` | wikijs / its Postgres container | pages, uploads, DB |
 | `rest-<slug>-data` | rest-\<slug\> at `/app/.data` | instance SQLite + bucket |
 
 **Snapshots and backups** (three layers, same model as do-ops):
 
 1. **In-app backups** — the restaurant app takes its own SQLite online
    backup + bucket tarball, same as before. Lives on the container's own
-   ZFS volume. Survives operator error, not volume loss.
-2. **ZFS snapshots** — `incus snapshot create <ct> snap0` before every
-   container replacement, plus a cron that snapshots all volumes daily.
-   `zfs send` to an off-site target for disaster recovery.
-   `incus config device override` to mount an old volume into a recovery
-   container for surgical restore.
-3. **Host backup** — the droplet's own DO backup (whole-disk). Restores
-   everything, but is all-or-nothing. Last resort.
+   data volume. Survives operator error, not volume loss.
+2. **Volume snapshots** — each `deploy-*.sh` takes a `pre-update-*`
+   snapshot of a service's own volume before replacing its container,
+   plus `scripts/snapshot-all.sh` snapshots every custom volume daily
+   (`daily-*`, pruned to the newest 14 — see "Storage" above; there is no
+   `zfs send` equivalent on the `dir` driver, so this is local-only, not
+   off-site). `incus storage volume snapshot restore` (or `incus config
+   device override` to mount an old snapshot into a recovery container)
+   for surgical restore.
+3. **Host backup** — the droplet's own DO backup (whole-disk, opt-in, not
+   currently confirmed enabled). Restores everything, but is
+   all-or-nothing. Last resort, and the only layer that's actually
+   off-box.
 
-Layer 1 is always on. Layer 2 is scripted (see `scripts/snapshot-all.sh`).
-Layer 3 is opt-in via DO console.
+Layer 1 is always on. Layer 2 is scripted and running (systemd timer
+`snapshot-all.timer`, daily at 06:00 UTC). Layer 3 needs a human to check
+the DO console.
 
 ## CI/CD
 
@@ -426,7 +435,7 @@ SSD, NYC1).
 | gitea | 2GB | 4.8 | |
 | ct-runner | 4GB | 8.8 | ⚠️ over limit when active |
 | plane | 2GB | 10.8 | |
-| bookstack | 1GB | 11.8 | |
+| wikijs | 1GB | 11.8 | |
 | rest-sicily | 1GB | 12.8 | |
 | each rest-\<slug\> | 1GB | +1 | |
 
@@ -611,126 +620,6 @@ incus list
 incus exec rest-acme -- journalctl -u restaurant --no-pager -n 40
 ```
 
-### Deploy BookStack (docs.opsavor.app)
-
-**As of the Wiki.js migration below, BookStack no longer serves
-`wiki.opsavor.work`** — it was replaced there because the editing/admin UX
-was unpleasant to work with day to day. It's still running and still routed
-at `docs.opsavor.app` (a separate, pre-existing use unrelated to the
-internal wiki), so the container and this section are kept as-is for that.
-
-BookStack is a singleton internal service (unlike restaurants, there's only
-ever one), so it isn't run through the manager — `scripts/deploy-bookstack.sh`
-is the whole story: build the image, create+attach its persistent data
-volume (MariaDB datadir, uploads, and the generated `APP_KEY`/DB password
-all live there — see `images/bookstack/bookstack-entrypoint.sh`), launch
-the container, health-gate.
-
-```sh
-# 1. One-time: point DNS at this host. opsavor.work is a separate domain
-#    from opsavor.app (added to the same DO account) — apex + wildcard, so
-#    a single Caddy wildcard cert can cover every opsavor.work subdomain,
-#    not just wiki.
-set -a; . /root/.env; set +a
-DOMAIN=opsavor.work ./providers/digitalocean/dns.sh <host-public-ip>
-
-# 2. Build + launch:
-./scripts/deploy-bookstack.sh
-
-# 3. Route wiki.opsavor.work at it and pick up the wildcard cert. The edge
-#    Caddyfile's `*.opsavor.work` block (see edge/Caddyfile) already has a
-#    host matcher for wiki.opsavor.work → bookstack:80; this just pushes
-#    that file to the running edge container (there was previously no
-#    script for this at all — the live Caddyfile was hand-pushed once and
-#    never kept in sync):
-./scripts/sync-edge-caddyfile.sh
-
-# First boot takes a couple of minutes (MariaDB datadir init + Laravel
-# migrations run inline before the app can serve). Watch it:
-incus exec bookstack -- journalctl -u bookstack --no-pager -n 40
-```
-
-Adding a THIRD opsavor.work subdomain later (say `status.opsavor.work`)
-needs no new DNS record (the wildcard already covers it) and no new
-top-level Caddy site block (that would issue it a separate, non-wildcard
-cert) — just another `@matcher`/`handle` pair inside the existing
-`*.opsavor.work` block, then `./scripts/sync-edge-caddyfile.sh`.
-
-To change BookStack's public URL later: `incus exec bookstack -- vi
-/data/env` (edit `APP_URL`), then `incus restart bookstack` — the
-entrypoint only ever WRITES that file on the volume's first boot, so this
-is the one supported way to change it afterward.
-
-#### Google Workspace SSO for BookStack
-
-BookStack's login method is one of `standard`, `ldap`, `saml2`, or `oidc` —
-exclusive, not layered (switching to `oidc` replaces the password login
-form entirely, it doesn't add a button alongside it). Google Workspace
-accounts authenticate via OIDC; Google itself, not BookStack, is what
-restricts sign-in to your Workspace domain.
-
-**1. Create the OAuth client in Google Cloud Console** (needs a Google
-Cloud project belonging to the Workspace org — a personal/consumer Google
-account can't create an "Internal" app):
-
-- APIs & Services → OAuth consent screen → User type: **Internal**. This
-  is the actual domain restriction — an Internal app can only be signed
-  into by accounts in your Workspace org; there is no equivalent setting
-  on the BookStack side (`app/Config/oidc.php` has no domain/`hd` option).
-- APIs & Services → Credentials → Create Credentials → OAuth client ID →
-  Application type: Web application.
-- Authorized redirect URI: `https://wiki.opsavor.work/oidc/callback`
-- Save; copy the Client ID and Client Secret.
-
-**2. Configure BookStack** — edit the persisted config, not the image:
-
-```sh
-incus exec bookstack -- vi /data/env
-```
-
-Add:
-
-```
-AUTH_METHOD=oidc
-OIDC_CLIENT_ID=<client id from Google Cloud>
-OIDC_CLIENT_SECRET=<client secret from Google Cloud>
-```
-
-(`OIDC_ISSUER`, `OIDC_ISSUER_DISCOVER`, `OIDC_NAME`, `OIDC_DISPLAY_NAME_CLAIMS`,
-and `OIDC_END_SESSION_ENDPOINT` all default to working Google values in
-`bookstack-entrypoint.sh` — only override them in `/data/env` if you need
-something different.) Then:
-
-```sh
-incus restart bookstack
-```
-
-**3. First real login and admin access.** A newly-provisioned OIDC user
-gets BookStack's default role, not Admin — there's no Workspace group
-sync configured (`OIDC_USER_TO_GROUPS` needs group claims in the ID token,
-which Google's default OIDC scopes don't include). After your first
-Google login creates your user row, promote it directly:
-
-```sh
-incus exec bookstack -- bash -c "cd /var/www/bookstack && php artisan tinker --execute=\"
-\\\$u = \\\\BookStack\\\\Users\\\\Models\\\\User::where('email','you@yourdomain.com')->first();
-\\\$u->attachRole(\\\\BookStack\\\\Users\\\\Models\\\\Role::where('system_name','admin')->first());
-\\\$u->save();
-\""
-```
-
-**Recovery**: switching `AUTH_METHOD` to `oidc` removes the password
-login form from `/login` entirely — there's no UI fallback if the OIDC
-setup is wrong. Recovery is always available directly on the host,
-regardless of what `/login` shows:
-`incus exec bookstack -- mysql --socket=/run/mysqld/mysqld.sock -D
-bookstack -e "..."` against the `users` table, or set `AUTH_METHOD=standard`
-back in `/data/env` and `incus restart bookstack` to get the password form
-back. The seeded default admin (`admin@admin.com`) is NOT left on its
-well-known default password on this instance — it was rotated the same
-way (`php artisan tinker`, `Hash::make()`) the first time this was set up;
-the new one is saved at `/root/.bookstack-admin-pw.tmp` on the host.
-
 ### Deploy Wiki.js (wiki.opsavor.work)
 
 Unlike BookStack/Gitea, Wiki.js is not built from source here — like Plane,
@@ -788,7 +677,7 @@ repos, and generated secrets all live there — see
 DNS or Caddy step needed — `git.opsavor.work` is already a host matcher in
 the existing `*.opsavor.work` wildcard block in `edge/Caddyfile`, so it's
 covered the moment `./scripts/sync-edge-caddyfile.sh` has been run once
-(see the BookStack section above if it hasn't).
+(see "Deploy Wiki.js" above if it hasn't).
 
 ```sh
 ./scripts/deploy-gitea.sh
@@ -1007,7 +896,7 @@ native-ops/
     profiles/
       base.yml                 ← least-privilege defaults (inherited by all)
       edge.yml                 ← Caddy + proxy devices for :80/:443
-      service.yml              ← internal tooling (gitea, plane, bookstack)
+      service.yml              ← internal tooling (gitea, plane, wikijs)
       ci.yml                   ← CI runner (privileged, Incus socket mounted)
       restaurant.yml           ← per-site Next.js + SQLite
   images/
@@ -1017,7 +906,6 @@ native-ops/
     restaurant/                ← restaurant app (build.sh)
     gitea/                     ← Gitea binary + config (build.sh)
     plane/                     ← Plane distribution (build.sh)
-    bookstack/                 ← BookStack + PHP (build.sh)
   edge/
     sites/                     ← per-site Caddy blocks (manager-written, gitignored)
   providers/
@@ -1069,6 +957,6 @@ generated). Image build scripts write nothing to this repo at runtime.
   ~1.5GB zstd). Do not Ctrl-C; the published image will be corrupt.
 
 - **Host out of RAM**: `incus list --format csv | awk -F, '{print $1}'`
-  while read; then stop non-essential services (plane, bookstack) or stop
+  while read; then stop non-essential services (plane, wikijs) or stop
   ct-runner if it is mid-build. Consider whether you have hit the Phase 2
   trigger.

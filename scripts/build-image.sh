@@ -2,10 +2,10 @@
 # Build and publish an Incus image.
 #
 # Usage: ./scripts/build-image.sh <image-name> [ref]
-#   image-name: base | edge | manager | restaurant | gitea | plane | bookstack
+#   image-name: base | edge | manager | restaurant | gitea | plane
 #   ref:        git tag/branch for app images
 #
-# For base/edge/gitea/plane/bookstack: builds from the image recipe in images/
+# For base/edge/gitea/plane: builds from the image recipe in images/
 # For manager/restaurant: builds FROM opsavor-base; images/<name>/build.sh
 # clones the app repo at <ref> itself (via $MANAGER_REPO / $RESTAURANT_REPO).
 #
@@ -78,7 +78,7 @@ if [ "$IMAGE_NAME" = "manager" ] || [ "$IMAGE_NAME" = "restaurant" ]; then
 fi
 
 # Run build (manager/restaurant clone their own app source inside build.sh;
-# base/edge/gitea/plane/bookstack ignore $2 entirely)
+# base/edge/gitea/plane ignore $2 entirely)
 if [ -n "$REF" ]; then
   incus exec "$TMP_CT" -- bash "/tmp/build/build.sh" "$REF"
 else

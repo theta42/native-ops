@@ -11,11 +11,11 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/data}"
 
 # Refuse to run until $DATA_DIR is genuinely the mounted custom volume —
-# see images/bookstack/bookstack-entrypoint.sh for why this matters
-# (an early start against the container's own ephemeral pre-mount
+# an early start against the container's own ephemeral pre-mount
 # directory left two generations of a stateful service fighting each
-# other there; cheaper to guard against it here too than find out the
-# same way twice).
+# other there (first hit building this same guard for another service's
+# entrypoint); cheaper to guard against it here too than find out the
+# same way twice.
 if ! mountpoint -q "$DATA_DIR" 2>/dev/null; then
   echo "[gitea] $DATA_DIR is not a mounted volume yet — waiting for it to be attached" >&2
   exit 1
