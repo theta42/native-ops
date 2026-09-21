@@ -48,6 +48,14 @@ for profile_file in "$REPO_DIR"/incus/profiles/*.yml; do
   fi
 done
 
+# OCI remotes for services run as pre-built images rather than built from
+# source (e.g. Plane — see scripts/deploy-plane.sh). docker.io is the
+# default registry; quay.io is needed too since some images (MinIO, as of
+# this writing) have moved off Docker Hub entirely.
+echo "[provision] Adding OCI remotes..."
+incus remote list --format csv | grep -q '^docker,' || incus remote add docker https://docker.io --protocol=oci
+incus remote list --format csv | grep -q '^quay,' || incus remote add quay https://quay.io --protocol=oci
+
 # Firewall (host level)
 echo "[provision] Configuring firewall..."
 ufw default deny incoming

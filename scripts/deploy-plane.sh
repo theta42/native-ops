@@ -16,6 +16,9 @@
 # Usage: ./scripts/deploy-plane.sh [domain]
 set -euo pipefail
 
+incus remote list --format csv | grep -q '^docker,' || incus remote add docker https://docker.io --protocol=oci
+incus remote list --format csv | grep -q '^quay,' || incus remote add quay https://quay.io --protocol=oci
+
 PLANE_DOMAIN="${1:-tickets.opsavor.work}"
 SECRETS="/root/.plane-secrets.env"
 
@@ -72,9 +75,12 @@ incus config device add plane-mq data disk pool=default source=plane-mq-data pat
 incus restart plane-mq
 
 echo "[deploy] MinIO..."
+# minio/minio on Docker Hub now returns "requested access to the resource
+# is denied" outright (MinIO moved off Docker Hub at some point) — quay.io
+# still serves it.
 new_volume plane-minio-data
 incus delete plane-minio --force 2>/dev/null || true
-incus launch docker:minio/minio plane-minio --profile base \
+incus launch quay:minio/minio plane-minio --profile base \
   --config environment.MINIO_ROOT_USER="$MINIO_ROOT_USER" \
   --config environment.MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
   --config environment.MINIO_VOLUMES=/export \
@@ -86,7 +92,7 @@ sleep 5
 
 echo "[deploy] ensuring the uploads bucket exists..."
 incus delete plane-mc-init --force 2>/dev/null || true
-incus launch docker:minio/mc plane-mc-init --profile base --ephemeral \
+incus launch quay:minio/mc plane-mc-init --profile base --ephemeral \
   --config environment.MC_HOST_local="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@plane-minio:9000"
 sleep 3
 incus exec plane-mc-init -- mc mb --ignore-existing local/uploads || true
