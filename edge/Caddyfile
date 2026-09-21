@@ -62,6 +62,16 @@ docs.opsavor.app {
 	reverse_proxy manager:3001
 }
 
+# opsavor.work apex: staff landing page (the wiki's "home" page, public,
+# no login required — see the Guests group's page rule in Wiki.js).
+opsavor.work {
+	tls {
+		dns digitalocean {env.DO_API_TOKEN}
+	}
+	import strip-forged-identity
+	reverse_proxy wikijs:3000
+}
+
 # opsavor.work: internal tooling domain (separate from the opsavor.app
 # customer-facing wildcard above). One wildcard cert covers everything
 # under it via host matchers in a SINGLE site block — a second site block
