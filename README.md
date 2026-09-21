@@ -421,8 +421,8 @@ API scripts (`do.sh`, `make-golden-image.sh`, `onboard-restaurant.sh`,
 | `add-edge-dns.sh` | kept (still DO DNS) |
 | `ensure-firewall.sh` | dropped — replaced by host nftables + Incus proxy |
 | `make-golden-image.sh` | `scripts/build-image.sh` — Incus build + publish |
-| `onboard-restaurant.sh` | (dropped — manager launches containers directly) |
-| `deploy-manager.sh` | `scripts/deploy-service.sh` — generic launch/swap/cleanup |
+| `onboard-restaurant.sh` | kept, fixed to match `lib/incus.mjs`'s onboarding flow (env path, volume attach order) — a manual/CLI fallback; the manager's `POST /api/restaurants` is the normal path |
+| `deploy-manager.sh` | kept under the same name — builds via `scripts/build-image.sh manager`, replaces the container, keeps its data volume |
 | `edge/cloud-init.yml` | `scripts/provision-host.sh` — host setup (not cloud-init) |
 | `restaurant/cloud-init.yml` | (dropped — containers boot from images, not cloud-init) |
 
@@ -432,86 +432,113 @@ names), `site.caddy.tmpl`, `Dockerfile.caddy` → `images/edge/build.sh`, and
 
 ### management
 
-The manager's orchestration layer changes. What was `lib/do.mjs` (DO API)
-becomes `lib/incus.mjs` (Incus API over Unix socket or HTTPS). What was
-`lib/fleet-ssh.mjs` (SSH into droplets) becomes `lib/incus-exec.mjs` (`incus
-exec` into containers). Everything else — `lib/db.mjs`, `lib/caddy.mjs`,
-`lib/sites.mjs`, `lib/ops-auth.mjs`, `lib/api-tokens.mjs`, the dashboard —
-carries over unchanged.
+**As actually implemented** (this section originally described a plan
+drafted before the migration; updated to match what shipped — see
+`management`'s own README and `lib/incus.mjs` for the full picture):
+
+`lib/do.mjs` and `lib/fleet-ssh.mjs` were both replaced by a single
+`lib/incus.mjs`, plus `lib/container-config.mjs` in place of
+`lib/userdata.mjs`. The manager has no Incus socket and no `incus` CLI
+inside its own container — it drives Incus by SSHing back to the host as a
+scoped, no-sudo `manager-ctl` user (incus-admin group) and running `incus`
+there, rather than over a mounted Unix socket or the HTTPS API (see
+"Manager -> Incus control plane" in `AGENTS.md` for why). `lib/db.mjs`,
+`lib/caddy.mjs` (rewritten to push Caddy site files to `edge` directly
+over that same SSH path instead of a shared bind mount), `lib/sites.mjs`,
+`lib/ops-auth.mjs`, `lib/api-tokens.mjs`, and the dashboard carry over.
 
 Key endpoint changes:
 
 | old behavior (droplet) | new behavior (container) |
 |---|---|
-| `POST /api/restaurants` → deploy droplet from snapshot | launch container from image |
-| `POST /:slug/resize` → power off → DO resize | stop → `incus config set limits.*` → start |
-| rolling update → SSH + rebuild | launch new + health-gate + swap |
-| `POST /:slug/backup` → instance self-backup | unchanged (in-app backup) + ZFS snapshot |
-| `DELETE /:slug` → destroy droplet | `incus delete <ct>` + delete volume |
+| `POST /api/restaurants` → deploy droplet from snapshot | launch container from the `opsavor-restaurant:latest` image fingerprint |
+| `POST /:slug/resize` → power off → DO resize → power on | live `incus config set limits.cpu/memory` — no stop/start at all |
+| rolling update → SSH in, `git fetch` + rebuild in place | delete + relaunch from a pre-built `opsavor-restaurant:<ref>` image, keeping the same data volume (containers are immutable — see AGENTS.md principle 1) |
+| `POST /:slug/backup` → instance self-backup | unchanged (in-app backup); no ZFS snapshot layer (host uses the `dir` storage backend, not ZFS — see gotcha) |
+| `DELETE /:slug` → destroy droplet | `incus delete <ct>` + delete its custom volume |
+| `GET/POST /:slug/droplet` | renamed `/:slug/container`; actions are `start\|stop\|restart` |
 
 ### restaurant
 
-The app itself does not change. The entrypoint, health check, compose
-file, and Dockerfile are retired. The app ships as an Incus image now:
-`images/restaurant/` holds the build script that produces the image.
-The `.env` is replaced by `incus config set environment.*` at launch.
-`AGENTS.md` / `README.md` deployment sections are updated to reference
-`native-ops` instead of `do-ops`.
+The app itself does not change. The entrypoint, health check, and
+Dockerfile logic move into `images/restaurant/build.sh` and a systemd
+unit — its `ExecStart` runs the same `scripts/docker-entrypoint.sh` the
+Docker image used (staged restore → migrate → optional owner seed →
+`server.js`), not `node server.js` directly. Per-instance config (owner
+email/password, service token, Ollama settings) lands in
+`/app/.data/env` on the container's data volume — NOT via `incus config
+set environment.*`, which (per the gotcha above) never reaches a
+systemd-managed process; the systemd unit reads it via
+`EnvironmentFile=-/app/.data/env`. `AGENTS.md` / `README.md` deployment
+sections reference `native-ops` instead of `do-ops`.
 
 ## Runbooks
 
 ### Provision the host (first time)
 
+As actually run against `opsavor-node-1` (a DO droplet — see the gotcha
+about `dir` storage: DO's custom kernel can't DKMS-build ZFS):
+
 ```sh
-# 1. Create the droplet (DO console or doctl):
-#    Ubuntu 24.04 → upgrade to Debian 13, or start with a Debian 13 image.
-#    4 vCPU / 8GB / 160GB / NYC1. Enable private networking.
+# 1. Create the droplet: 4 vCPU / 8GB / 160GB / Debian 13 / NYC1,
+#    private networking on.
 
-# 2. SSH in as root. Install Incus:
-apt update && apt install -y incus zfsutils-linux curl git
+# 2. SSH in as root. Clone this repo (SSH deploy key against
+#    git.theta42.com — git.opsavor.app doesn't exist yet, see "Build
+#    Gitea container" in the pilot todo):
+git clone ssh://gitea@git.theta42.com:2222/opsavor/native-ops.git /root/native-ops
 
-# 3. Initialize Incus from the preseed:
-git clone https://git.opsavor.app/opsavor/native-ops.git /root/native-ops
-incus admin init --preseed < /root/native-ops/incus/preseed.yml
+# 3. Provision: installs Incus from the Zabbly repo, runs
+#    `incus admin init --preseed` from incus/preseed.yml, applies
+#    incus/profiles/*.yml, locks down UFW (including the incusbr0 bridge
+#    rules — see gotcha), and creates the manager-ctl Incus control user.
+cd /root/native-ops && ./scripts/provision-host.sh
 
-# 4. Write /root/.env (chmod 600) with DO_API_TOKEN, MANAGER_TOKEN, etc.
+# 4. Write /root/.env (chmod 600) with MANAGER_TOKEN, OLLAMA_DEFAULT_TOKEN.
+#    (No DO_API_TOKEN needed here — that's a fleet-DB secret set from the
+#    manager dashboard once it's up, for the edge's DNS-01 challenge.)
 
-# 5. Build and launch core containers:
-./scripts/provision-host.sh          # installs profiles, projects, firewall
+# 5. Build and launch the core containers:
 ./scripts/build-image.sh base
 ./scripts/build-image.sh edge
-./scripts/build-image.sh manager
-./scripts/build-image.sh gitea
-./scripts/launch-core.sh             # edge, manager, gitea, ct-runner
+git clone ssh://gitea@git.theta42.com:2222/opsavor/management.git /root/management
+./scripts/deploy-manager.sh main
+incus launch opsavor-edge edge --profile base --profile edge
 
 # 6. Point DNS at the host:
-DO_API_TOKEN=… ./scripts/add-edge-dns.sh <node-1-public-ip>
+DO_API_TOKEN=… ./providers/digitalocean/dns.sh <node-1-public-ip>
 ```
 
 ### Deploy a manager update
 
 ```sh
-# Push the tag:
-git -C ../management tag manager-v1.2.3 && git push origin manager-v1.2.3
-
-# The ct-runner picks it up. To do it manually:
-./scripts/build-image.sh manager v1.2.3
-./scripts/deploy-service.sh manager opsavor-manager-v1.2.3
+git -C /root/management pull origin main   # or fetch a specific ref
+./scripts/deploy-manager.sh main           # or a tag/branch name
 ```
+
+Builds the image via `scripts/build-image.sh manager`, replaces the
+running container, and reattaches its existing data volume (fleet.db is
+never recreated). Not yet wired to Gitea Actions — see `.gitea/workflows/
+deploy.yml` in the management repo, which needs a runner registered on
+this host first.
 
 ### Onboard a restaurant
 
 ```sh
+# Build the image once per release tag (build-image.sh restaurant, needs
+# real memory — see the build-container-memory gotcha):
+./scripts/build-image.sh restaurant restaurant-v0.2.2
+
 # Via the manager UI: dashboard → Onboard card → slug, name, owner, size
 # Via the manager API:
 curl -X POST -H "Authorization: Bearer $MANAGER_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"slug":"acme","name":"Acme Pizza","ownerEmail":"...","ownerPassword":"..."}' \
+  -d '{"slug":"acme","name":"Acme Pizza","ownerEmail":"...","ownerPassword":"...","size":"medium"}' \
   https://manage.opsavor.app/api/restaurants
 
 # Watch provisioning:
-incus list --project tenants
-incus console rest-acme --show-log    # boot log
+incus list
+incus exec rest-acme -- journalctl -u restaurant --no-pager -n 40
 ```
 
 ### Migrate a restaurant between nodes (Phase 2)
