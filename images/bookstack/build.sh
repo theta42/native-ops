@@ -29,10 +29,26 @@ COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --no-interaction --optimize
 chown -R www-data:www-data /var/www/bookstack
 chmod -R 755 /var/www/bookstack/storage /var/www/bookstack/bootstrap/cache
 
-# nginx: BookStack's public/ as webroot, PHP handed off to php-fpm over the
-# versionless socket alias php-fpm's own package maintains
-# (/run/php/php-fpm.sock -> /etc/alternatives/php-fpm.sock -> the real
-# versioned socket) so this never needs updating across a PHP version bump.
+# The php-fpm binary, its systemd unit name, and the socket its pool config
+# actually listens on all stay version-qualified (php-fpm8.4,
+# php8.4-fpm.service, /run/php/php8.4-fpm.sock) — resolve them instead of
+# hardcoding a version that WILL go stale on the next Debian release.
+#
+# The package DOES maintain a versionless alias for the socket
+# (/run/php/php-fpm.sock -> /etc/alternatives/... -> the real one), but
+# that symlink is (re)created by the STOCK php8.4-fpm.service unit's own
+# startup — which we disable below in favor of supervisord running the
+# raw binary directly, so the alias never gets created and nginx would be
+# pointed at a dangling symlink ("No such file or directory"). Use the
+# real, version-resolved socket path directly instead.
+PHP_FPM_BIN="$(ls /usr/sbin/php-fpm[0-9]* | head -1)"
+PHP_FPM_UNIT="$(systemctl list-unit-files --no-legend 'php*-fpm.service' | awk '{print $1}' | head -1)"
+PHP_FPM_VER="${PHP_FPM_BIN##*php-fpm}"
+PHP_FPM_SOCK="/run/php/php${PHP_FPM_VER}-fpm.sock"
+
+# nginx: BookStack's public/ as webroot, PHP handed off to php-fpm over
+# that resolved socket. Quoted heredoc (nginx's own $uri/$query_string/etc
+# must NOT be bash-expanded); substitute the one real variable with sed.
 mkdir -p /etc/nginx/sites-available
 cat > /etc/nginx/sites-available/bookstack <<'NGX'
 server {
@@ -47,23 +63,17 @@ server {
     }
 
     location ~ \.php$ {
-        fastcgi_pass unix:/run/php/php-fpm.sock;
+        fastcgi_pass unix:__PHP_FPM_SOCK__;
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
         include fastcgi_params;
     }
 }
 NGX
+sed -i "s#__PHP_FPM_SOCK__#$PHP_FPM_SOCK#" /etc/nginx/sites-available/bookstack
 ln -sf /etc/nginx/sites-available/bookstack /etc/nginx/sites-enabled/bookstack
 rm -f /etc/nginx/sites-enabled/default
 
-# The php-fpm package aliases its SOCKET path (/run/php/php-fpm.sock) to a
-# stable name via update-alternatives, but not the binary or the systemd
-# unit name — those stay version-qualified (php-fpm8.4, php8.4-fpm.service).
-# Resolve them instead of hardcoding a version that WILL go stale on the
-# next Debian release.
-PHP_FPM_BIN="$(ls /usr/sbin/php-fpm[0-9]* | head -1)"
-PHP_FPM_UNIT="$(systemctl list-unit-files --no-legend 'php*-fpm.service' | awk '{print $1}' | head -1)"
 # supervisord manages php-fpm, mariadb, and nginx instead — the
 # mariadb-server, nginx, and php-fpm packages all auto-enable (and their
 # postinst scripts auto-START) their own systemd units. Left enabled, the
