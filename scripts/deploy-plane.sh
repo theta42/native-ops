@@ -197,6 +197,17 @@ fi
 # cpuset=lxc.payload.plane) — that looked exactly like a DB-connectivity
 # hang until `dmesg` on the host made the real cause obvious. Override the
 # limit at the instance level rather than raising it fleet-wide.
+#
+# CORS_ALLOWED_ORIGINS also matters for a reason that has nothing to do
+# with CORS itself: Plane's settings.py (plane/settings/common.py) derives
+# CSRF_TRUSTED_ORIGINS directly from this var, and leaves it an empty list
+# when it's unset. Every GET still works fine without it, but any form
+# submit (e.g. the god-mode "create instance admin" setup wizard) gets
+# silently rejected by Django's CSRF check with no entry in the request
+# log at all, since CSRF middleware runs ahead of Plane's own
+# request-logging middleware. It also gates whether session/CSRF cookies
+# get `Secure` at all (`secure_origins` in the same file), so this is the
+# correct setting for an HTTPS deployment regardless.
 incus delete plane --force 2>/dev/null || true
 incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config limits.memory=3GB \
@@ -212,6 +223,7 @@ incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.AWS_S3_ENDPOINT_URL="http://${PLANE_MINIO_IP}:9000" \
   --config environment.USE_MINIO=1 \
   --config environment.SITE_ADDRESS=:80 \
+  --config environment.CORS_ALLOWED_ORIGINS="https://${PLANE_DOMAIN}" \
   --config environment.SECRET_KEY="$SECRET_KEY" \
   --config environment.LIVE_SERVER_SECRET_KEY="$LIVE_SERVER_SECRET_KEY" \
   "${GOOGLE_OAUTH_ARGS[@]}"
