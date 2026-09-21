@@ -117,29 +117,34 @@ fi
 # present in $SECRETS (see above); idempotent (checks first, then adds or
 # updates rather than erroring on a duplicate name).
 #
-# `--provider google` (Gitea's built-in Google shortcut) reliably failed
-# with "Command error: auth source is not activated" in 1.27.3, for
-# reasons not tracked down further — generic OpenID Connect with Google's
-# well-known discovery URL works and is arguably more robust anyway (same
-# approach bookstack's OIDC setup uses), so use that instead.
+# `--provider google` doesn't exist — checked Gitea's actual source
+# (services/auth/source/oauth2/providers_simple.go): its Google provider
+# is registered internally as "gplus" ("named gplus due to legacy gplus
+# -> google migration (Google killed Google+). This ensures old
+# connections still work" — that comment is the whole explanation),
+# which is why --provider google errored "auth source is not activated"
+# (no such registered provider). --name (the display name AND the
+# /user/oauth2/<name>/callback URL slug) is independent of --provider and
+# can still be "google" — only the internal --provider identifier is
+# "gplus".
 #
-# --scopes matters: with none specified, Gitea only requested the bare
-# `openid` scope, so Google's response carried no email or name/profile
-# data at all — auto-registration then failed outright ("OAuth2 Provider
-# google returned missing fields: email,nickname"). `email` and `profile`
-# are both required for it to have anything to create an account from.
+# Tried generic `--provider openidConnect` with Google's discovery URL
+# first, which DOES authenticate, but Gitea's generic OIDC handler always
+# needs a `nickname` claim to auto-create an account, and Google's
+# userinfo response never includes one under any scope — auto-
+# registration failed outright regardless of --scopes ("OAuth2 Provider
+# google returned missing fields: email,nickname"). The dedicated
+# "gplus" provider is Google-specific code that doesn't need one.
 if [ -n "${GITEA_OAUTH_CLIENT_ID:-}" ]; then
   EXISTING_ID="$(runuser -u git -- "$GITEA" admin auth list --config "$CONF" 2>/dev/null | awk '$2=="google"{print $1}')"
   if [ -z "$EXISTING_ID" ]; then
     echo "[gitea] configuring Google OAuth2 login..."
     runuser -u git -- "$GITEA" admin auth add-oauth --config "$CONF" \
-      --name google --provider openidConnect \
-      --auto-discover-url https://accounts.google.com/.well-known/openid-configuration \
-      --scopes openid --scopes email --scopes profile \
+      --name google --provider gplus \
       --key "$GITEA_OAUTH_CLIENT_ID" --secret "$GITEA_OAUTH_CLIENT_SECRET"
   else
     runuser -u git -- "$GITEA" admin auth update-oauth --config "$CONF" --id "$EXISTING_ID" \
-      --scopes openid --scopes email --scopes profile \
+      --provider gplus \
       --key "$GITEA_OAUTH_CLIENT_ID" --secret "$GITEA_OAUTH_CLIENT_SECRET"
   fi
 fi
