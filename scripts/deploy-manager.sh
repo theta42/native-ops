@@ -40,12 +40,16 @@ incus launch "$FP" manager --profile base --profile service
 
 sleep 3
 
-# Attach volumes BEFORE writing anything under them or restarting — a write
-# to /app/.data before the device is attached lands on the container's
-# ephemeral rootfs copy and is shadowed (lost) the moment the device mounts.
+# Attach the data volume BEFORE writing anything under it or restarting —
+# a write to /app/.data before the device is attached lands on the
+# container's ephemeral rootfs copy and is shadowed (lost) the moment the
+# device mounts. (No `sites` device: the manager pushes Caddy site files
+# directly into the edge container over SSH — see management's
+# lib/caddy.mjs — rather than through a shared bind mount. An earlier
+# version of this attached one at /sites for the manager to write into
+# directly, but that directory is root-owned on the host and unwritable by
+# the manager's own non-root process user.)
 incus config device add manager data disk source="$VOLUME_PATH" path=/app/.data
-incus config device add manager sites disk source="$REPO_DIR/edge/sites" path=/sites
-mkdir -p "$REPO_DIR/edge/sites"
 
 # Push this manager's dedicated Incus control key. The manager process has
 # no Incus socket or CLI of its own inside the container; it SSHes back to
@@ -71,7 +75,6 @@ MANAGER_TOKEN=${MANAGER_TOKEN}
 OLLAMA_DEFAULT_TOKEN=${OLLAMA_DEFAULT_TOKEN:-}
 OLLAMA_DEFAULT_MODEL=${OLLAMA_DEFAULT_MODEL:-gemma4:31b-cloud}
 FLEET_DB=/app/.data/fleet.db
-CADDY_SITES_DIR=/sites
 INCUS_SSH_HOST=10.0.100.1
 INCUS_SSH_USER=manager-ctl
 INCUS_SSH_KEY=/home/manager/.ssh/incus_ctl
