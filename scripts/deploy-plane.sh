@@ -143,6 +143,31 @@ incus exec plane-mc-init -- mc mb --ignore-existing local/uploads
 incus delete plane-mc-init --force 2>/dev/null || true
 
 echo "[deploy] Plane (all-in-one)..."
+# Use IPs, not hostnames, for the infra services below. This image's
+# Python (musl-based) does a plain dual-stack getaddrinfo for
+# DATABASE_URL/REDIS_URL/etc, and incusbr0's dnsmasq — since the network
+# has no IPv6 range configured at all (ipv6.address: none) — doesn't
+# answer AAAA queries with a fast empty response, it just never answers
+# them, so the AAAA half of that dual-stack lookup hangs forever and the
+# API/worker/beat processes sit at "wait_for_db" indefinitely (confirmed
+# live: forcing socket.AF_INET resolves plane-db instantly; the default
+# AF_UNSPEC call never returns). Not something to fix by changing the
+# shared incusbr0 network's DNS behavior — every other container on it
+# depends on that too. Resolving these four to their current IP at
+# deploy time sidesteps it entirely for Plane's own connection strings.
+get_ip() {
+  incus list "$1" --format json | python3 -c "
+import json, sys
+rows = json.load(sys.stdin)
+addrs = rows[0].get('state', {}).get('network', {}).get('eth0', {}).get('addresses', [])
+print(next(a['address'] for a in addrs if a['family'] == 'inet'))
+"
+}
+PLANE_DB_IP="$(get_ip plane-db)"
+PLANE_REDIS_IP="$(get_ip plane-redis)"
+PLANE_MQ_IP="$(get_ip plane-mq)"
+PLANE_MINIO_IP="$(get_ip plane-minio)"
+
 # No `latest` tag exists for this image ("manifest unknown") — pin an
 # actual release tag instead.
 #
@@ -165,14 +190,14 @@ fi
 incus delete plane --force 2>/dev/null || true
 incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.DOMAIN_NAME="$PLANE_DOMAIN" \
-  --config environment.DATABASE_URL="postgresql://plane:${POSTGRES_PASSWORD}@plane-db:5432/plane" \
-  --config environment.REDIS_URL="redis://plane-redis:6379/" \
-  --config environment.AMQP_URL="amqp://plane:${RABBITMQ_PASSWORD}@plane-mq:5672/plane" \
+  --config environment.DATABASE_URL="postgresql://plane:${POSTGRES_PASSWORD}@${PLANE_DB_IP}:5432/plane" \
+  --config environment.REDIS_URL="redis://${PLANE_REDIS_IP}:6379/" \
+  --config environment.AMQP_URL="amqp://plane:${RABBITMQ_PASSWORD}@${PLANE_MQ_IP}:5672/plane" \
   --config environment.AWS_REGION=us-east-1 \
   --config environment.AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
   --config environment.AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
   --config environment.AWS_S3_BUCKET_NAME=uploads \
-  --config environment.AWS_S3_ENDPOINT_URL=http://plane-minio:9000 \
+  --config environment.AWS_S3_ENDPOINT_URL="http://${PLANE_MINIO_IP}:9000" \
   --config environment.USE_MINIO=1 \
   --config environment.SITE_ADDRESS=:80 \
   --config environment.SECRET_KEY="$SECRET_KEY" \
