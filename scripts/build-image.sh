@@ -52,6 +52,21 @@ done
 # Push the build recipe
 incus file push -r "$BUILD_DIR/" "$TMP_CT/tmp/build/"
 
+# manager/restaurant clone their own app source over SSH inside build.sh
+# (git.theta42.com via the gitea_deploy key), but that key and its
+# accept-new host config live on the HOST's /root/.ssh, not inside this
+# fresh temp container — without pushing them in first, the clone fails
+# outright with "Host key verification failed". The container is destroyed
+# right after this build, so the exposure is no wider than the host's own
+# already-standing trust in that key.
+if [ "$IMAGE_NAME" = "manager" ] || [ "$IMAGE_NAME" = "restaurant" ]; then
+  incus exec "$TMP_CT" -- mkdir -p /root/.ssh
+  incus file push /root/.ssh/gitea_deploy "$TMP_CT/root/.ssh/gitea_deploy"
+  [ -f /root/.ssh/config ] && incus file push /root/.ssh/config "$TMP_CT/root/.ssh/config"
+  incus exec "$TMP_CT" -- chmod 700 /root/.ssh
+  incus exec "$TMP_CT" -- chmod 600 /root/.ssh/gitea_deploy /root/.ssh/config
+fi
+
 # Run build (manager/restaurant clone their own app source inside build.sh;
 # base/edge/gitea/plane/bookstack ignore $2 entirely)
 if [ -n "$REF" ]; then
