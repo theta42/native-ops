@@ -51,6 +51,21 @@ docs.opsavor.app {
 	reverse_proxy outline:3000
 }
 
+# opsavor.ai — public home page / marketing site. Served by the `home`
+# container (opsavor/opsavor.ai repo, image opsavor-home); see
+# scripts/deploy-home.sh. This TLD used to be a ChatGPT Sites deployment
+# behind Cloudflare; its DNS moved to DigitalOcean so TLS uses the same
+# DNS-01 provider as everything else here. Not a wildcard block: apex + www
+# share one cert, and anything else under *.opsavor.ai is intentionally
+# unserved rather than falling through to the restaurant wildcard below.
+opsavor.ai, www.opsavor.ai {
+	tls {
+		dns digitalocean {env.DO_API_TOKEN}
+	}
+	import strip-forged-identity
+	reverse_proxy home:3000
+}
+
 # Restaurant white-labels. Wildcard cert; per-site blocks come from
 # /etc/caddy/sites/*.caddy (one file per slug, written by the manager).
 *.opsavor.app {
