@@ -56,12 +56,13 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │    ├─ Incus socket mounted → launches/stops/snapshots containers
   │    └─ Caddy sites written via incus file push → caddy reload
   │
-  ├─ gitea         10.0.100.12   Git hosting + Actions (unused — see note)
-  │    └─ empty; org/repos were never actually moved here
+  ├─ gitea         10.0.100.12   Git hosting + Actions (not populated yet —
+  │    │                          repos still live on git.theta42.com;
+  │    │                          moving them here is a planned, not-yet-done
+  │    │                          step, see "CI/CD" below)
   │
-  ├─ ct-runner     10.0.100.13   Gitea Actions runner (aspirational — see note)
-  │    ├─ runs test suites, builds Incus images
-  │    └─ talks to Incus socket for temp build containers
+  ├─ (no ct-runner container — CI runs as act_runner directly on THIS host,
+  │    a systemd service, not a separate Incus instance; see "CI/CD" below)
   │
   ├─ plane         10.0.100.14   Project management
   ├─ bookstack     10.0.100.15   Internal wiki/docs
@@ -250,84 +251,104 @@ Layer 3 is opt-in via DO console.
 
 ## CI/CD
 
-**What's actually running (2026-09-21), corrected from the aspirational
-design below):** the repos (`opsavor/restaurant`, `opsavor/management`,
-`opsavor/native-ops`) are hosted on `git.theta42.com`, a separate Gitea
-instance — NOT the `gitea` container in the topology diagram above, which
-is empty and unused. The CI runner is `act_runner` v3.5.0 running directly
-on the Incus host as a systemd service (`act-runner.service`, `/root/
-act-runner/`), registered against `git.theta42.com` with label `incus-host`
-(`--labels incus-host:host`, no Docker/container executor — it just runs
-`run:` steps in its own shell, which is all `management`'s and
-`restaurant`'s workflows need). There is no separate `ct-runner` container,
-no privileged/`ci`-profile instance, and no blue-green "manager-new" swap —
-`deploy-manager.sh` replaces the `manager` container in place. The
-step-by-step diagrams below describe the ORIGINAL design intent, which the
-actual workflows (`management/.gitea/workflows/deploy.yml`,
-`restaurant/.gitea/workflows/release.yml`) only partially implement; treat
-them as background, not a spec, until this section is rewritten to match.
+The repos (`opsavor/restaurant`, `opsavor/management`, `opsavor/native-ops`)
+are hosted on `git.theta42.com`, a separate Gitea instance — not the
+`gitea` container in the topology diagram above. That container is
+provisioned and reachable but not yet populated; the repos will move there
+eventually, just not yet.
 
-CI runs as the `ct-runner` container (Gitea Actions `act_runner` inside an
-Incus container with the `ci` profile, which gives it the host Incus
-socket). Self-hosted, label `[native]`, same trust model as the old edge
-runner (outbound-only HTTPS to Gitea, no SSH keys for CI).
+CI runs as `act_runner` v3.5.0, installed directly on the Incus host as a
+systemd service (`act-runner.service`, working directory
+`/root/act-runner/`) — not inside a container. It's registered against
+`git.theta42.com` with label `incus-host` (`--labels incus-host:host`: no
+Docker/container executor, it just runs `run:` steps in its own root shell,
+which is all either workflow needs, since both call `native-ops` scripts
+that talk to the Incus socket directly). To re-register after a host
+rebuild: get a fresh org-level token with
+`tea api -X POST /orgs/opsavor/actions/runners/registration-token`, then
+`act_runner register --no-interactive --instance https://git.theta42.com
+--token <token> --name incus-host --labels incus-host:host` from
+`/root/act-runner`, then `systemctl enable --now act-runner`.
+
+Both releases replace the running instance **in place** — same container
+name, same data volume, new image. There is no blue-green pair, no second
+"-new" container, and no Caddy route to swap: Caddy already targets
+containers by name (`manager.incus`, `<slug>.incus`) over the bridge's own
+DNS, and that name keeps resolving to whatever IP the replacement container
+gets. The tradeoff: the site really is down for the few seconds between
+`incus delete` and the replacement passing its health-gate — not the
+zero-downtime swap an earlier draft of this section described. Both
+`deploy-manager.sh` and the restaurant fleet roll (via
+`management/lib/incus.mjs`'s `buildUpdateScript`) build the new image
+*before* deleting anything, so a failed build never touches the running
+instance; a failure between delete and health-gate is not automatically
+rolled back (a `manager-data` ZFS snapshot is taken first for manual
+recovery — see "Storage" above; restaurant sites don't currently get an
+equivalent pre-replace snapshot).
 
 ### Manager release (`manager-vX.Y.Z`)
 
 ```
-gitea receives tag manager-v1.2.3
+git.theta42.com receives tag manager-v1.2.3
   │
   v
-ct-runner picks it up (native-ops workflow or management/.gitea/workflows/)
+act-runner picks it up (management/.gitea/workflows/deploy.yml)
   │
-  ├─ 1. Check out the tag
-  │
-  ├─ 2. Build image: tmp-build-manager from images/manager/
-  │     → publish as opsavor-manager-v1.2.3
-  │
-  ├─ 3. Launch new: incus launch opsavor-manager-v1.2.3 manager-new
-  │       attach manager-data volume, inject env from /root/.env
-  │
-  ├─ 4. Health-gate: curl manager-new.incus:3001/health
-  │
-  ├─ 5. Swap: update Caddy route manager.incus:3001 → manager-new.incus:3001
-  │       incus file push + incus exec edge -- caddy reload
-  │
-  └─ 6. Clean up: incus delete manager-old (rename old one first for
-        rollback window; keep it stopped, not deleted, for 15 min)
+  └─ deploy-manager.sh manager-v1.2.3
+       ├─ 1. Build image: build-image.sh manager manager-v1.2.3
+       │     (temp container clones management @ the tag, npm ci
+       │      --production, publish as opsavor-manager:manager-v1.2.3)
+       ├─ 2. Snapshot the manager-data volume (if a manager already exists)
+       ├─ 3. incus delete manager --force
+       ├─ 4. incus launch <built image> manager --profile base --profile service
+       ├─ 5. Reattach manager-data at /app/.data, push the Incus SSH control
+       │     key, write /etc/default/manager from /root/.env
+       ├─ 6. incus restart manager
+       └─ 7. Health-gate: incus exec manager -- curl 127.0.0.1:3001/health
+             (24 tries, 5s apart; exit 1 + journalctl dump on failure)
 ```
 
-No downtime: the new container is healthy before Caddy switches. Old
-container is kept stopped for a rollback window, then deleted by sweep.
+`branches: [main]` + `paths: [.gitea/workflows/deploy.yml]` also fires this
+same job on an ordinary push to `main` that touches the workflow file
+itself, with `ref` resolving to `refs/heads/main` — intended to just prove
+the runner is reachable, but it runs the real deploy script with that ref,
+which only works if `opsavor-manager:refs/heads/main` can actually be
+built and launched. Worth tightening later; not blocking today.
 
 ### Restaurant release (`restaurant-vX.Y.Z`)
 
 ```
-gitea receives tag restaurant-v1.2.3
+git.theta42.com receives tag restaurant-v1.2.3
   │
   v
-ct-runner picks it up
+act-runner picks it up (restaurant/.gitea/workflows/release.yml)
   │
-  ├─ 1. Prove green: npm ci && npm test in the build container
+  ├─ 1. Prove green: test-restaurant.sh restaurant-v1.2.3
+  │     (temp container clones restaurant @ the tag, npm ci, npm test —
+  │     which runs `next build` + the full suite; container always deleted
+  │     after, pass or fail)
   │
-  ├─ 2. Build image: tmp-build-restaurant from images/restaurant/
-  │     → publish as opsavor-restaurant-v1.2.3
+  ├─ 2. Build image: build-image.sh restaurant restaurant-v1.2.3
+  │     → publish as opsavor-restaurant:restaurant-v1.2.3, repoint
+  │       opsavor-restaurant:latest at it (so fresh on-boards use it too)
   │
-  ├─ 3. For each ACTIVE restaurant (manager API /api/update-all):
-  │     ├─ incus launch opsavor-restaurant-v1.2.3 rest-<slug>-new
-  │     │     attach rest-<slug>-data volume, inject per-site env
-  │     ├─ health-gate rest-<slug>-new.incus:3000/api/health
-  │     ├─ swap Caddy route <slug>.opsavor.app → rest-<slug>-new
-  │     ├─ incus stop rest-<slug>-old (keep for rollback window)
-  │     └─ sweep deletes old after window
-  │
-  └─ On-boards use the new image alias immediately (GOLDEN_IMAGE_ALIAS
-      in manager env: opsavor-restaurant-v1.2.3)
+  └─ 3. Roll the fleet: POST /api/update-all {ref} to the manager
+        (reached at its live bridge IP — container_ip() in lib.sh, since
+        `.incus` names don't resolve from the host act-runner runs on)
+        — the manager then, for each ACTIVE restaurant, in sequence:
+          incus delete rest-<slug> --force
+          incus launch opsavor-restaurant:restaurant-v1.2.3 rest-<slug>
+            --profile base --profile restaurant --config limits.cpu=<size>
+            --config limits.memory=<size>
+          reattach rest-<slug>-data at /app/.data
+          incus restart rest-<slug>
+          health-gate: incus exec rest-<slug> -- curl 127.0.0.1:3000/api/health
+            (36 tries, 5s apart)
 ```
 
-Restaurant releases are synchronous like the old `/api/update-all`: the
-manager walks each tenant, launches new, health-gates, swaps, and only then
-moves to the next. Failures are per-site and never abort mid-fleet.
+`/api/update-all` is synchronous and per-site: the manager walks every
+active instance in turn, and one instance's failure doesn't abort the
+rest of the fleet or the ones already done.
 
 ### Onboard
 
