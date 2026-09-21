@@ -94,6 +94,13 @@ cp /root/.ssh/manager_incus_ed25519.pub /home/manager-ctl/.ssh/authorized_keys
 chown -R manager-ctl:manager-ctl /home/manager-ctl/.ssh
 chmod 600 /home/manager-ctl/.ssh/authorized_keys
 
+echo "[provision] Installing the daily volume-snapshot timer..."
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cp "$REPO_DIR/scripts/systemd/snapshot-all.service" /etc/systemd/system/snapshot-all.service
+cp "$REPO_DIR/scripts/systemd/snapshot-all.timer" /etc/systemd/system/snapshot-all.timer
+systemctl daemon-reload
+systemctl enable --now snapshot-all.timer
+
 echo "[provision] Host provisioning complete."
 echo ""
 echo "Next steps:"

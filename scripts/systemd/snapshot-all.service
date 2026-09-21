@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily snapshot of every custom Incus storage volume
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/native-ops
+ExecStart=/root/native-ops/scripts/snapshot-all.sh
