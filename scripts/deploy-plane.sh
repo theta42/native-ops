@@ -88,19 +88,26 @@ incus launch quay:minio/minio plane-minio --profile base \
 sleep 5
 incus config device add plane-minio data disk pool=default source=plane-minio-data path=/export
 incus restart plane-minio
-sleep 5
+
+echo "[deploy] waiting for MinIO..."
+for i in $(seq 1 24); do
+  incus exec plane-minio -- curl -fsS --max-time 3 http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break
+  sleep 5
+done
 
 echo "[deploy] ensuring the uploads bucket exists..."
 incus delete plane-mc-init --force 2>/dev/null || true
 incus launch quay:minio/mc plane-mc-init --profile base --ephemeral \
   --config environment.MC_HOST_local="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@plane-minio:9000"
 sleep 3
-incus exec plane-mc-init -- mc mb --ignore-existing local/uploads || true
+incus exec plane-mc-init -- mc mb --ignore-existing local/uploads
 incus delete plane-mc-init --force 2>/dev/null || true
 
 echo "[deploy] Plane (all-in-one)..."
+# No `latest` tag exists for this image ("manifest unknown") — pin an
+# actual release tag instead.
 incus delete plane --force 2>/dev/null || true
-incus launch docker:makeplane/plane-aio-community:latest plane --profile base \
+incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.DOMAIN_NAME="$PLANE_DOMAIN" \
   --config environment.DATABASE_URL="postgresql://plane:${POSTGRES_PASSWORD}@plane-db:5432/plane" \
   --config environment.REDIS_URL="redis://plane-redis:6379/" \
