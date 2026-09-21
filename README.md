@@ -722,6 +722,60 @@ incus exec gitea -- sqlite3 /data/gitea.db \
 incus restart gitea
 ```
 
+### Deploy Plane (tickets.opsavor.work)
+
+Unlike every other service in this fleet, Plane is NOT built from source.
+It's a genuinely large multi-service stack — Django API + Celery worker +
+beat scheduler + three separate Next.js frontends + a realtime
+collaboration server, normally run as a 13-container docker-compose.
+Rebuilding all of that natively would take far longer and be far more
+fragile than using Plane's own maintained images, so this runs them as
+Incus OCI application containers instead — Incus can pull and run OCI
+images directly, no separate Docker daemon needed. `scripts/deploy-plane.sh`
+runs Plane's official All-In-One image (`makeplane/plane-aio-community`,
+which bundles web/space/admin/api/live/worker/beat/an internal Caddy into
+one container) plus Postgres/Redis/RabbitMQ/MinIO as its four required
+external services.
+
+```sh
+./scripts/deploy-plane.sh
+./scripts/sync-edge-caddyfile.sh   # if not already run for wiki/git
+```
+
+Generated secrets (DB/queue/storage passwords, Django secret keys) live in
+`/root/.plane-secrets.env` on the host — there's no custom entrypoint here
+to persist them on a volume the way bookstack/gitea's do, since these are
+all upstream images running their own. **The four infra containers
+(`plane-db`, `plane-redis`, `plane-mq`, `plane-minio`) are only ever
+created once** — re-running this script leaves them alone if they already
+exist and only replaces the `plane` app container. Force-deleting a
+running Postgres to "redeploy" it sends it a hard kill instead of a
+graceful shutdown; doing that repeatedly while first getting this working
+corrupted its data directory for real, which is the specific thing this
+guards against.
+
+#### Google Workspace SSO for Plane
+
+Plane has a native Google OAuth provider
+(`apps/api/plane/authentication/provider/oauth/google.py`) that reads
+`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` as plain environment variables —
+no admin-UI configuration step needed, unlike BookStack/Gitea. The
+redirect URI is fixed by Plane's own code (not something you choose via
+`--name` the way Gitea's is):
+
+```
+https://tickets.opsavor.work/auth/google/callback/
+```
+
+Add that as an authorized redirect URI on the same Google Cloud OAuth
+client already used for BookStack/Gitea, then:
+
+```sh
+echo 'GOOGLE_CLIENT_ID=<client id>' >> /root/.plane-secrets.env
+echo 'GOOGLE_CLIENT_SECRET=<client secret>' >> /root/.plane-secrets.env
+./scripts/deploy-plane.sh   # only replaces the plane container; infra is untouched
+```
+
 ### Migrate a restaurant between nodes (Phase 2)
 
 ```sh

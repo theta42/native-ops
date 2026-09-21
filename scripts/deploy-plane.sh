@@ -145,6 +145,23 @@ incus delete plane-mc-init --force 2>/dev/null || true
 echo "[deploy] Plane (all-in-one)..."
 # No `latest` tag exists for this image ("manifest unknown") — pin an
 # actual release tag instead.
+#
+# Google SSO: GOOGLE_CLIENT_ID/SECRET are OPERATOR-supplied, like
+# bookstack's OIDC_*/gitea's GITEA_OAUTH_* — add them to
+# /root/.plane-secrets.env and re-run this script (only the `plane`
+# container gets replaced; the four infra services above are left alone)
+# to enable it. Plane's own Google provider
+# (apps/api/plane/authentication/provider/oauth/google.py) reads these
+# as plain env vars directly — no god-mode/admin-UI step needed. Redirect
+# URI is fixed by Plane's own code, not configurable:
+# https://<domain>/auth/google/callback/
+GOOGLE_OAUTH_ARGS=()
+if [ -n "${GOOGLE_CLIENT_ID:-}" ]; then
+  GOOGLE_OAUTH_ARGS=(
+    --config environment.GOOGLE_CLIENT_ID="$GOOGLE_CLIENT_ID"
+    --config environment.GOOGLE_CLIENT_SECRET="$GOOGLE_CLIENT_SECRET"
+  )
+fi
 incus delete plane --force 2>/dev/null || true
 incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.DOMAIN_NAME="$PLANE_DOMAIN" \
@@ -159,7 +176,8 @@ incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.USE_MINIO=1 \
   --config environment.SITE_ADDRESS=:80 \
   --config environment.SECRET_KEY="$SECRET_KEY" \
-  --config environment.LIVE_SERVER_SECRET_KEY="$LIVE_SERVER_SECRET_KEY"
+  --config environment.LIVE_SERVER_SECRET_KEY="$LIVE_SERVER_SECRET_KEY" \
+  "${GOOGLE_OAUTH_ARGS[@]}"
 
 echo "[deploy] Waiting for Plane to become healthy (first boot runs DB migrations across several services — can take a few minutes)..."
 for i in $(seq 1 60); do
