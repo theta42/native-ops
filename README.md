@@ -655,6 +655,73 @@ well-known default password on this instance — it was rotated the same
 way (`php artisan tinker`, `Hash::make()`) the first time this was set up;
 the new one is saved at `/root/.bookstack-admin-pw.tmp` on the host.
 
+### Deploy Gitea (git.opsavor.work)
+
+Same singleton-service shape as BookStack: `scripts/deploy-gitea.sh` builds
+the image, creates+attaches the persistent `gitea-data` volume (SQLite DB,
+repos, and generated secrets all live there — see
+`images/gitea/gitea-entrypoint.sh`), launches, health-gates. No separate
+DNS or Caddy step needed — `git.opsavor.work` is already a host matcher in
+the existing `*.opsavor.work` wildcard block in `edge/Caddyfile`, so it's
+covered the moment `./scripts/sync-edge-caddyfile.sh` has been run once
+(see the BookStack section above if it hasn't).
+
+```sh
+./scripts/deploy-gitea.sh
+```
+
+A local `admin` account is created on first boot with a generated
+password (never a well-known default) — `incus exec gitea -- cat
+/data/gitea-secrets.env` to read it.
+
+#### Google Workspace SSO for Gitea
+
+Unlike BookStack, Gitea layers OAuth2 login alongside the local
+`admin`/password form rather than replacing it — no separate recovery
+path needed here, the standard login box is always still there at
+`/user/login`. Gitea stores OAuth2 login sources in its own database
+(the volume), not a config file, so once added it's just there — no
+env-file plumbing to keep in sync.
+
+**1. Add a redirect URI to your existing Google Cloud OAuth client**
+(reuse the same one from the BookStack setup — Google OAuth clients
+support multiple redirect URIs, no need for a second client or a new
+Client ID/Secret): APIs & Services → Credentials → your OAuth client →
+Authorized redirect URIs → add:
+
+```
+https://git.opsavor.work/user/oauth2/google/callback
+```
+
+**2. Configure Gitea** — edit the persisted secrets, not the image:
+
+```sh
+incus exec gitea -- vi /data/gitea-secrets.env
+```
+
+Add:
+
+```
+GITEA_OAUTH_CLIENT_ID=<client id>
+GITEA_OAUTH_CLIENT_SECRET=<client secret>
+```
+
+Then `incus restart gitea` — the entrypoint adds the `google` OAuth2
+source via `gitea admin auth add-oauth` on that boot (idempotent: it
+checks `gitea admin auth list` first, so this is safe to leave in place
+across every later restart too). New Google logins get
+`ENABLE_AUTO_REGISTRATION`-provisioned Gitea accounts. Gitea's admin CLI
+has no "promote to admin" subcommand (only `create`, `list`,
+`change-password`, `delete`, `must-change-password`) — either use the web
+UI (sign in as the local `admin` account → Site Administration → Users →
+edit the user → Is Admin), or:
+
+```sh
+incus exec gitea -- sqlite3 /data/gitea.db \
+  "UPDATE user SET is_admin = 1 WHERE name = '<gitea-username>';"
+incus restart gitea
+```
+
 ### Migrate a restaurant between nodes (Phase 2)
 
 ```sh
