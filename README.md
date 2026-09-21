@@ -522,6 +522,39 @@ never recreated). Not yet wired to Gitea Actions — see `.gitea/workflows/
 deploy.yml` in the management repo, which needs a runner registered on
 this host first.
 
+#### Google Workspace SSO for the manager dashboard
+
+Reuses the same "Internal" Google Cloud OAuth client already used for
+BookStack/Gitea/Plane — same domain-restriction gate (Google itself, via
+the Internal app-type, only lets Workspace org members reach the consent
+screen at all), plus a server-side check in `resolveGoogleEmail`
+(`management/lib/google-auth.mjs`) that the returned email actually ends
+in `GOOGLE_ALLOWED_DOMAIN` (default `opsavor.ai`). Unlike BookStack/Gitea,
+Google login here doesn't just create a normal-privilege user — every
+`ops_users` row IS a full fleet-management operator (there's no lower
+role), so this only auto-provisions for the allowed domain, and there's no
+group-sync/promotion step needed afterward.
+
+Add the redirect URI to the existing OAuth client, then set
+`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` in `/root/.env` and redeploy:
+
+```
+https://manage.opsavor.app/auth/google/callback
+```
+
+```sh
+echo 'GOOGLE_CLIENT_ID=<client id>' >> /root/.env
+echo 'GOOGLE_CLIENT_SECRET=<client secret>' >> /root/.env
+echo 'GOOGLE_ALLOWED_DOMAIN=opsavor.ai' >> /root/.env   # default; only set if different
+./scripts/deploy-manager.sh main
+```
+
+`deploy-manager.sh` writes these into `/etc/default/manager` on every
+deploy (same `EnvironmentFile` mechanism as `MANAGER_TOKEN`), so they
+survive redeploys. Leaving `GOOGLE_CLIENT_ID` unset keeps SSO off
+entirely — `/api/meta`'s `google_sso` field reflects this, and
+`login.html` only shows the "Sign in with Google" button when it's true.
+
 ### Onboard a restaurant
 
 ```sh
