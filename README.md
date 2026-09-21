@@ -58,10 +58,14 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │    ├─ Incus socket mounted → launches/stops/snapshots containers
   │    └─ Caddy sites written via incus file push → caddy reload
   │
-  ├─ gitea         10.0.100.12   Git hosting + Actions (not populated yet —
-  │    │                          repos still live on git.theta42.com;
-  │    │                          moving them here is a planned, not-yet-done
-  │    │                          step, see "CI/CD" below)
+  ├─ gitea         10.0.100.12   Git hosting + Actions. opsavor/opsavor.ai
+  │    │                          now lives here (the home image clones it);
+  │    │                          restaurant/management/native-ops still live
+  │    │                          on git.theta42.com — see "CI/CD" below.
+  │
+  ├─ home          10.0.100.15   opsavor.ai home page — Node static server
+  │                                (:3000, via edge Caddy). Repo
+  │                                opsavor/opsavor.ai; image opsavor-home.
   │
   ├─ (no ct-runner container — CI runs as act_runner directly on THIS host,
   │    a systemd service, not a separate Incus instance; see "CI/CD" below)
@@ -85,6 +89,8 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
 
 - **DNS** (`opsavor.app` in DO DNS): apex + `*` A-records → node-1 public IP
   (`scripts/add-edge-dns.sh`). Per-site DNS is never needed (wildcard).
+  `opsavor.ai` (the public home page) is also in DO DNS now, apex + `*`, set
+  with the same script (`DOMAIN=opsavor.ai`) — see the `home` deploy runbook.
 - **TLS**: Caddy LE wildcard via DNS-01 (`DO_API_TOKEN`), covers `manage.*`,
   `git.*`, `plane.*`, `wiki.*`, `*.opsavor.app`. Per-site blocks re-declare
   `tls { dns … }`.
@@ -152,6 +158,7 @@ scoped to `default + tenants`.
 | `edge` | default | base, edge | 10.0.100.10 | 1C / 256MB | ports 80/443 (proxy devices) |
 | `manager` | default | base, service | 10.0.100.11 | 2C / 2GB | :3001 (via edge Caddy) |
 | `gitea` | default | base, service | 10.0.100.12 | 2C / 2GB | :3000 (via edge Caddy), :2222 (SSH, own proxy device) |
+| `home` | default | base, service | 10.0.100.15 | 2C / 2GB | :3000 (via edge Caddy) — opsavor.ai home page |
 | `ct-runner` | default | base, ci | 10.0.100.13 | 2C / 4GB | outbound-only |
 | `plane` | services | base, service | 10.0.100.14 | 2C / 2GB | :3001 (via edge Caddy) |
 | `outline` | services | base, service | 10.0.100.1x | 2C / 1GB | :3000 (via edge Caddy) |
@@ -175,6 +182,7 @@ the local image store (`incus image list`).
 | `opsavor-base` | `images:debian/13` | `images/base/` (build script) | ct-runner |
 | `opsavor-edge` | `opsavor-base` | `images/edge/` — Caddy binary + Caddyfile | ct-runner |
 | `opsavor-manager` | `opsavor-base` | `images/manager/` — `npm ci` + `server.mjs` | ct-runner |
+| `opsavor-home` | `opsavor-base` | `images/home/` — clone opsavor/opsavor.ai + `server.mjs` | ct-runner |
 | `opsavor-restaurant` | `opsavor-base` | `images/restaurant/` — `npm ci && npm run build` + standalone | ct-runner |
 | `opsavor-gitea` | `opsavor-base` | `images/gitea/` — Gitea binary + config | ct-runner |
 | `opsavor-plane` | `opsavor-base` | `images/plane/` — Plane distribution | one-time manual |
@@ -403,7 +411,8 @@ sub-second from a cached image.
 | `GITEA_ADMIN_TOKEN` | host `/root/.env` (600) | manager: user provisioning via Gitea API | git, CI logs |
 | `opsavor_ed25519` | operator laptop `~/.ssh` | break-glass SSH to the host | git |
 | `manager_fleet` | host `/root/.ssh` (600) | manager SSH into tenant containers (rare; Incus exec preferred) | git |
-| `gitea_deploy` | host `/root/.ssh` (600) | read-only repo deploy keys for ci-runner | git |
+| `gitea_deploy` | host `/root/.ssh` (600) | read-only repo deploy keys for ci-runner (git.theta42.com) | git |
+| `gitea_opsavor_deploy` | host `/root/.ssh` (600) | read-only deploy key for the home image build (git.opsavor.work) | git |
 | per-site `SERVICE_TOKEN` / `OLLAMA_*` / owner pw | fleet DB / incus config env at launch | instance auth + Savy | git, list/get responses |
 | Incus client cert | manager container `/root/.config/incus/` | manager→Incus API authentication | git |
 
@@ -610,6 +619,37 @@ deploy (same `EnvironmentFile` mechanism as `MANAGER_TOKEN`), so they
 survive redeploys. Leaving `GOOGLE_CLIENT_ID` unset keeps SSO off
 entirely — `/api/meta`'s `google_sso` field reflects this, and
 `login.html` only shows the "Sign in with Google" button when it's true.
+
+### Deploy the opsavor.ai home page (`home`)
+
+The public marketing/home page (`https://opsavor.ai`, apex + `www`) is a
+small Node static server from the `opsavor/opsavor.ai` repo, running in the
+`home` container and reverse-proxied by edge Caddy. It replaced a ChatGPT
+Sites deployment; its DNS moved from GoDaddy/Cloudflare to DigitalOcean so
+TLS uses the same DNS-01 provider as the rest of the edge.
+
+```sh
+# 1. DNS: point opsavor.ai (apex + wildcard) at the host, in DO DNS —
+#    same provider/script as opsavor.app, different DOMAIN:
+DO_API_TOKEN=… DOMAIN=opsavor.ai ./providers/digitalocean/dns.sh <node-1-public-ip>
+
+# 2. Deploy key: the build container clones from the in-fleet Gitea over SSH
+#    (git.opsavor.work:2222). Add a read-only deploy key to that repo
+#    (repo → Settings → Deploy Keys) and drop the private half on the host:
+#      /root/.ssh/gitea_opsavor_deploy   (chmod 600)
+#    Separate from gitea_deploy (which is for git.theta42.com).
+
+# 3. Build + launch + health-gate:
+./scripts/deploy-home.sh main        # or a tag, e.g. home-v0.1.0
+
+# 4. Only if edge/Caddyfile changed (the opsavor.ai block lives there):
+./scripts/sync-edge-caddyfile.sh
+```
+
+The site is stateless — there is no data volume, so a deploy is just
+build → delete `home` → launch → health-gate `http://127.0.0.1:3000/health`.
+Caddy reaches it as `home:3000` over the bridge. To change page content,
+edit the `opsavor/opsavor.ai` repo and re-run `deploy-home.sh`.
 
 ### Onboard a restaurant
 
@@ -925,6 +965,7 @@ native-ops/
     base/                      ← Debian 13 + node:22 + common tools (build.sh)
     edge/                      ← Caddy binary + Caddyfile (build.sh)
     manager/                   ← management app (build.sh)
+    home/                      ← opsavor/opsavor.ai home page (build.sh)
     restaurant/                ← restaurant app (build.sh)
     gitea/                     ← Gitea binary + config (build.sh)
     plane/                     ← Plane distribution (build.sh)
