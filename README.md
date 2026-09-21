@@ -56,11 +56,10 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │    ├─ Incus socket mounted → launches/stops/snapshots containers
   │    └─ Caddy sites written via incus file push → caddy reload
   │
-  ├─ gitea         10.0.100.12   Git hosting + Actions
-  │    ├─ repos: restaurant, management, native-ops
-  │    └─ Actions dispatcher → ct-runner (below)
+  ├─ gitea         10.0.100.12   Git hosting + Actions (unused — see note)
+  │    └─ empty; org/repos were never actually moved here
   │
-  ├─ ct-runner     10.0.100.13   Gitea Actions runner (privileged)
+  ├─ ct-runner     10.0.100.13   Gitea Actions runner (aspirational — see note)
   │    ├─ runs test suites, builds Incus images
   │    └─ talks to Incus socket for temp build containers
   │
@@ -250,6 +249,23 @@ Layer 1 is always on. Layer 2 is scripted (see `scripts/snapshot-all.sh`).
 Layer 3 is opt-in via DO console.
 
 ## CI/CD
+
+**What's actually running (2026-09-21), corrected from the aspirational
+design below):** the repos (`opsavor/restaurant`, `opsavor/management`,
+`opsavor/native-ops`) are hosted on `git.theta42.com`, a separate Gitea
+instance — NOT the `gitea` container in the topology diagram above, which
+is empty and unused. The CI runner is `act_runner` v3.5.0 running directly
+on the Incus host as a systemd service (`act-runner.service`, `/root/
+act-runner/`), registered against `git.theta42.com` with label `incus-host`
+(`--labels incus-host:host`, no Docker/container executor — it just runs
+`run:` steps in its own shell, which is all `management`'s and
+`restaurant`'s workflows need). There is no separate `ct-runner` container,
+no privileged/`ci`-profile instance, and no blue-green "manager-new" swap —
+`deploy-manager.sh` replaces the `manager` container in place. The
+step-by-step diagrams below describe the ORIGINAL design intent, which the
+actual workflows (`management/.gitea/workflows/deploy.yml`,
+`restaurant/.gitea/workflows/release.yml`) only partially implement; treat
+them as background, not a spec, until this section is rewritten to match.
 
 CI runs as the `ct-runner` container (Gitea Actions `act_runner` inside an
 Incus container with the `ci` profile, which gives it the host Incus
@@ -950,7 +966,14 @@ zfs receive rpool/incus/custom/rest-sicily-data < backup/rest-sicily-data.zfs
 # 6. DNS:
 DO_API_TOKEN=… ./scripts/add-edge-dns.sh <new-ip>
 
-# 7. Re-register ct-runner with Gitea (the runner token is per-host).
+# 7. Re-register the CI runner (act_runner, systemd service `act-runner`,
+#    /root/act-runner/) with git.theta42.com — the registration token is
+#    per-host and one-time-use; get a fresh one via
+#    `tea api -X POST /orgs/opsavor/actions/runners/registration-token`,
+#    then `act_runner register --no-interactive --instance
+#    https://git.theta42.com --token <token> --name incus-host --labels
+#    incus-host:host` from /root/act-runner, then
+#    `systemctl enable --now act-runner`.
 ```
 
 ## File layout

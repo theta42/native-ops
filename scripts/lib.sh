@@ -23,3 +23,28 @@ for a in json.load(sys.stdin):
 sys.exit(1)
 ' "$alias"
 }
+
+# Look up a running container's bridge IPv4 address.
+#
+# `.incus` mDNS-style names only resolve from INSIDE other containers on
+# the bridge (Incus serves that DNS on incusbr0 itself) — the host is not a
+# client of it, so `curl http://manager.incus:3001/...` from a script
+# running directly on the host (as the CI runner now does) fails with
+# "Could not resolve host". The documented 10.0.100.x addresses per
+# container are also not load-bearing: real containers come up on
+# whatever the bridge's DHCP hands out, which drifts across replaces. Ask
+# Incus directly instead of assuming either.
+container_ip() {
+  local name="$1"
+  incus list "$name" --format json | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if not data:
+    sys.exit(1)
+for addr in data[0]["state"]["network"]["eth0"]["addresses"]:
+    if addr["family"] == "inet":
+        print(addr["address"])
+        sys.exit(0)
+sys.exit(1)
+'
+}
