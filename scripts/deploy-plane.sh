@@ -166,7 +166,9 @@ print(next(a['address'] for a in addrs if a['family'] == 'inet'))
 PLANE_DB_IP="$(get_ip plane-db)"
 PLANE_REDIS_IP="$(get_ip plane-redis)"
 PLANE_MQ_IP="$(get_ip plane-mq)"
-PLANE_MINIO_IP="$(get_ip plane-minio)"
+# No PLANE_MINIO_IP here: AWS_S3_ENDPOINT_URL below is the public domain,
+# not MinIO's internal bridge IP (see the Caddyfile's /uploads/* route to
+# plane-minio for why) — the internal address is never referenced directly.
 
 # No `latest` tag exists for this image ("manifest unknown") — pin an
 # actual release tag instead.
@@ -220,7 +222,7 @@ incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
   --config environment.AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
   --config environment.AWS_S3_BUCKET_NAME=uploads \
-  --config environment.AWS_S3_ENDPOINT_URL="http://${PLANE_MINIO_IP}:9000" \
+  --config environment.AWS_S3_ENDPOINT_URL="https://${PLANE_DOMAIN}" \
   --config environment.USE_MINIO=1 \
   --config environment.SITE_ADDRESS=:80 \
   --config environment.CORS_ALLOWED_ORIGINS="https://${PLANE_DOMAIN}" \

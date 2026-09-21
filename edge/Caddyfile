@@ -109,9 +109,27 @@ opsavor.work {
 		reverse_proxy gitea:3000
 	}
 
+	# Plane's uploaded-file URLs are generated server-side from
+	# AWS_S3_ENDPOINT_URL (scripts/deploy-plane.sh), which the browser must
+	# be able to reach directly — it was pointed at plane-minio's internal
+	# incusbr0 IP (e.g. http://10.0.100.x:9000/uploads/...), which no
+	# browser outside the bridge can resolve, so every upload/attachment
+	# link 404'd for real users. AWS_S3_ENDPOINT_URL is now
+	# https://tickets.opsavor.work (the same public domain, no separate
+	# internal-vs-public split in Plane's own config — see the AIO deploy
+	# guide, which does the same by exposing MinIO's port directly), so
+	# this path is proxied here to plane-minio instead of falling through
+	# to the Plane app container. plane.opsavor.app doesn't need this: it's
+	# never the origin baked into AWS_S3_ENDPOINT_URL.
 	@tickets host tickets.opsavor.work
 	handle @tickets {
-		reverse_proxy plane:80
+		@tickets-uploads path /uploads/*
+		handle @tickets-uploads {
+			reverse_proxy plane-minio:9000
+		}
+		handle {
+			reverse_proxy plane:80
+		}
 	}
 
 	handle {
