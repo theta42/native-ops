@@ -78,6 +78,10 @@ FLEET_DB=/app/.data/fleet.db
 INCUS_SSH_HOST=10.0.100.1
 INCUS_SSH_USER=manager-ctl
 INCUS_SSH_KEY=/home/manager/.ssh/incus_ctl
+GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-https://manage.opsavor.app/auth/google/callback}
+GOOGLE_ALLOWED_DOMAIN=${GOOGLE_ALLOWED_DOMAIN:-opsavor.ai}
 EOF
 chown manager:manager /etc/default/manager
 chmod 600 /etc/default/manager"
