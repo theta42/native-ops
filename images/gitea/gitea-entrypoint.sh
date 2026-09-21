@@ -122,6 +122,12 @@ fi
 # reasons not tracked down further — generic OpenID Connect with Google's
 # well-known discovery URL works and is arguably more robust anyway (same
 # approach bookstack's OIDC setup uses), so use that instead.
+#
+# --scopes matters: with none specified, Gitea only requested the bare
+# `openid` scope, so Google's response carried no email or name/profile
+# data at all — auto-registration then failed outright ("OAuth2 Provider
+# google returned missing fields: email,nickname"). `email` and `profile`
+# are both required for it to have anything to create an account from.
 if [ -n "${GITEA_OAUTH_CLIENT_ID:-}" ]; then
   EXISTING_ID="$(runuser -u git -- "$GITEA" admin auth list --config "$CONF" 2>/dev/null | awk '$2=="google"{print $1}')"
   if [ -z "$EXISTING_ID" ]; then
@@ -129,9 +135,11 @@ if [ -n "${GITEA_OAUTH_CLIENT_ID:-}" ]; then
     runuser -u git -- "$GITEA" admin auth add-oauth --config "$CONF" \
       --name google --provider openidConnect \
       --auto-discover-url https://accounts.google.com/.well-known/openid-configuration \
+      --scopes openid --scopes email --scopes profile \
       --key "$GITEA_OAUTH_CLIENT_ID" --secret "$GITEA_OAUTH_CLIENT_SECRET"
   else
     runuser -u git -- "$GITEA" admin auth update-oauth --config "$CONF" --id "$EXISTING_ID" \
+      --scopes openid --scopes email --scopes profile \
       --key "$GITEA_OAUTH_CLIENT_ID" --secret "$GITEA_OAUTH_CLIENT_SECRET"
   fi
 fi
