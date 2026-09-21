@@ -44,56 +44,80 @@ new_volume() {
   incus storage volume set default "$1" security.shifted=true
 }
 
+# Postgres/Redis/RabbitMQ/MinIO are stateful infrastructure, not something
+# this script ever needs to "update" the way the Plane app container below
+# gets replaced on every run — force-deleting and relaunching them
+# unconditionally on every re-run (as an earlier version of this script
+# did) sends a running Postgres a hard kill instead of a graceful
+# shutdown, and doing that across several iterations while debugging
+# corrupted its data directory for real ("could not locate a valid
+# checkpoint record"). If one already exists, leave it alone entirely.
+skip_if_exists() {
+  incus info "$1" >/dev/null 2>&1
+}
+
 echo "[deploy] Postgres..."
-new_volume plane-db-data
-incus delete plane-db --force 2>/dev/null || true
-incus launch docker:postgres:15.7-alpine plane-db --profile base \
-  --config environment.POSTGRES_USER=plane \
-  --config environment.POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-  --config environment.POSTGRES_DB=plane
-sleep 5
-incus config device add plane-db data disk pool=default source=plane-db-data path=/var/lib/postgresql/data
-incus restart plane-db
+if skip_if_exists plane-db; then
+  echo "  plane-db already exists, leaving it alone"
+else
+  new_volume plane-db-data
+  incus launch docker:postgres:15.7-alpine plane-db --profile base \
+    --config environment.POSTGRES_USER=plane \
+    --config environment.POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+    --config environment.POSTGRES_DB=plane
+  sleep 5
+  incus config device add plane-db data disk pool=default source=plane-db-data path=/var/lib/postgresql/data
+  incus restart plane-db
+fi
 
 echo "[deploy] Redis (valkey)..."
-new_volume plane-redis-data
-incus delete plane-redis --force 2>/dev/null || true
-incus launch docker:valkey/valkey:7.2.11-alpine plane-redis --profile base
-sleep 5
-incus config device add plane-redis data disk pool=default source=plane-redis-data path=/data
-incus restart plane-redis
+if skip_if_exists plane-redis; then
+  echo "  plane-redis already exists, leaving it alone"
+else
+  new_volume plane-redis-data
+  incus launch docker:valkey/valkey:7.2.11-alpine plane-redis --profile base
+  sleep 5
+  incus config device add plane-redis data disk pool=default source=plane-redis-data path=/data
+  incus restart plane-redis
+fi
 
 echo "[deploy] RabbitMQ..."
-new_volume plane-mq-data
-incus delete plane-mq --force 2>/dev/null || true
-incus launch docker:rabbitmq:3.13.6-management-alpine plane-mq --profile base \
-  --config environment.RABBITMQ_DEFAULT_USER=plane \
-  --config environment.RABBITMQ_DEFAULT_PASS="$RABBITMQ_PASSWORD" \
-  --config environment.RABBITMQ_DEFAULT_VHOST=plane
-sleep 5
-incus config device add plane-mq data disk pool=default source=plane-mq-data path=/var/lib/rabbitmq
-incus restart plane-mq
+if skip_if_exists plane-mq; then
+  echo "  plane-mq already exists, leaving it alone"
+else
+  new_volume plane-mq-data
+  incus launch docker:rabbitmq:3.13.6-management-alpine plane-mq --profile base \
+    --config environment.RABBITMQ_DEFAULT_USER=plane \
+    --config environment.RABBITMQ_DEFAULT_PASS="$RABBITMQ_PASSWORD" \
+    --config environment.RABBITMQ_DEFAULT_VHOST=plane
+  sleep 5
+  incus config device add plane-mq data disk pool=default source=plane-mq-data path=/var/lib/rabbitmq
+  incus restart plane-mq
+fi
 
 echo "[deploy] MinIO..."
-# minio/minio on Docker Hub now returns "requested access to the resource
-# is denied" outright (MinIO moved off Docker Hub at some point) — quay.io
-# still serves it.
-# The image's own entrypoint (`/usr/bin/docker-entrypoint.sh minio` —
-# check `incus config show <instance>`'s auto-populated `oci.entrypoint`
-# on any OCI instance to see this per-image) passes bare `minio` with no
-# subcommand, which just prints usage and exits: MINIO_VOLUMES as an env
-# var is NOT enough on its own, minio still needs the `server` subcommand
-# and path as actual arguments. `oci.entrypoint` is a real, overridable
-# Incus config key for exactly this.
-new_volume plane-minio-data
-incus delete plane-minio --force 2>/dev/null || true
-incus launch quay:minio/minio plane-minio --profile base \
-  --config environment.MINIO_ROOT_USER="$MINIO_ROOT_USER" \
-  --config environment.MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
-  --config oci.entrypoint="/usr/bin/docker-entrypoint.sh minio server /export --console-address :9090"
-sleep 5
-incus config device add plane-minio data disk pool=default source=plane-minio-data path=/export
-incus restart plane-minio
+if skip_if_exists plane-minio; then
+  echo "  plane-minio already exists, leaving it alone"
+else
+  # minio/minio on Docker Hub now returns "requested access to the
+  # resource is denied" outright (MinIO moved off Docker Hub at some
+  # point) — quay.io still serves it.
+  # The image's own entrypoint (`/usr/bin/docker-entrypoint.sh minio` —
+  # check `incus config show <instance>`'s auto-populated `oci.entrypoint`
+  # on any OCI instance to see this per-image) passes bare `minio` with no
+  # subcommand, which just prints usage and exits: MINIO_VOLUMES as an env
+  # var is NOT enough on its own, minio still needs the `server`
+  # subcommand and path as actual arguments. `oci.entrypoint` is a real,
+  # overridable Incus config key for exactly this.
+  new_volume plane-minio-data
+  incus launch quay:minio/minio plane-minio --profile base \
+    --config environment.MINIO_ROOT_USER="$MINIO_ROOT_USER" \
+    --config environment.MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+    --config oci.entrypoint="/usr/bin/docker-entrypoint.sh minio server /export --console-address :9090"
+  sleep 5
+  incus config device add plane-minio data disk pool=default source=plane-minio-data path=/export
+  incus restart plane-minio
+fi
 
 echo "[deploy] waiting for MinIO..."
 minio_up=false
