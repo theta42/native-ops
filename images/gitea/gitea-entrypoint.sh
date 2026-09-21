@@ -83,6 +83,7 @@ SECRET_KEY = ${SECRET_KEY}
 INTERNAL_TOKEN = ${INTERNAL_TOKEN}
 
 [oauth2]
+ENABLED = true
 JWT_SECRET = ${JWT_SECRET}
 
 [service]
@@ -113,13 +114,26 @@ if ! runuser -u git -- "$GITEA" admin user list --config "$CONF" 2>/dev/null | g
 fi
 
 # Google OAuth2 login source — only added once GITEA_OAUTH_CLIENT_ID is
-# present in $SECRETS (see above); idempotent, since `add-oauth` errors on
-# a duplicate name rather than updating it.
-if [ -n "${GITEA_OAUTH_CLIENT_ID:-}" ] && ! runuser -u git -- "$GITEA" admin auth list --config "$CONF" 2>/dev/null | grep -qw google; then
-  echo "[gitea] configuring Google OAuth2 login..."
-  runuser -u git -- "$GITEA" admin auth add-oauth --config "$CONF" \
-    --name google --provider google \
-    --key "$GITEA_OAUTH_CLIENT_ID" --secret "$GITEA_OAUTH_CLIENT_SECRET"
+# present in $SECRETS (see above); idempotent (checks first, then adds or
+# updates rather than erroring on a duplicate name).
+#
+# `--provider google` (Gitea's built-in Google shortcut) reliably failed
+# with "Command error: auth source is not activated" in 1.27.3, for
+# reasons not tracked down further — generic OpenID Connect with Google's
+# well-known discovery URL works and is arguably more robust anyway (same
+# approach bookstack's OIDC setup uses), so use that instead.
+if [ -n "${GITEA_OAUTH_CLIENT_ID:-}" ]; then
+  EXISTING_ID="$(runuser -u git -- "$GITEA" admin auth list --config "$CONF" 2>/dev/null | awk '$2=="google"{print $1}')"
+  if [ -z "$EXISTING_ID" ]; then
+    echo "[gitea] configuring Google OAuth2 login..."
+    runuser -u git -- "$GITEA" admin auth add-oauth --config "$CONF" \
+      --name google --provider openidConnect \
+      --auto-discover-url https://accounts.google.com/.well-known/openid-configuration \
+      --key "$GITEA_OAUTH_CLIENT_ID" --secret "$GITEA_OAUTH_CLIENT_SECRET"
+  else
+    runuser -u git -- "$GITEA" admin auth update-oauth --config "$CONF" --id "$EXISTING_ID" \
+      --key "$GITEA_OAUTH_CLIENT_ID" --secret "$GITEA_OAUTH_CLIENT_SECRET"
+  fi
 fi
 
 echo "[gitea] starting..."
