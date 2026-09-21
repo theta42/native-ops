@@ -541,7 +541,13 @@ incus list
 incus exec rest-acme -- journalctl -u restaurant --no-pager -n 40
 ```
 
-### Deploy BookStack (wiki.opsavor.work)
+### Deploy BookStack (docs.opsavor.app)
+
+**As of the Wiki.js migration below, BookStack no longer serves
+`wiki.opsavor.work`** — it was replaced there because the editing/admin UX
+was unpleasant to work with day to day. It's still running and still routed
+at `docs.opsavor.app` (a separate, pre-existing use unrelated to the
+internal wiki), so the container and this section are kept as-is for that.
 
 BookStack is a singleton internal service (unlike restaurants, there's only
 ever one), so it isn't run through the manager — `scripts/deploy-bookstack.sh`
@@ -654,6 +660,54 @@ back. The seeded default admin (`admin@admin.com`) is NOT left on its
 well-known default password on this instance — it was rotated the same
 way (`php artisan tinker`, `Hash::make()`) the first time this was set up;
 the new one is saved at `/root/.bookstack-admin-pw.tmp` on the host.
+
+### Deploy Wiki.js (wiki.opsavor.work)
+
+Unlike BookStack/Gitea, Wiki.js is not built from source here — like Plane,
+it runs the upstream `requarks/wiki:2` OCI image directly (plus a Postgres
+instance) via Incus's native OCI support. `scripts/deploy-wikijs.sh`
+generates a DB password on first run (`/root/.wikijs-secrets.env`),
+creates the Postgres instance once (left alone on redeploys, same
+`skip_if_exists` guard as Plane's infra containers), and always
+replaces the `wikijs` app container itself. Uploaded page assets persist
+on a separate volume mounted at `/wiki/data/content` (chowned to uid 1000
+after attach — the upstream image's entrypoint runs as the non-root `node`
+user baked into its base image, not root); everything else (pages,
+revisions, users) lives in Postgres.
+
+```sh
+./scripts/deploy-wikijs.sh
+./scripts/sync-edge-caddyfile.sh   # only needed if edge/Caddyfile changed
+```
+
+**First-run setup wizard**: unlike BookStack/Gitea, Wiki.js has no
+CLI-driven first-boot admin creation — visiting `https://wiki.opsavor.work/`
+for the first time serves its own setup wizard (site title, admin
+email/password, telemetry opt-out). Complete that once through the browser
+before configuring SSO.
+
+#### Google Workspace SSO for Wiki.js
+
+Wiki.js's Google auth strategy is configured through its admin UI
+(Administration → Login), not environment variables or a config file, and
+it layers alongside local/password login rather than replacing it (unlike
+BookStack's `oidc` mode).
+
+**1. Add the redirect URI to the existing Google Cloud OAuth client** (the
+same "Internal" app already used for BookStack/Gitea/Plane — Google's
+Internal-app restriction is still what limits sign-in to the Workspace
+domain; Wiki.js has no domain-restriction setting of its own either):
+
+```
+https://wiki.opsavor.work/login/google/callback
+```
+
+Also add `https://wiki.opsavor.work` under Authorized JavaScript origins.
+
+**2. In Wiki.js**: Administration → Login → click Google → toggle it
+enabled → paste the Client ID and Client Secret → Save. New users
+authenticating via Google get a default (non-admin) role; promote via
+Administration → Users after their first login.
 
 ### Deploy Gitea (git.opsavor.work)
 

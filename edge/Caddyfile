@@ -78,7 +78,7 @@ docs.opsavor.app {
 
 	@wiki host wiki.opsavor.work
 	handle @wiki {
-		reverse_proxy bookstack:80
+		reverse_proxy wikijs:3000
 	}
 
 	@git host git.opsavor.work
