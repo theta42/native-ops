@@ -24,9 +24,14 @@ export NODE_OPTIONS=--max-old-space-size=2560
 npm ci
 npm run build
 
-# Copy the standalone output to /app
+# Copy the standalone output to /app. `.next/standalone/*` is a bash glob
+# and globs skip dotfiles by default — the standalone build always nests a
+# HIDDEN .next/ inside itself (server.js's own compiled output), so `*`
+# silently drops it, and the next line then has nowhere to put static
+# assets ("cannot create directory '/app/.next/static'"). `.` instead of
+# `*` copies every entry, dotfiles included.
 mkdir -p /app
-cp -r .next/standalone/* /app/
+cp -r .next/standalone/. /app/
 cp -r .next/static /app/.next/static
 cp -r public /app/public
 cp -r scripts /app/scripts
