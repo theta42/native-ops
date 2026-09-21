@@ -1,14 +1,17 @@
 #!/bin/bash
-# Deploy Outline (outline.opsavor.work), replacing Wiki.js as the internal
-# wiki. Like Wiki.js and Plane, this runs the upstream OCI image directly
-# via Incus rather than building from source.
+# Deploy Outline at wiki.opsavor.work — replaced Wiki.js as the internal
+# wiki after a trial at outline.opsavor.work (retired; Outline's own
+# URL/cookie/OAuth-callback config only cleanly supports one canonical
+# hostname, so there's no dual-domain period). Like Wiki.js and Plane,
+# this runs the upstream OCI image directly via Incus rather than
+# building from source.
 #
 # Requires Postgres + Redis (both provisioned here, same pattern as
-# deploy-wikijs.sh/deploy-plane.sh) and Google OAuth credentials
+# deploy-plane.sh) and Google OAuth credentials
 # (GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET) already in /root/.env — the same
-# shared "Internal" Google Cloud OAuth client used for the manager, Gitea,
-# and Wiki.js. Google Cloud Console needs
-# https://outline.opsavor.work/auth/google.callback added to that client's
+# shared "Internal" Google Cloud OAuth client used for the manager and
+# Gitea. Google Cloud Console needs
+# https://wiki.opsavor.work/auth/google.callback added to that client's
 # authorized redirect URIs by hand first (no API for that step); Outline
 # comes up fine without it, Google sign-in just won't work until it's done.
 #
@@ -97,7 +100,7 @@ incus delete outline --force 2>/dev/null || true
 incus launch docker:outlinewiki/outline:1.10.1 outline --profile base \
   --config limits.cpu=2 --config limits.memory=1GB \
   --config environment.NODE_ENV=production \
-  --config environment.URL=https://outline.opsavor.work \
+  --config environment.URL=https://wiki.opsavor.work \
   --config environment.PORT=3000 \
   --config environment.SECRET_KEY="$SECRET_KEY" \
   --config environment.UTILS_SECRET="$UTILS_SECRET" \

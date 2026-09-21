@@ -40,15 +40,15 @@ plane.opsavor.app {
 	reverse_proxy plane:80
 }
 
-# Docs — BookStack retired (its editing/admin UX was bad enough to ask for
-# a replacement, same reason wiki.opsavor.work moved off it); this domain
-# now serves the same Wiki.js instance so old links keep working.
+# Docs — BookStack retired, then Wiki.js retired too; this domain now
+# serves the same Outline instance as wiki.opsavor.work so old links keep
+# working.
 docs.opsavor.app {
 	tls {
 		dns digitalocean {env.DO_API_TOKEN}
 	}
 	import strip-forged-identity
-	reverse_proxy wikijs:3000
+	reverse_proxy outline:3000
 }
 
 # Restaurant white-labels. Wildcard cert; per-site blocks come from
@@ -64,14 +64,20 @@ docs.opsavor.app {
 	reverse_proxy manager:3001
 }
 
-# opsavor.work apex: staff landing page (the wiki's "home" page, public,
-# no login required — see the Guests group's page rule in Wiki.js).
+# opsavor.work apex: staff landing page. A plain static file (pushed by
+# sync-edge-caddyfile.sh from edge/opsavor-work-landing/), not proxied to
+# whatever wiki engine is current — it used to be a Wiki.js page gated
+# through the Guests group's page rule, which meant "public, no login"
+# depended on that engine's own sharing model. Outline's public-sharing
+# model is different (and Wiki.js is gone anyway), so a static file is the
+# one version of "public, no login" that survives switching wiki engines.
 opsavor.work {
 	tls {
 		dns digitalocean {env.DO_API_TOKEN}
 	}
 	import strip-forged-identity
-	reverse_proxy wikijs:3000
+	root * /etc/caddy/landing
+	file_server
 }
 
 # opsavor.work: internal tooling domain (separate from the opsavor.app
@@ -88,9 +94,14 @@ opsavor.work {
 	}
 	import strip-forged-identity
 
+	# Wiki.js retired in favor of Outline (better fit; see native-ops
+	# README's "Deploy Outline" section). outline.opsavor.work (the trial
+	# domain) is retired too — wiki.opsavor.work is now canonical, since
+	# Outline's own URL/cookie/OAuth-callback config only cleanly supports
+	# one hostname.
 	@wiki host wiki.opsavor.work
 	handle @wiki {
-		reverse_proxy wikijs:3000
+		reverse_proxy outline:3000
 	}
 
 	@git host git.opsavor.work
@@ -101,11 +112,6 @@ opsavor.work {
 	@tickets host tickets.opsavor.work
 	handle @tickets {
 		reverse_proxy plane:80
-	}
-
-	@outline host outline.opsavor.work
-	handle @outline {
-		reverse_proxy outline:3000
 	}
 
 	handle {

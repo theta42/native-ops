@@ -47,7 +47,7 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │    ├─ manage.opsavor.app → manager.incus:3001         vX.Y.Z
   │    ├─ git.opsavor.app    → gitea.incus:3000    (published to local
   │    ├─ plane.opsavor.app  → plane.incus:3001      image store)
-  │    ├─ docs.opsavor.app   → wikijs.incus:3000
+  │    ├─ docs.opsavor.app   → outline.incus:3000
   │    ├─ *.opsavor.app (LE wildcard, DO DNS-01)
   │    └─ /opt/sites/<slug>.caddy (manager-written via incus file push)
   │
@@ -65,9 +65,8 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │    a systemd service, not a separate Incus instance; see "CI/CD" below)
   │
   ├─ plane         10.0.100.14   Project management
-  ├─ wikijs        10.0.100.1x   Internal wiki/docs (wiki.opsavor.work +
+  ├─ outline       10.0.100.1x   Internal wiki/docs (wiki.opsavor.work +
   │                                docs.opsavor.app)
-  ├─ outline       10.0.100.1x   Trial wiki (outline.opsavor.work)
   ├─ outline-db     10.0.100.1x   Outline's Postgres
   ├─ outline-redis  10.0.100.1x   Outline's Redis/valkey
   │
@@ -77,7 +76,7 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │
   └─ custom storage volumes (on the `default` pool — `dir` driver, not ZFS;
      see "Storage" below):
-       manager-data, gitea-data, plane-data, wikijs-data, wikijs-db-data,
+       manager-data, gitea-data, plane-data,
        outline-data, outline-db-data, outline-redis-data,
        rest-sicily-data, rest-<slug>-data
 ```
@@ -124,7 +123,7 @@ Provisioned by `incus/preseed.yml` (non-interactive `incus admin init
 |---|---|---|---|---|---|
 | `base` | 1 | 512MB | no | no | inherited by everything |
 | `edge` | 1 | 256MB | no | no | Caddy + proxy devices for :80/:443 |
-| `service` | 2 | 2GB | yes | no | gitea, plane, wikijs, outline |
+| `service` | 2 | 2GB | yes | no | gitea, plane, outline |
 | `ci` | 2 | 4GB | yes | **yes** | ct-runner (Incus-in-Incus for image builds) |
 | `restaurant` | 1 | 1GB | yes | no | per-site Next.js + SQLite |
 
@@ -137,7 +136,7 @@ privileged container on the host.
 | project | containers | purpose |
 |---|---|---|
 | `default` | edge, manager, gitea, ct-runner | core platform |
-| `services` | plane, wikijs, outline | internal tooling |
+| `services` | plane, outline | internal tooling |
 | `tenants` | rest-sicily, rest-\<slug\> | customer workload isolation |
 
 Projects provide RBAC scoping: a leaked tenant token cannot read the
@@ -153,7 +152,6 @@ scoped to `default + tenants`.
 | `gitea` | default | base, service | 10.0.100.12 | 2C / 2GB | :3000 (via edge Caddy) |
 | `ct-runner` | default | base, ci | 10.0.100.13 | 2C / 4GB | outbound-only |
 | `plane` | services | base, service | 10.0.100.14 | 2C / 2GB | :3001 (via edge Caddy) |
-| `wikijs` | services | base, service | 10.0.100.1x | 1C / 1GB | :3000 (via edge Caddy) |
 | `outline` | services | base, service | 10.0.100.1x | 2C / 1GB | :3000 (via edge Caddy) |
 | `outline-db` | services | base, service | 10.0.100.1x | 1C / 512MB | Postgres (internal only) |
 | `outline-redis` | services | base, service | 10.0.100.1x | 1C / 512MB | Redis/valkey (internal only) |
@@ -240,7 +238,6 @@ based, not copy-on-write), which is what `scripts/snapshot-all.sh` uses.
 | `manager-data` | manager at `/app/.data` | fleet.db |
 | `gitea-data` | gitea at `/data` | repos, DB, config |
 | `plane-db-data` / `plane-minio-data` / `plane-mq-data` / `plane-redis-data` | plane's Postgres/MinIO/RabbitMQ/Valkey containers | Plane's own state |
-| `wikijs-data` / `wikijs-db-data` | wikijs / its Postgres container | pages, uploads, DB |
 | `outline-data` / `outline-db-data` / `outline-redis-data` | outline / its Postgres / its Redis container | docs+uploads, DB, queue state |
 | `rest-<slug>-data` | rest-\<slug\> at `/app/.data` | instance SQLite + bucket |
 
@@ -443,9 +440,8 @@ SSD, NYC1).
 | gitea | 2GB | 4.8 | |
 | ct-runner | 4GB | 8.8 | ⚠️ over limit when active |
 | plane | 2GB | 10.8 | |
-| wikijs | 1GB | 11.8 | |
-| outline (+ its Postgres/Redis) | ~1.5GB | 13.3 | |
-| rest-sicily | 1GB | 12.8 | |
+| outline (+ its Postgres/Redis) | ~1.5GB | 12.3 | |
+| rest-sicily | 1GB | 13.3 | |
 | each rest-\<slug\> | 1GB | +1 | |
 
 **Reality**: ct-runner is idle 99% of the time. When it runs, it needs 4GB
@@ -629,59 +625,14 @@ incus list
 incus exec rest-acme -- journalctl -u restaurant --no-pager -n 40
 ```
 
-### Deploy Wiki.js (wiki.opsavor.work)
+### Deploy Outline (wiki.opsavor.work, docs.opsavor.app)
 
-Unlike BookStack/Gitea, Wiki.js is not built from source here — like Plane,
-it runs the upstream `requarks/wiki:2` OCI image directly (plus a Postgres
-instance) via Incus's native OCI support. `scripts/deploy-wikijs.sh`
-generates a DB password on first run (`/root/.wikijs-secrets.env`),
-creates the Postgres instance once (left alone on redeploys, same
-`skip_if_exists` guard as Plane's infra containers), and always
-replaces the `wikijs` app container itself. Uploaded page assets persist
-on a separate volume mounted at `/wiki/data/content` (chowned to uid 1000
-after attach — the upstream image's entrypoint runs as the non-root `node`
-user baked into its base image, not root); everything else (pages,
-revisions, users) lives in Postgres.
-
-```sh
-./scripts/deploy-wikijs.sh
-./scripts/sync-edge-caddyfile.sh   # only needed if edge/Caddyfile changed
-```
-
-**First-run setup wizard**: unlike BookStack/Gitea, Wiki.js has no
-CLI-driven first-boot admin creation — visiting `https://wiki.opsavor.work/`
-for the first time serves its own setup wizard (site title, admin
-email/password, telemetry opt-out). Complete that once through the browser
-before configuring SSO.
-
-#### Google Workspace SSO for Wiki.js
-
-Wiki.js's Google auth strategy is configured through its admin UI
-(Administration → Login), not environment variables or a config file, and
-it layers alongside local/password login rather than replacing it (unlike
-BookStack's `oidc` mode).
-
-**1. Add the redirect URI to the existing Google Cloud OAuth client** (the
-same "Internal" app already used for BookStack/Gitea/Plane — Google's
-Internal-app restriction is still what limits sign-in to the Workspace
-domain; Wiki.js has no domain-restriction setting of its own either):
-
-```
-https://wiki.opsavor.work/login/google/callback
-```
-
-Also add `https://wiki.opsavor.work` under Authorized JavaScript origins.
-
-**2. In Wiki.js**: Administration → Login → click Google → toggle it
-enabled → paste the Client ID and Client Secret → Save. New users
-authenticating via Google get a default (non-admin) role; promote via
-Administration → Users after their first login.
-
-### Deploy Outline (outline.opsavor.work)
-
-Trial deployment alongside Wiki.js, not a replacement (yet) — Wiki.js still
-serves `wiki.opsavor.work` and `docs.opsavor.app`. Same "upstream OCI image,
-no build from source" approach as Wiki.js/Plane: `scripts/deploy-outline.sh`
+Replaced Wiki.js (which had itself replaced BookStack) after a short trial
+at `outline.opsavor.work` — that trial domain is retired now that
+`wiki.opsavor.work` and `docs.opsavor.app` both serve Outline directly.
+No dual-domain period: Outline's own URL/cookie/OAuth-callback config only
+cleanly supports one canonical hostname. Same "upstream OCI image, no
+build from source" approach as Plane: `scripts/deploy-outline.sh`
 provisions Postgres (`outline-db`) and Redis/valkey (`outline-redis`) once
 each (left alone on redeploys), generates `SECRET_KEY`/`UTILS_SECRET`/the DB
 password on first run (`/root/.outline-secrets.env`), and always replaces
@@ -705,7 +656,7 @@ is adding this redirect URI to that client in Google Cloud Console (there
 is no API for it):
 
 ```
-https://outline.opsavor.work/auth/google.callback
+https://wiki.opsavor.work/auth/google.callback
 ```
 
 Outline comes up and is reachable without this; the Google sign-in button
@@ -945,7 +896,7 @@ native-ops/
     profiles/
       base.yml                 ← least-privilege defaults (inherited by all)
       edge.yml                 ← Caddy + proxy devices for :80/:443
-      service.yml              ← internal tooling (gitea, plane, wikijs, outline)
+      service.yml              ← internal tooling (gitea, plane, outline)
       ci.yml                   ← CI runner (privileged, Incus socket mounted)
       restaurant.yml           ← per-site Next.js + SQLite
   images/
@@ -1006,6 +957,6 @@ generated). Image build scripts write nothing to this repo at runtime.
   ~1.5GB zstd). Do not Ctrl-C; the published image will be corrupt.
 
 - **Host out of RAM**: `incus list --format csv | awk -F, '{print $1}'`
-  while read; then stop non-essential services (plane, wikijs, outline) or stop
+  while read; then stop non-essential services (plane, outline) or stop
   ct-runner if it is mid-build. Consider whether you have hit the Phase 2
   trigger.
