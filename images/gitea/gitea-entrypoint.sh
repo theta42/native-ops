@@ -97,12 +97,14 @@ DEFAULT_BRANCH = main
 INI
 chown git:git "$CONF"
 
+# Unlike `gitea web`, the `gitea admin ...` subcommands do NOT run
+# database migrations themselves — Gitea's own docs for `gitea migrate`
+# say exactly this: run it first so `gitea admin user create` has a
+# schema to work with. Safe/idempotent to run on every boot.
+runuser -u git -- "$GITEA" migrate --config "$CONF"
+
 # Local admin fallback account — created once, with a generated (not
-# well-known-default) password from the start. Every `gitea admin ...`
-# subcommand initializes the app the same way `gitea web` does (DB
-# migrations included), so this and the oauth2 step below both work
-# against a freshly-rendered, not-yet-served config with no separate
-# migrate step needed.
+# well-known-default) password from the start.
 if ! runuser -u git -- "$GITEA" admin user list --config "$CONF" 2>/dev/null | grep -qw admin; then
   echo "[gitea] first boot: creating local admin account..."
   runuser -u git -- "$GITEA" admin user create --config "$CONF" \
