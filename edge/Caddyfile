@@ -81,6 +81,11 @@ docs.opsavor.app {
 		reverse_proxy bookstack:80
 	}
 
+	@git host git.opsavor.work
+	handle @git {
+		reverse_proxy gitea:3000
+	}
+
 	handle {
 		respond "not found" 404
 	}
