@@ -11,6 +11,16 @@
 # systemd-managed process (see native-ops AGENTS.md gotcha #1). To change
 # it later: edit APP_URL in /data/env inside the container, then
 # `incus restart bookstack`.
+#
+# bookstack.service is NOT enabled in the image (see build.sh): this
+# script starts it explicitly, AFTER attaching the data volume, rather
+# than letting `incus launch` auto-start it against an ephemeral
+# not-yet-mounted /data and then restarting moments later. That race
+# actually happened — mariadb-install-db plus a backgrounded temporary
+# mysqld is slow enough that the first (ephemeral) attempt was often still
+# mid-flight when a subsequent `incus restart` fired, leaving two
+# generations of mysqld/nginx/php-fpm alive and fighting over the same
+# port/socket.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,7 +47,7 @@ incus launch opsavor-bookstack bookstack --profile base --profile service
 
 sleep 3
 incus config device add bookstack data disk pool=default source=bookstack-data path=/data
-incus restart bookstack
+incus exec bookstack -- systemctl enable --now bookstack
 
 echo "[deploy] Waiting for BookStack to become healthy (first boot runs MariaDB init + migrations — can take a couple of minutes)..."
 for i in $(seq 1 48); do

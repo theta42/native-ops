@@ -121,7 +121,17 @@ TimeoutStartSec=180
 WantedBy=multi-user.target
 SVC
 
-systemctl enable bookstack
+# NOT enabled here on purpose: `incus launch` boots the container
+# immediately, and an enabled unit would auto-start against the
+# not-yet-attached data volume (an ephemeral, pre-mount /data) before
+# deploy-bookstack.sh gets a chance to attach the real one — a race that
+# actually bit this: mariadb-install-db plus a backgrounded temporary
+# mysqld is heavy/slow enough that it was often still mid-flight when the
+# subsequent `incus restart` fired, leaving that first attempt's processes
+# only partially cleaned up and colliding with the second boot's (multiple
+# supervisord instances, both nginx and php-fpm fighting over the same
+# port/socket). deploy-bookstack.sh instead does
+# `systemctl enable --now bookstack` itself, AFTER the volume is attached.
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
