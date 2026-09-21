@@ -103,6 +103,11 @@ opsavor.work {
 		reverse_proxy plane:80
 	}
 
+	@outline host outline.opsavor.work
+	handle @outline {
+		reverse_proxy outline:3000
+	}
+
 	handle {
 		respond "not found" 404
 	}
