@@ -712,10 +712,10 @@ Outline comes up and is reachable without this; the Google sign-in button
 just won't complete the flow until it's added.
 
 **No first-run wizard**: there's no separate setup step like Wiki.js's —
-just sign in with Google once the redirect URI above is added. (Not yet
-confirmed here whether the very first sign-in is auto-promoted to admin,
-the way some self-hosted wikis bootstrap — check Administration → Members
-after the first login and promote by hand if not.)
+just sign in with Google once the redirect URI above is added. Confirmed
+live: the first account to sign in gets `role = admin` automatically
+(`SELECT email, role FROM users;` against `outline-db` if you need to
+check without the UI) — nothing to promote by hand.
 
 ### Deploy Gitea (git.opsavor.work)
 
