@@ -11,6 +11,28 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data}"
+
+# Refuse to do anything until $DATA_DIR is genuinely the mounted custom
+# volume, not the container's own ephemeral rootfs directory at that path.
+# This guards against exactly the race that happened in practice: something
+# (systemd's own preset reconciliation on a container's first boot appears
+# to re-enable a unit that was explicitly disabled at image-build time,
+# independent of deploy-bookstack.sh's own enable/disable choreography)
+# started this unit before `incus config device add` had attached the
+# volume. Without this check, that early run would happily
+# mariadb-install-db and launch supervisord against the ephemeral
+# directory, and when the real volume mounted moments later (shadowing it
+# from underneath), that first generation's still-running mysqld/nginx/
+# php-fpm would linger and fight a second, correct generation for the same
+# ports/sockets — which is exactly what was observed live. Exiting fast
+# here instead (systemd's Restart=on-failure retries every few seconds)
+# means an early invocation does nothing at all rather than something
+# that has to be untangled later.
+if ! mountpoint -q "$DATA_DIR" 2>/dev/null; then
+  echo "[bookstack] $DATA_DIR is not a mounted volume yet — waiting for it to be attached" >&2
+  exit 1
+fi
+
 mkdir -p "$DATA_DIR/mysql" "$DATA_DIR/storage"
 
 # Point MariaDB at the persistent volume regardless of who starts it later
