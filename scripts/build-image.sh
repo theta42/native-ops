@@ -88,7 +88,18 @@ echo "  publishing..."
 incus stop "$TMP_CT"
 incus publish "$TMP_CT" --alias "$ALIAS" --reuse
 if [ -n "$REF" ]; then
-  incus image alias create --reuse "opsavor-${IMAGE_NAME}:latest" "$(image_fingerprint "$ALIAS")" 2>/dev/null || true
+  # Two gotchas here, both previously masked by `|| true` swallowing the
+  # real error:
+  # 1. `incus image alias create` has no --reuse flag (only `incus publish`
+  #    does), so :latest was never actually repointed.
+  # 2. Its <new alias name> argument is itself parsed as [<remote>:]<name>
+  #    on the FIRST colon — "opsavor-restaurant:latest" was read as remote
+  #    "opsavor-restaurant", resource "latest", and failed with "the remote
+  #    ... doesn't exist". Prefixing the explicit `local:` remote makes the
+  #    colon split land where intended, leaving the alias itself intact.
+  LATEST="opsavor-${IMAGE_NAME}:latest"
+  incus image alias delete "local:$LATEST" 2>/dev/null || true
+  incus image alias create "local:$LATEST" "$(image_fingerprint "$ALIAS")"
 fi
 
 incus delete "$TMP_CT" --force

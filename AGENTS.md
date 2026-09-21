@@ -69,7 +69,19 @@ pattern of the `fleet` user model DO-era instances used. See
 - UFW drops Incus bridge traffic by default. The provision script adds
   `ufw allow in on incusbr0` and route rules.
 - Image aliases with `:` (e.g., `opsavor-manager:latest`) confuse the
-  `incus launch` CLI. Use the image fingerprint — but note
+  `incus launch` CLI, AND `incus image alias create`'s own `<new alias
+  name>` argument — both parse it as `[<remote>:]<name>` on the first
+  colon, so `opsavor-restaurant:latest` becomes remote
+  "opsavor-restaurant" (which doesn't exist) rather than a literal alias.
+  Prefix an explicit `local:` remote to make a colon-bearing alias name
+  parse as intended: `incus image alias create local:opsavor-restaurant:latest
+  <fingerprint>`. (`incus publish --alias` does NOT have this problem —
+  it accepts the colon-bearing string directly.) Also note `incus image
+  alias create` has no `--reuse` flag (only `incus publish` does); to
+  repoint an existing alias, delete then create.
+
+  For `incus launch`/`incus config`, sidestep all of this by using the image
+  fingerprint instead of the alias — but note
   `incus image alias list`'s box-drawn table output is NOT safe to `awk
   '{print $N}'` on: the │ separators are their own whitespace-split fields,
   so a naive column index silently grabs the wrong column (this cost real
