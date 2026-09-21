@@ -37,9 +37,17 @@ case "$IMAGE_NAME" in
     ;;
 esac
 
+# The `base` profile caps a container at 512MB, which is enough to run an
+# app but not to build one: `npm ci` on the restaurant app (Next.js +
+# drizzle-kit + typescript + eslint as devDependencies, plus better-sqlite3
+# possibly compiling from source) gets OOM-killed well short of finishing.
+# Give build containers real headroom regardless of what the published
+# image will run with; the host has it (8GB, mostly idle).
+BUILD_LIMITS=(--config limits.cpu=2 --config limits.memory=3GB)
+
 echo "[build] Building $ALIAS from $FROM"
 incus delete "$TMP_CT" --force 2>/dev/null || true
-incus launch "$FROM" "$TMP_CT" --profile base
+incus launch "$FROM" "$TMP_CT" --profile base "${BUILD_LIMITS[@]}"
 
 echo "  waiting for network..."
 for i in $(seq 1 30); do
