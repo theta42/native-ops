@@ -72,8 +72,18 @@ PHP_FPM_UNIT="$(systemctl list-unit-files --no-legend 'php*-fpm.service' | awk '
 # supervisord's long-running one gets a chance to, and they collide on the
 # same Aria/InnoDB lock files; the stock nginx.service does the same thing
 # to port 80. Disable all three package units; supervisord owns them now.
-systemctl disable "$PHP_FPM_UNIT" mariadb nginx
-systemctl stop "$PHP_FPM_UNIT" mariadb nginx 2>/dev/null || true
+#
+# The `supervisor` PACKAGE ITSELF ships and auto-enables a `supervisor.
+# service` unit that reads this exact conf.d directory — this is the one
+# that actually caused the crash-loop this file's other comments chase:
+# it starts supervisord (and thus mysqld/nginx/php-fpm) completely
+# independently of, and before, our own bookstack.service ever runs,
+# giving two live supervisord instances fighting over the same ports.
+# bookstack.service's own entrypoint is what should be starting
+# supervisord — after the data volume is attached — not the package's
+# own unit.
+systemctl disable "$PHP_FPM_UNIT" mariadb nginx supervisor
+systemctl stop "$PHP_FPM_UNIT" mariadb nginx supervisor 2>/dev/null || true
 
 # supervisord runs all three long-lived processes; the entrypoint (below)
 # does one-time/per-boot setup (persisted volume init, migrations) BEFORE

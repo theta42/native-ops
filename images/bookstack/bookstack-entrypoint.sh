@@ -113,13 +113,20 @@ echo "[bookstack] running migrations..."
 mysqladmin --socket=/run/mysqld/mysqld.sock shutdown
 wait "$MYSQLD_PID" 2>/dev/null || true
 
-# A prior crashed/restarted attempt can leave supervisord's own unix
-# socket file behind, which makes the NEXT supervisord refuse to start at
-# all ("Another program is already listening on a port that one of our
-# HTTP servers is configured to use") even though nothing is actually
-# still running — systemd's Restart=on-failure kills the whole cgroup
-# first, but that doesn't delete this leftover file.
-rm -f /var/run/supervisor.sock
+# A prior crashed attempt (e.g. after a hard host reboot) can leave
+# supervisord's own unix socket file behind, which makes the next
+# supervisord refuse to start ("Another program is already listening on a
+# port that one of our HTTP servers is configured to use") even though
+# nothing is actually still running. But that refusal is also supervisord's
+# ONLY defense against two genuinely simultaneous instances — unconditionally
+# removing the file here previously defeated it and let a duplicate,
+# still-unexplained second invocation of this entrypoint run its own
+# mysqld/nginx/php-fpm alongside a real, already-running first one, which
+# is what was actually causing the crash-loop this guards against. Only
+# clean up the socket when nothing is actually listening on it.
+if ! pgrep -x supervisord >/dev/null 2>&1; then
+  rm -f /var/run/supervisor.sock
+fi
 
 echo "[bookstack] starting mysqld/php-fpm/nginx..."
 exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf
