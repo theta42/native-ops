@@ -86,6 +86,11 @@ docs.opsavor.app {
 		reverse_proxy gitea:3000
 	}
 
+	@tickets host tickets.opsavor.work
+	handle @tickets {
+		reverse_proxy plane:80
+	}
+
 	handle {
 		respond "not found" 404
 	}
