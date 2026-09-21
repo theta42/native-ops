@@ -40,10 +40,12 @@ esac
 # The `base` profile caps a container at 512MB, which is enough to run an
 # app but not to build one: `npm ci` on the restaurant app (Next.js +
 # drizzle-kit + typescript + eslint as devDependencies, plus better-sqlite3
-# possibly compiling from source) gets OOM-killed well short of finishing.
-# Give build containers real headroom regardless of what the published
-# image will run with; the host has it (8GB, mostly idle).
-BUILD_LIMITS=(--config limits.cpu=2 --config limits.memory=3GB)
+# possibly compiling from source) gets OOM-killed well short of finishing —
+# and even at 3GB, `next build`'s TypeScript-checking phase (Next 16 +
+# Turbopack) still got OOM-killed. Give build containers real headroom
+# regardless of what the published image will run with; the host has it
+# (8GB, mostly idle during a build).
+BUILD_LIMITS=(--config limits.cpu=2 --config limits.memory=5GB)
 
 echo "[build] Building $ALIAS from $FROM"
 incus delete "$TMP_CT" --force 2>/dev/null || true
