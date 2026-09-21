@@ -91,5 +91,13 @@ echo "[bookstack] running migrations..."
 mysqladmin --socket=/run/mysqld/mysqld.sock shutdown
 wait "$MYSQLD_PID" 2>/dev/null || true
 
+# A prior crashed/restarted attempt can leave supervisord's own unix
+# socket file behind, which makes the NEXT supervisord refuse to start at
+# all ("Another program is already listening on a port that one of our
+# HTTP servers is configured to use") even though nothing is actually
+# still running — systemd's Restart=on-failure kills the whole cgroup
+# first, but that doesn't delete this leftover file.
+rm -f /var/run/supervisor.sock
+
 echo "[bookstack] starting mysqld/php-fpm/nginx..."
 exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf

@@ -64,9 +64,16 @@ rm -f /etc/nginx/sites-enabled/default
 # next Debian release.
 PHP_FPM_BIN="$(ls /usr/sbin/php-fpm[0-9]* | head -1)"
 PHP_FPM_UNIT="$(systemctl list-unit-files --no-legend 'php*-fpm.service' | awk '{print $1}' | head -1)"
-# supervisord manages php-fpm instead; disable the package's own unit so
-# they don't race for the same port/socket at boot.
-systemctl disable "$PHP_FPM_UNIT"
+# supervisord manages php-fpm, mariadb, and nginx instead — the
+# mariadb-server, nginx, and php-fpm packages all auto-enable (and their
+# postinst scripts auto-START) their own systemd units. Left enabled, the
+# stock mariadb.service starts mysqld against our /data-redirected datadir
+# on every boot BEFORE the entrypoint's own temporary migration mysqld or
+# supervisord's long-running one gets a chance to, and they collide on the
+# same Aria/InnoDB lock files; the stock nginx.service does the same thing
+# to port 80. Disable all three package units; supervisord owns them now.
+systemctl disable "$PHP_FPM_UNIT" mariadb nginx
+systemctl stop "$PHP_FPM_UNIT" mariadb nginx 2>/dev/null || true
 
 # supervisord runs all three long-lived processes; the entrypoint (below)
 # does one-time/per-boot setup (persisted volume init, migrations) BEFORE
