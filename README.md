@@ -737,6 +737,14 @@ which bundles web/space/admin/api/live/worker/beat/an internal Caddy into
 one container) plus Postgres/Redis/RabbitMQ/MinIO as its four required
 external services.
 
+The `plane` container needs far more than the fleet's default 512MB
+(`deploy-plane.sh` overrides it to 3GB/2 vCPU at the instance level): under
+the default limit, the kernel OOM-killer inside the container's memcg kills
+the API/worker/beat/migrator processes every few seconds, which looks
+exactly like a stuck DB connection (`python manage.py wait_for_db`
+appearing to hang forever) rather than what it actually is. Confirm with
+`dmesg -T | grep oom-kill` on the host if this ever recurs.
+
 ```sh
 ./scripts/deploy-plane.sh
 ./scripts/sync-edge-caddyfile.sh   # if not already run for wiki/git

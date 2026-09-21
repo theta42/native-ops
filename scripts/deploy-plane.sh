@@ -187,8 +187,20 @@ if [ -n "${GOOGLE_CLIENT_ID:-}" ]; then
     --config environment.GOOGLE_CLIENT_SECRET="$GOOGLE_CLIENT_SECRET"
   )
 fi
+# The `base` profile's 512MB limit (fine for every other single-process
+# service in this fleet) is nowhere near enough here: this one container
+# runs ~7 processes (Django API, Celery worker, beat, 3 Next.js frontends,
+# a realtime server, Caddy). Under 512MB the kernel OOM-killer inside the
+# container's memcg kills api/worker/beat/migrator every few seconds
+# (visible as `python manage.py wait_for_db` respawning forever with
+# "Killed" in its stderr log and `dmesg -T` full of oom-kill entries for
+# cpuset=lxc.payload.plane) — that looked exactly like a DB-connectivity
+# hang until `dmesg` on the host made the real cause obvious. Override the
+# limit at the instance level rather than raising it fleet-wide.
 incus delete plane --force 2>/dev/null || true
 incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
+  --config limits.memory=3GB \
+  --config limits.cpu=2 \
   --config environment.DOMAIN_NAME="$PLANE_DOMAIN" \
   --config environment.DATABASE_URL="postgresql://plane:${POSTGRES_PASSWORD}@${PLANE_DB_IP}:5432/plane" \
   --config environment.REDIS_URL="redis://${PLANE_REDIS_IP}:6379/" \

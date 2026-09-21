@@ -118,3 +118,17 @@ pattern of the `fleet` user model DO-era instances used. See
 - `incus snapshot create <name> <snapshot>` snapshots an *instance*.
   Snapshotting a custom storage volume is a different command:
   `incus storage volume snapshot create <pool> <volume> [<snapshot>]`.
+- The `base` profile's 512MB memory limit is sized for single-process
+  services. A multi-process OCI app container (e.g. Plane's all-in-one
+  image, which runs API + worker + beat + 3 frontends + a realtime server
+  + Caddy all in one instance) will get OOM-killed inside its own memcg
+  under that limit — and it does NOT look like an OOM kill from inside the
+  container: processes just die and get respawned by supervisor/whatever
+  entrypoint loop over and over (e.g. Django's `wait_for_db` appearing to
+  hang forever, when actually each attempt is getting SIGKILLed a few
+  seconds in). The container's own stderr logs show `Killed` with no
+  further explanation. Confirm with `dmesg -T | grep oom-kill` on the
+  *host* (filter by `cpuset=lxc.payload.<name>`) before assuming a
+  networking/DB issue. Fix by overriding `limits.memory`/`limits.cpu` at
+  the instance level (`incus launch ... --config limits.memory=3GB`),
+  not by raising the shared profile.
