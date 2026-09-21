@@ -39,6 +39,12 @@ incus launch opsavor-gitea gitea --profile base --profile service
 
 sleep 3
 incus config device add gitea data disk pool=default source=gitea-data path=/data
+# Public git-over-SSH: a deliberate exception to "no public listener except
+# edge" (see README's Design principles / Firewall) — git-over-ssh is a raw
+# TCP protocol Caddy can't reverse-proxy the way it does gitea's HTTP
+# traffic, so this is its own proxy device straight from the host's public
+# interface into the container, parallel to (not instead of) edge's 80/443.
+incus config device add gitea ssh-git proxy listen=tcp:0.0.0.0:2222 connect=tcp:127.0.0.1:2222 2>/dev/null || true
 incus exec gitea -- systemctl enable --now gitea
 
 echo "[deploy] Waiting for Gitea to become healthy..."

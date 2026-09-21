@@ -21,8 +21,10 @@ This repo replaces `do-ops`; code lives in `opsavor/restaurant` (app) and
   destroy containers. What `do-ops` did with the DigitalOcean API and SSH,
   the manager now does with the Incus API — same dashboard, same endpoints,
   different substrate.
-- **Fail closed.** No public listener except the edge proxy (ports 80/443
-  forwarded via Incus `proxy` device). All inter-container traffic is on
+- **Fail closed.** Public listeners are the edge proxy (ports 80/443
+  forwarded via Incus `proxy` device) plus one deliberate exception: gitea's
+  own `proxy` device on port 2222 for git-over-ssh, which Caddy can't
+  reverse-proxy the way it does HTTP. All inter-container traffic is on
   `incusbr0` (10.0.100.0/24). A container with a missing profile has no
   network and no disk — it does not fail open.
 - **Secrets on the host, injected at launch.** All tokens live in
@@ -149,7 +151,7 @@ scoped to `default + tenants`.
 |---|---|---|---|---|---|
 | `edge` | default | base, edge | 10.0.100.10 | 1C / 256MB | ports 80/443 (proxy devices) |
 | `manager` | default | base, service | 10.0.100.11 | 2C / 2GB | :3001 (via edge Caddy) |
-| `gitea` | default | base, service | 10.0.100.12 | 2C / 2GB | :3000 (via edge Caddy) |
+| `gitea` | default | base, service | 10.0.100.12 | 2C / 2GB | :3000 (via edge Caddy), :2222 (SSH, own proxy device) |
 | `ct-runner` | default | base, ci | 10.0.100.13 | 2C / 4GB | outbound-only |
 | `plane` | services | base, service | 10.0.100.14 | 2C / 2GB | :3001 (via edge Caddy) |
 | `outline` | services | base, service | 10.0.100.1x | 2C / 1GB | :3000 (via edge Caddy) |
@@ -413,14 +415,17 @@ truth, chmod 600, gitignored.
 
 ## Firewall
 
-Host nftables (not ufw — Incus manages its own bridge NAT rules, and ufw
-fights with them):
+`ufw` (`provision-host.sh`; despite an earlier draft of this section
+claiming nftables directly — ufw is what's actually configured, plus the
+explicit `ufw allow in on incusbr0` rules below that keep it from
+dropping bridge traffic):
 
 | port | protocol | source | destination | purpose |
 |---|---|---|---|---|
 | 22 | tcp | admin CIDR | host | SSH admin |
 | 80 | tcp | any | edge (proxy) | HTTP → Caddy (redirect to HTTPS) |
 | 443 | tcp | any | edge (proxy) | HTTPS → Caddy |
+| 2222 | tcp | any | gitea (proxy device on gitea itself, not edge) | git-over-ssh — see "Deploy Gitea" |
 | 8443 | tcp | admin CIDR | host Incus API | remote management (optional; disabled by default) |
 
 Container-internal traffic on `incusbr0` is unrestricted (same trust domain).
@@ -670,14 +675,14 @@ check without the UI) — nothing to promote by hand.
 
 ### Deploy Gitea (git.opsavor.work)
 
-Same singleton-service shape as BookStack: `scripts/deploy-gitea.sh` builds
+Same singleton-service shape as Outline: `scripts/deploy-gitea.sh` builds
 the image, creates+attaches the persistent `gitea-data` volume (SQLite DB,
 repos, and generated secrets all live there — see
 `images/gitea/gitea-entrypoint.sh`), launches, health-gates. No separate
 DNS or Caddy step needed — `git.opsavor.work` is already a host matcher in
 the existing `*.opsavor.work` wildcard block in `edge/Caddyfile`, so it's
 covered the moment `./scripts/sync-edge-caddyfile.sh` has been run once
-(see "Deploy Wiki.js" above if it hasn't).
+(see "Deploy Outline" above if it hasn't).
 
 ```sh
 ./scripts/deploy-gitea.sh
@@ -686,6 +691,23 @@ covered the moment `./scripts/sync-edge-caddyfile.sh` has been run once
 A local `admin` account is created on first boot with a generated
 password (never a well-known default) — `incus exec gitea -- cat
 /data/gitea-secrets.env` to read it.
+
+#### Git over SSH (port 2222)
+
+Gitea's own built-in SSH server (not the host's OpenSSH, and not the
+system container's — `START_SSH_SERVER = true` in the generated
+`app.ini`), listening on 2222 inside the container. `deploy-gitea.sh`
+attaches an Incus `proxy` device straight from the host's public interface
+to the container (`ufw allow 2222/tcp` in `provision-host.sh`) — a
+deliberate exception to "public traffic only through edge" (see Design
+principles / Firewall above), since Caddy can't reverse-proxy a raw TCP
+protocol like git-over-ssh the way it does gitea's HTTP traffic.
+
+Clone/push URLs are `ssh://git@git.opsavor.work:2222/<owner>/<repo>.git`.
+Each user adds their own public key through the Gitea UI (Settings → SSH /
+GPG Keys) — there's no host-level SSH user or key involved; Gitea's SSH
+server authenticates against keys stored in its own database and maps the
+connection to `git-upload-pack`/`git-receive-pack` internally.
 
 #### Google Workspace SSO for Gitea
 

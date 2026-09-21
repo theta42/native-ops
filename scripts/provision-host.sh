@@ -63,6 +63,10 @@ ufw default allow outgoing
 ufw allow 22/tcp comment "SSH"
 ufw allow 80/tcp comment "HTTP"
 ufw allow 443/tcp comment "HTTPS"
+# git-over-ssh into the gitea container (Incus proxy device on gitea
+# itself, added by deploy-gitea.sh) — a deliberate exception to "public
+# traffic only through edge", since ssh isn't something Caddy can proxy.
+ufw allow 2222/tcp comment "Gitea SSH"
 # 8443 for Incus API (multi-host phase). Commented out for single-node.
 # ufw allow 8443/tcp comment "Incus API"
 ufw --force enable

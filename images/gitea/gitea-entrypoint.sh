@@ -67,7 +67,10 @@ WORK_PATH = ${DATA_DIR}
 DOMAIN = git.opsavor.work
 ROOT_URL = ${GITEA_URL}/
 HTTP_PORT = 3000
-DISABLE_SSH = true
+START_SSH_SERVER = true
+SSH_DOMAIN = git.opsavor.work
+SSH_PORT = 2222
+SSH_LISTEN_PORT = 2222
 LFS_START_SERVER = true
 
 [database]
