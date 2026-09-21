@@ -541,6 +541,50 @@ incus list
 incus exec rest-acme -- journalctl -u restaurant --no-pager -n 40
 ```
 
+### Deploy BookStack (wiki.opsavor.work)
+
+BookStack is a singleton internal service (unlike restaurants, there's only
+ever one), so it isn't run through the manager — `scripts/deploy-bookstack.sh`
+is the whole story: build the image, create+attach its persistent data
+volume (MariaDB datadir, uploads, and the generated `APP_KEY`/DB password
+all live there — see `images/bookstack/bookstack-entrypoint.sh`), launch
+the container, health-gate.
+
+```sh
+# 1. One-time: point DNS at this host. opsavor.work is a separate domain
+#    from opsavor.app (added to the same DO account) — apex + wildcard, so
+#    a single Caddy wildcard cert can cover every opsavor.work subdomain,
+#    not just wiki.
+set -a; . /root/.env; set +a
+DOMAIN=opsavor.work ./providers/digitalocean/dns.sh <host-public-ip>
+
+# 2. Build + launch:
+./scripts/deploy-bookstack.sh
+
+# 3. Route wiki.opsavor.work at it and pick up the wildcard cert. The edge
+#    Caddyfile's `*.opsavor.work` block (see edge/Caddyfile) already has a
+#    host matcher for wiki.opsavor.work → bookstack:80; this just pushes
+#    that file to the running edge container (there was previously no
+#    script for this at all — the live Caddyfile was hand-pushed once and
+#    never kept in sync):
+./scripts/sync-edge-caddyfile.sh
+
+# First boot takes a couple of minutes (MariaDB datadir init + Laravel
+# migrations run inline before the app can serve). Watch it:
+incus exec bookstack -- journalctl -u bookstack --no-pager -n 40
+```
+
+Adding a THIRD opsavor.work subdomain later (say `status.opsavor.work`)
+needs no new DNS record (the wildcard already covers it) and no new
+top-level Caddy site block (that would issue it a separate, non-wildcard
+cert) — just another `@matcher`/`handle` pair inside the existing
+`*.opsavor.work` block, then `./scripts/sync-edge-caddyfile.sh`.
+
+To change BookStack's public URL later: `incus exec bookstack -- vi
+/data/env` (edit `APP_URL`), then `incus restart bookstack` — the
+entrypoint only ever WRITES that file on the volume's first boot, so this
+is the one supported way to change it afterward.
+
 ### Migrate a restaurant between nodes (Phase 2)
 
 ```sh

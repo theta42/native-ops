@@ -58,9 +58,35 @@ pattern of the `fleet` user model DO-era instances used. See
 ## Common gotchas
 
 - `incus config set environment.*` does NOT affect systemd services. Use
-  EnvironmentFile in the unit instead.
-- Volume attach: `incus config device add` needs full host path, not just
-  volume name. Path must not contain `/` in the device name.
+  EnvironmentFile in the unit instead. The same is true of `incus exec`:
+  it does NOT forward the calling shell's environment into the container
+  either (only `incus config set environment.*` or an explicit `--env
+  KEY=VALUE` on the exec call itself reaches the executed command) — so
+  `FOO=bar incus exec ct -- some-script` does NOT make `$FOO` visible
+  inside `some-script`, the same way it wouldn't for a plain systemd unit.
+- Attaching a custom volume by its raw host path (`source=/var/lib/incus/
+  storage-pools/<pool>/custom/<pool>_<vol>`) bind-mounts it directly and
+  skips Incus's own volume config — notably `security.shifted`, which is
+  what lets an unprivileged container's own uid/gid mapping apply to the
+  volume's contents. Attach it by name instead — `disk pool=<pool>
+  source=<vol> path=<path>` — and the volume's own config (including
+  security.shifted) actually takes effect at mount time. Without shifting,
+  the volume directory is host-root-owned (typically mode 711), and
+  neither a non-root user inside the container nor an unprivileged host
+  SSH user (see "Manager -> Incus control plane" above) can write to it;
+  WITH it, root inside the container — which `incus exec` always runs
+  as — can freely chown/chmod its own view of the mount for whatever
+  user actually needs it. (The device name itself still can't contain
+  `/`, regardless of which form `source=` takes.)
+- One Caddy site block gets one cert. A wildcard block (`*.opsavor.work
+  { tls { dns ... } ... }`) and a second, more specific block for one of
+  its own subdomains (`wiki.opsavor.work { tls { dns ... } ... }`) are
+  TWO separate site definitions to Caddy — the specific one issues its
+  OWN individual cert rather than reusing the wildcard, silently defeating
+  the point of having one. To serve multiple names under one wildcard
+  cert, keep them all in the SAME site block and split on `@matcher` /
+  `handle` by Host header instead (see `*.opsavor.app` and `*.opsavor.work`
+  in edge/Caddyfile).
 - Order matters when a device's mount path is one a container write targets
   (e.g. `/app/.data/env`): attach the device *before* writing under it. A
   write that lands first goes to the container's ephemeral rootfs copy of

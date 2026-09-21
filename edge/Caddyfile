@@ -62,4 +62,28 @@ docs.opsavor.app {
 	reverse_proxy manager:3001
 }
 
+# opsavor.work: internal tooling domain (separate from the opsavor.app
+# customer-facing wildcard above). One wildcard cert covers everything
+# under it via host matchers in a SINGLE site block — a second site block
+# for a specific name under the same wildcard (e.g. a literal
+# "wiki.opsavor.work { ... }") would make Caddy issue that name its own
+# separate cert instead of reusing this one, defeating the point of having
+# a wildcard at all. Add a new @matcher/handle pair here for each new
+# opsavor.work subdomain rather than a new top-level site block.
+*.opsavor.work {
+	tls {
+		dns digitalocean {env.DO_API_TOKEN}
+	}
+	import strip-forged-identity
+
+	@wiki host wiki.opsavor.work
+	handle @wiki {
+		reverse_proxy bookstack:80
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}
+
 import /etc/caddy/sites/*.caddy
