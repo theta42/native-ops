@@ -10,8 +10,14 @@ REPO_URL="${RESTAURANT_REPO:-ssh://gitea@git.theta42.com:2222/opsavor/restaurant
 apt-get update -qq
 # build-essential + python3: better-sqlite3 falls back to compiling its
 # native binding from source when no prebuilt matches this glibc/Node
-# combo. Purged again below once the build is done (mirrors the Dockerfile's
-# multi-stage image, which never shipped the build stage's apt packages).
+# combo. Left installed afterward (NOT purged): `apt-get purge
+# build-essential python3` was tried here to shrink the image (mirroring
+# the old Dockerfile's multi-stage build, which never shipped the build
+# stage's packages) but apt resolved that combined purge by ALSO removing
+# nodejs — confirmed by reproducing it standalone against a plain
+# opsavor-base container. The app needs node to run at all, so a smaller
+# image is not worth silently losing it; revisit if a safe way to shrink
+# this is found (e.g. purging in a separate, later-published layer).
 apt-get install -y -qq --no-install-recommends \
   ca-certificates curl git sqlite3 build-essential python3
 
@@ -69,9 +75,7 @@ SVC
 
 systemctl enable restaurant
 
-# Cleanup build source and build-only dependencies
+# Cleanup build source (build-essential/python3 stay — see above)
 rm -rf /tmp/restaurant-src
-apt-get purge -y -qq build-essential python3
-apt-get autoremove -y -qq
 apt-get clean
 rm -rf /var/lib/apt/lists/*
