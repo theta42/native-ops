@@ -78,22 +78,37 @@ echo "[deploy] MinIO..."
 # minio/minio on Docker Hub now returns "requested access to the resource
 # is denied" outright (MinIO moved off Docker Hub at some point) — quay.io
 # still serves it.
+# The image's own entrypoint (`/usr/bin/docker-entrypoint.sh minio` —
+# check `incus config show <instance>`'s auto-populated `oci.entrypoint`
+# on any OCI instance to see this per-image) passes bare `minio` with no
+# subcommand, which just prints usage and exits: MINIO_VOLUMES as an env
+# var is NOT enough on its own, minio still needs the `server` subcommand
+# and path as actual arguments. `oci.entrypoint` is a real, overridable
+# Incus config key for exactly this.
 new_volume plane-minio-data
 incus delete plane-minio --force 2>/dev/null || true
 incus launch quay:minio/minio plane-minio --profile base \
   --config environment.MINIO_ROOT_USER="$MINIO_ROOT_USER" \
   --config environment.MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
-  --config environment.MINIO_VOLUMES=/export \
-  --config environment.MINIO_CONSOLE_ADDRESS=:9090
+  --config oci.entrypoint="/usr/bin/docker-entrypoint.sh minio server /export --console-address :9090"
 sleep 5
 incus config device add plane-minio data disk pool=default source=plane-minio-data path=/export
 incus restart plane-minio
 
 echo "[deploy] waiting for MinIO..."
+minio_up=false
 for i in $(seq 1 24); do
-  incus exec plane-minio -- curl -fsS --max-time 3 http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break
+  if incus exec plane-minio -- curl -fsS --max-time 3 http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+    minio_up=true
+    break
+  fi
   sleep 5
 done
+if [ "$minio_up" != "true" ]; then
+  echo "[deploy] MinIO did not become healthy" >&2
+  incus console plane-minio --show-log 2>&1 | tail -30
+  exit 1
+fi
 
 echo "[deploy] ensuring the uploads bucket exists..."
 incus delete plane-mc-init --force 2>/dev/null || true
