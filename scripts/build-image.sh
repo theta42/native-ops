@@ -6,15 +6,17 @@
 #   ref:        git tag/branch for app images
 #
 # For base/edge/gitea/plane/bookstack: builds from the image recipe in images/
-# For manager/restaurant: builds FROM opsavor-base, clones the app repo at <ref>
+# For manager/restaurant: builds FROM opsavor-base; images/<name>/build.sh
+# clones the app repo at <ref> itself (via $MANAGER_REPO / $RESTAURANT_REPO).
 #
-# The image is built on the Incus host. Temp container → publish → delete.
+# The image is built on the Incus host. Temp container -> publish -> delete.
 set -euo pipefail
 
 IMAGE_NAME="${1:?usage: build-image.sh <name> [ref]}"
 REF="${2:-}"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$REPO_DIR/images/$IMAGE_NAME"
+source "$REPO_DIR/scripts/lib.sh"
 
 [ -d "$BUILD_DIR" ] || { echo "no image recipe at $BUILD_DIR" >&2; exit 1; }
 
@@ -50,16 +52,8 @@ done
 # Push the build recipe
 incus file push -r "$BUILD_DIR/" "$TMP_CT/tmp/build/"
 
-# For manager/restaurant (tag-based builds), also clone the app source
-if [ "$IMAGE_NAME" = "manager" ] || [ "$IMAGE_NAME" = "restaurant" ]; then
-  APP_REPO="${APP_REPO:-/root/${IMAGE_NAME}}"
-  if [ -n "$REF" ] && [ -d "$APP_REPO" ]; then
-    echo "  cloning app at $REF..."
-    incus exec "$TMP_CT" -- git clone --depth 1 --branch "$REF" "$APP_REPO" /tmp/app-src
-  fi
-fi
-
-# Run build
+# Run build (manager/restaurant clone their own app source inside build.sh;
+# base/edge/gitea/plane/bookstack ignore $2 entirely)
 if [ -n "$REF" ]; then
   incus exec "$TMP_CT" -- bash "/tmp/build/build.sh" "$REF"
 else
@@ -71,9 +65,8 @@ echo "  publishing..."
 incus stop "$TMP_CT"
 incus publish "$TMP_CT" --alias "$ALIAS" --reuse
 if [ -n "$REF" ]; then
-  incus image alias create --reuse "opsavor-${IMAGE_NAME}:latest" "$ALIAS" 2>/dev/null || true
+  incus image alias create --reuse "opsavor-${IMAGE_NAME}:latest" "$(image_fingerprint "$ALIAS")" 2>/dev/null || true
 fi
 
 incus delete "$TMP_CT" --force
-echo "[build] Done: $ALIAS"
-incus image list "$IMAGE_NAME"
+echo "[build] Done: $ALIAS ($(image_fingerprint "$ALIAS"))"

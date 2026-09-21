@@ -21,27 +21,30 @@ chmod +x /usr/local/bin/caddy
 # Install supporting files
 mkdir -p /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy
 
-# Create user for caddy
-useradd --system --shell /usr/sbin/nologin --home /var/lib/caddy caddy 2>/dev/null || true
-chown caddy:caddy /var/lib/caddy /var/log/caddy
-
-# Systemd service — Caddy needs the DO_API_TOKEN env var for DNS-01.
-# incus config set environment.* does NOT propagate to systemd services,
-# so we use an EnvironmentFile.
+# Runs as root, no dedicated `caddy` user: binding 80/443 needs
+# CAP_NET_BIND_SERVICE, and granting that to a non-root user via
+# AmbientCapabilities requires matching file capabilities on the binary too
+# (setcap doesn't reliably survive `incus publish`'s squashing). Root
+# sidesteps that; the container itself is still unprivileged
+# (security.privileged: false in profiles/base.yml), so this doesn't grant
+# anything outside the container's own namespace.
+#
+# Caddy needs the DO_API_TOKEN env var for DNS-01. `incus config set
+# environment.*` does NOT propagate to systemd services, so this uses an
+# EnvironmentFile instead (see AGENTS.md gotcha #1).
 cat > /etc/systemd/system/caddy.service <<'SVC'
 [Unit]
 Description=Caddy web server (opsavor edge)
 After=network.target
 
 [Service]
-User=caddy
-Group=caddy
+User=root
+Group=root
 EnvironmentFile=-/etc/default/edge
 ExecStart=/usr/local/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
 ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 Restart=on-failure
 RestartSec=5
-AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

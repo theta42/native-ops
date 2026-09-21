@@ -68,6 +68,24 @@ ufw route allow out on incusbr0 comment "Incus bridge forward out"
 ufw route allow in on incusbr0 out on eth0 comment "Incus bridge NAT out"
 ufw reload
 
+# The manager container controls Incus (launching/replacing restaurant and
+# service containers) by SSHing back to this host as a dedicated,
+# low-privilege user rather than mounting the Incus socket into the
+# container or giving it a root key: `manager-ctl` can run `incus` (it's in
+# the incus-admin group, which owns /var/lib/incus/unix.socket) but has no
+# sudo and no other access. deploy-manager.sh pushes the private half of
+# this key into the manager container on every deploy.
+echo "[provision] Setting up the manager-ctl Incus control user..."
+id manager-ctl >/dev/null 2>&1 || useradd -m -s /bin/bash -G incus-admin manager-ctl
+mkdir -p /home/manager-ctl/.ssh
+chmod 700 /home/manager-ctl/.ssh
+if [ ! -f /root/.ssh/manager_incus_ed25519 ]; then
+  ssh-keygen -t ed25519 -f /root/.ssh/manager_incus_ed25519 -N "" -C "manager-incus-ctl"
+fi
+cp /root/.ssh/manager_incus_ed25519.pub /home/manager-ctl/.ssh/authorized_keys
+chown -R manager-ctl:manager-ctl /home/manager-ctl/.ssh
+chmod 600 /home/manager-ctl/.ssh/authorized_keys
+
 echo "[provision] Host provisioning complete."
 echo ""
 echo "Next steps:"

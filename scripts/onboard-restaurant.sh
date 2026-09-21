@@ -14,7 +14,8 @@ OWNER_PASSWORD="${4:?}"
 SIZE="${5:-medium}"
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-source /root/.env 2>/dev/null || true
+source "$REPO_DIR/scripts/lib.sh"
+set -a; [ -f /root/.env ] && . /root/.env; set +a
 
 # Validate slug (lowercase alphanumeric + hyphens, 2-30 chars)
 if ! echo "$SLUG" | grep -qE '^[a-z0-9-]{2,30}$'; then
@@ -29,10 +30,10 @@ if incus info "rest-$SLUG" >/dev/null 2>&1; then
 fi
 
 # Get the restaurant image
-FP=$(incus image alias list | awk '/opsavor-restaurant:latest/ {print $2}')
+FP=$(image_fingerprint "opsavor-restaurant:latest" || true)
 if [ -z "$FP" ]; then
   echo "no opsavor-restaurant image found. Build it first:" >&2
-  echo "  ./scripts/build-image.sh restaurant restaurant-v0.1.0" >&2
+  echo "  ./scripts/build-image.sh restaurant restaurant-v0.2.2" >&2
   exit 1
 fi
 
@@ -59,10 +60,15 @@ incus launch "$FP" "rest-$SLUG" --profile base --profile restaurant \
 
 sleep 3
 
-# Write the instance env
-incus exec "rest-$SLUG" -- mkdir -p /app/.data
+# Attach the volume BEFORE writing the env: the systemd unit reads
+# EnvironmentFile=-/app/.data/env, which only lands on the persistent volume
+# if that path is already the mount when we write to it. Writing first and
+# attaching after would put the file on the container's ephemeral rootfs
+# copy of /app/.data, which the device-add then shadows — silently losing it.
+incus config device add "rest-$SLUG" data disk source="$VOL_PATH" path=/app/.data
+
 SERVICE_TOKEN=$(openssl rand -hex 32)
-incus exec "rest-$SLUG" -- bash -c "cat > /etc/default/restaurant <<EOF
+incus exec "rest-$SLUG" -- bash -c "cat > /app/.data/env <<EOF
 SITE_SLUG=$SLUG
 BASE_URL=https://${SLUG}.opsavor.app
 OWNER_EMAIL=$OWNER_EMAIL
@@ -70,11 +76,7 @@ OWNER_PASSWORD=$OWNER_PASSWORD
 SERVICE_TOKEN=$SERVICE_TOKEN
 OLLAMA_API_KEY=${OLLAMA_DEFAULT_TOKEN:-}
 OLLAMA_MODEL=${OLLAMA_DEFAULT_MODEL:-gemma4:31b-cloud}
-EOF
-chown restaurant:restaurant /etc/default/restaurant"
-
-# Attach volume
-incus config device add "rest-$SLUG" data disk source="$VOL_PATH" path=/app/.data
+EOF"
 
 incus restart "rest-$SLUG"
 
@@ -93,9 +95,13 @@ for i in $(seq 1 36); do
   sleep 5
 done
 
-# Write Caddy site block
+# Write Caddy site block. This is a plain host path (edge/sites is bind-
+# mounted into the edge container as /etc/caddy/sites), not an Incus
+# instance path — `incus file push` takes an <instance>/<path> destination,
+# so a local heredoc redirect is what's actually needed here.
+mkdir -p "$REPO_DIR/edge/sites"
 SITE_FILE="$REPO_DIR/edge/sites/rest-$SLUG.caddy"
-incus file push - "$SITE_FILE" <<CADDYEOF
+cat > "$SITE_FILE" <<CADDYEOF
 ${SLUG}.opsavor.app {
 	tls {
 		dns digitalocean {env.DO_API_TOKEN}
