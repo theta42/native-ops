@@ -2,7 +2,7 @@
 # Build and publish an Incus image.
 #
 # Usage: ./scripts/build-image.sh <image-name> [ref]
-#   image-name: base | edge | manager | restaurant | home | gitea | plane
+#   image-name: base | edge | manager | restaurant | home | gitea | plane | platform
 #   ref:        git tag/branch for app images
 #
 # For base/edge/gitea/plane: builds from the image recipe in images/
@@ -75,7 +75,7 @@ incus file push -r "$BUILD_DIR/" "$TMP_CT/tmp/build/"
 # (gitea_opsavor_deploy) — image/management as explicit, per-host keys.
 case "$IMAGE_NAME" in
   manager|restaurant) DEPLOY_KEY_SRC=/root/.ssh/gitea_deploy; DEPLOY_KEY_NAME=gitea_deploy ;;
-  home)               DEPLOY_KEY_SRC=/root/.ssh/gitea_opsavor_deploy; DEPLOY_KEY_NAME=gitea_opsavor_deploy ;;
+  home|platform)      DEPLOY_KEY_SRC=/root/.ssh/gitea_opsavor_deploy; DEPLOY_KEY_NAME=gitea_opsavor_deploy ;;
   *)                  DEPLOY_KEY_SRC="" ;;
 esac
 
