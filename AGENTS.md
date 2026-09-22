@@ -132,3 +132,38 @@ pattern of the `fleet` user model DO-era instances used. See
   networking/DB issue. Fix by overriding `limits.memory`/`limits.cpu` at
   the instance level (`incus launch ... --config limits.memory=3GB`),
   not by raising the shared profile.
+- `incus config set <ct> environment.KEY value` followed by `incus restart
+  <ct>` does NOT refresh the environment an OCI container's own init
+  process (PID 1, e.g. supervisord) sees — only `incus exec` dynamically
+  picks up the live config on each call. The new value only reaches PID 1
+  and its children at actual container creation (`incus launch`), i.e. a
+  real delete+relaunch, not a plain restart of an existing container.
+  Confirmed live debugging Plane: `incus config get plane
+  environment.GUNICORN_WORKERS` correctly showed the new value, and
+  `incus exec plane -- echo $GUNICORN_WORKERS` also showed it — but the
+  real supervisord-spawned `api` process kept seeing the OLD (empty)
+  value across several `incus restart plane` cycles, until the container
+  was actually deleted and relaunched (`deploy-plane.sh`'s own pattern).
+- A vendored image's own entrypoint script can be broken by conditions
+  that don't exist under real Docker but do under Incus's OCI container
+  support. Concretely: makeplane/plane-aio-community's
+  `docker-entrypoint-api.sh` does `DISK_INFO=$(df -h)` under `set -e` to
+  build a machine-signature. Under Incus, `/sys/kernel/debug/tracing` is
+  mounted but unreadable ("Permission denied"), GNU df's exit status goes
+  non-zero when even one enumerated mount fails to stat, and `set -e`
+  kills the whole script right there — every single boot, before
+  register_instance or gunicorn ever run. No traceback anywhere (df's own
+  stderr line is the only visible symptom), api stuck in a silent
+  ~10s crash-restart loop, everything else in the container (worker,
+  beat, db/redis/mq connections) completely healthy. `images/plane/
+  docker-entrypoint-api-patch.sh` is a patched copy (`df -h 2>/dev/null
+  || true`) that `deploy-plane.sh` pushes over the vendored path on every
+  deploy — it has to be re-pushed each time since it's a file inside the
+  container, not something `incus config set` can persist across a
+  relaunch. When an entrypoint loop is silent like this (respawns fast,
+  zero stderr beyond something that looks like noise), reproduce it by
+  hand with `incus exec <ct> -- bash -x <entrypoint script>` piped to a
+  file — that's what actually found this, after `dmesg` (not OOM),
+  individually re-running every later step by hand (all succeeded,
+  which is what made this so confusing), and reading tracebacks (there
+  were none) had all failed to explain it.

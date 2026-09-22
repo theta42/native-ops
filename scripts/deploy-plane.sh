@@ -251,10 +251,32 @@ incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.LIVE_SERVER_SECRET_KEY="$LIVE_SERVER_SECRET_KEY" \
   "${GOOGLE_OAUTH_ARGS[@]}"
 
+echo "[deploy] patching the vendored api entrypoint..."
+# Upstream's docker-entrypoint-api.sh computes a machine-signature via
+# `DISK_INFO=$(df -h)` under `set -e`. Under Incus's OCI container support,
+# /sys/kernel/debug/tracing is mounted but unreadable, GNU df's exit status
+# goes non-zero when it can't stat that one mount, and set -e kills the
+# whole script right there — every single time this container boots, before
+# ever reaching register_instance or gunicorn (confirmed live: the api
+# process crash-looped with no traceback, 502 forever, until this was
+# patched). Re-pushed on every deploy since it's a file inside the
+# container, not something incus config set can persist across a relaunch.
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+incus file push "$REPO_DIR/images/plane/docker-entrypoint-api-patch.sh" \
+  plane/app/backend/bin/docker-entrypoint-api.sh --mode 755
+incus restart plane
+
 echo "[deploy] Waiting for Plane to become healthy (first boot runs DB migrations across several services — can take a few minutes)..."
 for i in $(seq 1 60); do
-  if incus exec plane -- curl -fsS --max-time 5 http://127.0.0.1/ >/dev/null 2>&1; then
-    echo "[deploy] Plane healthy"
+  # Root / is served even while the api process itself is crash-looping
+  # (confirmed live — it's what let this exact outage pass the old check
+  # for a full hour), so this checks /api/ instead. curl -f would treat
+  # api's own normal 404-on-bare-/api/ as a failure, so this checks the
+  # status code directly instead: anything but 502 (bad gateway — proxy
+  # up, api down) or 000 (couldn't connect at all) means api answered.
+  code="$(incus exec plane -- curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1/api/ 2>/dev/null || echo 000)"
+  if [ "$code" != "502" ] && [ "$code" != "000" ]; then
+    echo "[deploy] Plane healthy (api responded ${code})"
     exit 0
   fi
   sleep 5
