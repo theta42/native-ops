@@ -166,9 +166,21 @@ print(next(a['address'] for a in addrs if a['family'] == 'inet'))
 PLANE_DB_IP="$(get_ip plane-db)"
 PLANE_REDIS_IP="$(get_ip plane-redis)"
 PLANE_MQ_IP="$(get_ip plane-mq)"
-# No PLANE_MINIO_IP here: AWS_S3_ENDPOINT_URL below is the public domain,
-# not MinIO's internal bridge IP (see the Caddyfile's /uploads/* route to
-# plane-minio for why) — the internal address is never referenced directly.
+PLANE_MINIO_IP="$(get_ip plane-minio)"
+# AWS_S3_ENDPOINT_URL is the internal bridge IP, not the public domain — a
+# same-domain hairpin (browser-facing URL == the app's own public domain,
+# proxied back to plane-minio via edge/Caddyfile's /uploads/* route) was
+# tried and reverted live: it's the pattern a real GitHub issue against
+# this exact image warns doesn't work cleanly (makeplane/plane#6740), and
+# in practice broke the very first restart after switching to it — though
+# that restart also hit the unrelated GUNICORN_WORKERS bug below at the
+# same time, so the S3-hairpin failure was never independently isolated
+# from that one. Left as the known-working internal address until it's
+# tested on its own, in isolation, with GUNICORN_WORKERS already fixed —
+# not re-attempted here after one already-scary outage in the same
+# session. The browser-facing upload-URL bug this was trying to fix
+# (Plane bakes this address into every upload link it returns — see
+# edge/Caddyfile's own comment on the /uploads/* route) is still open.
 
 # No `latest` tag exists for this image ("manifest unknown") — pin an
 # actual release tag instead.
@@ -210,6 +222,14 @@ fi
 # request-logging middleware. It also gates whether session/CSRF cookies
 # get `Secure` at all (`secure_origins` in the same file), so this is the
 # correct setting for an HTTPS deployment regardless.
+#
+# GUNICORN_WORKERS: this image's own supervisor.conf passes it straight to
+# `gunicorn -w "$GUNICORN_WORKERS"` (docker-entrypoint-api.sh) with no
+# default — left unset, that's `-w ""`, and gunicorn refuses to start at
+# all ("error: argument -w/--workers: invalid int value: ''"), no
+# traceback, api stuck in a silent restart loop. This only ever surfaces
+# on a restart (confirmed live: it was wrong from this script's first
+# version, invisible until the api process actually had to boot again).
 incus delete plane --force 2>/dev/null || true
 incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config limits.memory=3GB \
@@ -222,9 +242,10 @@ incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
   --config environment.AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
   --config environment.AWS_S3_BUCKET_NAME=uploads \
-  --config environment.AWS_S3_ENDPOINT_URL="https://${PLANE_DOMAIN}" \
+  --config environment.AWS_S3_ENDPOINT_URL="http://${PLANE_MINIO_IP}:9000" \
   --config environment.USE_MINIO=1 \
   --config environment.SITE_ADDRESS=:80 \
+  --config environment.GUNICORN_WORKERS=2 \
   --config environment.CORS_ALLOWED_ORIGINS="https://${PLANE_DOMAIN}" \
   --config environment.SECRET_KEY="$SECRET_KEY" \
   --config environment.LIVE_SERVER_SECRET_KEY="$LIVE_SERVER_SECRET_KEY" \
