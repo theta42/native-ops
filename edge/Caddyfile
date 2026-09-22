@@ -136,9 +136,18 @@ opsavor.work {
 	# this path is proxied here to plane-minio instead of falling through
 	# to the Plane app container. plane.opsavor.app doesn't need this: it's
 	# never the origin baked into AWS_S3_ENDPOINT_URL.
+	#
+	# Both path forms matter: the browser's presigned-POST upload targets
+	# the bare bucket root (`/uploads`, object key as a form field, not a
+	# URL segment — S3's "POST Policy" upload shape), while GETs for a
+	# specific object are `/uploads/<key>`. `/uploads/*` alone requires a
+	# trailing slash and never matches the bare root, so a real upload POST
+	# fell through to the Plane app container (a bare 405, not a MinIO
+	# error) even with the endpoint fix above — confirmed live by testing
+	# the actual POST shape, not just a GET.
 	@tickets host tickets.opsavor.work
 	handle @tickets {
-		@tickets-uploads path /uploads/*
+		@tickets-uploads path /uploads /uploads/*
 		handle @tickets-uploads {
 			reverse_proxy plane-minio:9000
 		}
