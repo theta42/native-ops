@@ -166,21 +166,19 @@ print(next(a['address'] for a in addrs if a['family'] == 'inet'))
 PLANE_DB_IP="$(get_ip plane-db)"
 PLANE_REDIS_IP="$(get_ip plane-redis)"
 PLANE_MQ_IP="$(get_ip plane-mq)"
-PLANE_MINIO_IP="$(get_ip plane-minio)"
-# AWS_S3_ENDPOINT_URL is the internal bridge IP, not the public domain — a
-# same-domain hairpin (browser-facing URL == the app's own public domain,
-# proxied back to plane-minio via edge/Caddyfile's /uploads/* route) was
-# tried and reverted live: it's the pattern a real GitHub issue against
-# this exact image warns doesn't work cleanly (makeplane/plane#6740), and
-# in practice broke the very first restart after switching to it — though
-# that restart also hit the unrelated GUNICORN_WORKERS bug below at the
-# same time, so the S3-hairpin failure was never independently isolated
-# from that one. Left as the known-working internal address until it's
-# tested on its own, in isolation, with GUNICORN_WORKERS already fixed —
-# not re-attempted here after one already-scary outage in the same
-# session. The browser-facing upload-URL bug this was trying to fix
-# (Plane bakes this address into every upload link it returns — see
-# edge/Caddyfile's own comment on the /uploads/* route) is still open.
+# AWS_S3_ENDPOINT_URL is the public domain, not plane-minio's internal
+# bridge IP — Plane bakes this address into every upload/attachment link
+# it returns to the browser, so an internal-only address means every
+# upload silently stalls (browser tries to POST straight to
+# 10.0.100.x:9000, which it can never reach). edge/Caddyfile's /uploads/*
+# route on this domain proxies that straight to plane-minio, so the same
+# address works for both the browser and (via that same public hostname)
+# Plane's own server-side S3 client. This was tried once before and
+# reverted mid-incident because it looked implicated in an api
+# crash-loop — it wasn't; that crash was the unrelated GUNICORN_WORKERS
+# bug below (unset before this same file also fixed it), confirmed by the
+# crash persisting even after reverting this back to the internal IP.
+# Re-applied here now that the two are no longer confounded.
 
 # No `latest` tag exists for this image ("manifest unknown") — pin an
 # actual release tag instead.
@@ -242,7 +240,7 @@ incus launch docker:makeplane/plane-aio-community:v1.4.2 plane --profile base \
   --config environment.AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
   --config environment.AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
   --config environment.AWS_S3_BUCKET_NAME=uploads \
-  --config environment.AWS_S3_ENDPOINT_URL="http://${PLANE_MINIO_IP}:9000" \
+  --config environment.AWS_S3_ENDPOINT_URL="https://${PLANE_DOMAIN}" \
   --config environment.USE_MINIO=1 \
   --config environment.SITE_ADDRESS=:80 \
   --config environment.GUNICORN_WORKERS=2 \
