@@ -625,8 +625,18 @@ entirely — `/api/meta`'s `google_sso` field reflects this, and
 The public marketing/home page (`https://opsavor.ai`, apex + `www`) is a
 small Node static server from the `opsavor/opsavor.ai` repo, running in the
 `home` container and reverse-proxied by edge Caddy. It replaced a ChatGPT
-Sites deployment; its DNS moved from GoDaddy/Cloudflare to DigitalOcean so
-TLS uses the same DNS-01 provider as the rest of the edge.
+Sites deployment; its DNS moved from GoDaddy/Cloudflare to DigitalOcean.
+
+TLS for `opsavor.ai`/`www` uses Caddy's default **HTTP-01 / TLS-ALPN**
+challenge, *not* the DNS-01 provider the wildcard blocks use. The
+`caddy-dns/digitalocean` plugin is broken against this zone: it creates the
+challenge TXT records but cannot delete them (`strconv.Atoi: parsing "":
+invalid syntax`), so stale records pile up and its own propagation self-check
+times out, and no cert is ever issued. apex + www are plain (non-wildcard)
+names, so the default challenge works with no DNS provider at all. See the
+comment in `edge/Caddyfile`. (The same provider bug is latent for the
+`*.opsavor.app`/`*.opsavor.work` wildcard renewals — worth revisiting
+separately.)
 
 ```sh
 # 1. DNS: point opsavor.ai (apex + wildcard) at the host, in DO DNS —
