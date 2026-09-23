@@ -110,7 +110,8 @@ func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error
 		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", name))
 		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip addr add %s/24 dev eth0 || true", name, targetIP))
 		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip route replace default via 10.0.100.1 || true", name))
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' | incus exec %s -- tee /etc/resolv.conf || true", name))
+		resolvB64 := base64.StdEncoding.EncodeToString([]byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"))
+		_, _ = c.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- tee /etc/resolv.conf >/dev/null || true", resolvB64, name))
 
 		out, err := c.exec.Run(ctx, cmd)
 		if err == nil {
