@@ -236,15 +236,19 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 				}
 			}
 
-			// If host exists, verify SSH authentication
+			// If host exists, verify SSH authentication and command execution
 			if primaryHostIP != "" && len(privKeyPEM) > 0 {
 				testExec, testErr := remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
+				if testErr == nil {
+					if _, err := testExec.Run(ctx, "true"); err != nil {
+						testErr = err
+					}
+					testExec.Close()
+				}
 				if testErr != nil {
-					log.Printf("    Host %s (%s) exists but SSH authentication failed (%v). Re-provisioning with registered SSH key...\n", hostName, primaryHostIP, testErr)
+					log.Printf("    Host %s (%s) exists but SSH verification failed (%v). Re-provisioning with registered SSH key...\n", hostName, primaryHostIP, testErr)
 					_ = r.hostMgr.DestroyHost(ctx, hostCfg.Provider, existingHostID)
 					primaryHostIP = ""
-				} else {
-					testExec.Close()
 				}
 			}
 
