@@ -1,28 +1,5 @@
-# Per-site block template. The manager renders one file per restaurant at
-# /etc/caddy/sites/<slug>.caddy in the edge container, then `caddy reload`.
-#
-# Active site (<slug>.opsavor.app -> restaurant container):
-#
-#   <slug>.opsavor.app {
-#       tls {
-#           dns digitalocean {env.DO_API_TOKEN}
-#       }
-#       import strip-forged-identity
-#       reverse_proxy rest-<slug>:3000
-#   }
-#
-# Suspended site (reason shown, origin never touched):
-#
-#   <slug>.opsavor.app {
-#       tls {
-#           dns digitalocean {env.DO_API_TOKEN}
-#       }
-#       import strip-forged-identity
-#       handle {
-#           respond "This restaurant site is suspended: <reason>. Contact support." 503
-#       }
-#   }
-#
-# Note: the proxy target is the Incus container name. Incus internal DNS
-# (dnsmasq on incusbr0) resolves container names to their bridge IPs when
-# dns.mode is "managed" in the network config.
+# Generic site template
+{{.Domain}} {
+    {{if .TLS}}tls {{.TLS}}{{end}}
+    reverse_proxy {{.UpstreamIP}}:{{.UpstreamPort}}
+}
