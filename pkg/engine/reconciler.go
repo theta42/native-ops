@@ -351,6 +351,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv4.address 10.0.100.1/24 || true")
 		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv4.nat true || true")
 		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv6.address none || true")
+		_, _ = sshExec.Run(ctx, "incus network set incusbr0 dns.mode managed || true")
+		_, _ = sshExec.Run(ctx, "incus network set incusbr0 raw.dnsmasq 'server=1.1.1.1' || true")
 		_, _ = sshExec.Run(ctx, "incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true")
 		_, _ = sshExec.Run(ctx, "incus remote list | grep -q ' docker ' || incus remote add docker https://docker.io --protocol=oci --public || true")
 
