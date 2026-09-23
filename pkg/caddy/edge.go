@@ -41,8 +41,18 @@ func RenderSiteBlock(domain, upstreamIP string, upstreamPort int, tls string, ex
 	return sb.String()
 }
 
+// EnsureBaseCaddyfile ensures /etc/caddy/Caddyfile exists and imports /etc/caddy/sites/*.caddy
+func (e *EdgeManager) EnsureBaseCaddyfile(ctx context.Context) error {
+	baseConfig := ":80 {\n    respond \"OK\" 200\n}\n\nimport /etc/caddy/sites/*.caddy\n"
+	b64 := base64.StdEncoding.EncodeToString([]byte(baseConfig))
+	cmd := fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- sh -c 'mkdir -p /etc/caddy /etc/caddy/sites && cat > /etc/caddy/Caddyfile && chmod 644 /etc/caddy/Caddyfile'", b64, e.edgeContainer)
+	_, _ = e.exec.Run(ctx, cmd)
+	return nil
+}
+
 // PublishSite writes a .caddy file into /etc/caddy/sites/ and reloads Caddy.
 func (e *EdgeManager) PublishSite(ctx context.Context, siteName string, routing config.RoutingConfig, upstreamIP string) error {
+	_ = e.EnsureBaseCaddyfile(ctx)
 	content := RenderSiteBlock(routing.Domain, upstreamIP, routing.UpstreamPort, routing.TLS, routing.ExtraDirectives)
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
 

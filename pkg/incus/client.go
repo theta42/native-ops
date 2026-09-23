@@ -75,8 +75,27 @@ func (c *Client) ResolveImageFingerprint(ctx context.Context, alias string) (str
 	return "", fmt.Errorf("image alias not found: %s", alias)
 }
 
+// DeterministicIPForService returns a stable IP in the 10.0.100.0/24 subnet for a given service name.
+func DeterministicIPForService(name string) string {
+	switch name {
+	case "edge":
+		return "10.0.100.10"
+	case "gitea":
+		return "10.0.100.20"
+	case "manager":
+		return "10.0.100.30"
+	default:
+		h := 0
+		for _, c := range name {
+			h = (h*31 + int(c)) % 200
+		}
+		return fmt.Sprintf("10.0.100.%d", 40+h)
+	}
+}
+
 // GetContainerIP extracts the eth0/incusbr0 IPv4 address from incus list JSON with retry polling.
 func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error) {
+	targetIP := DeterministicIPForService(name)
 	deadline := time.Now().Add(30 * time.Second)
 	cmd := fmt.Sprintf("incus list %s --format json", name)
 
@@ -86,6 +105,12 @@ func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error
 			return "", ctx.Err()
 		default:
 		}
+
+		// Configure static IP and default route inside the container namespace directly
+		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", name))
+		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip addr add %s/24 dev eth0 || true", name, targetIP))
+		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip route replace default via 10.0.100.1 || true", name))
+		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c 'echo \"nameserver 1.1.1.1\" > /etc/resolv.conf' || true", name))
 
 		out, err := c.exec.Run(ctx, cmd)
 		if err == nil {
@@ -116,11 +141,7 @@ func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error
 			}
 		}
 
-		// Self-healing attempt: ensure eth0 is up and trigger DHCP client
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", name))
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- udhcpc -i eth0 -q -n -t 2 || incus exec %s -- dhclient -1 eth0 || true", name, name))
-
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 
 	info, _ := c.exec.Run(ctx, fmt.Sprintf("incus info %s; incus list %s --format json", name, name))

@@ -125,6 +125,11 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 	}
 	log.Printf("    Container IP: %s\n", ip)
 
+	if svc.Name == "edge" {
+		_ = d.caddy.EnsureBaseCaddyfile(ctx)
+		_ = d.caddy.Reload(ctx)
+	}
+
 	if svc.HealthCheck.Path != "" {
 		log.Printf("    Probing healthcheck (%s:%d%s)...\n", ip, svc.HealthCheck.Port, svc.HealthCheck.Path)
 		if err := d.incus.HealthGate(ctx, ip, svc.HealthCheck); err != nil {
