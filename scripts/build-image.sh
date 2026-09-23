@@ -2,7 +2,7 @@
 # Build and publish an Incus image.
 #
 # Usage: ./scripts/build-image.sh <image-name> [ref]
-#   image-name: base | edge | manager | restaurant | home | gitea | plane | platform
+#   image-name: base | edge | manager | restaurant | home | gitea | plane | platform | plane-mcp | gitea-mcp
 #   ref:        git tag/branch for app images
 #
 # For base/edge/gitea/plane: builds from the image recipe in images/
