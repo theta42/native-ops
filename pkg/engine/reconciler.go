@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -222,20 +223,34 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("digitalocean provider init: %w", err)
 			}
+			var existingHostID string
 			hosts, err := do.ListHosts(ctx)
 			if err == nil {
 				for _, h := range hosts {
 					if h.Name == hostName && h.Status == "active" {
 						primaryHostIP = h.PublicIP
+						existingHostID = h.ID
 						log.Printf("    Host %s already active at IP %s\n", hostName, primaryHostIP)
 						break
 					}
 				}
 			}
 
-			// If not found, provision new host
+			// If host exists, verify SSH authentication
+			if primaryHostIP != "" && len(privKeyPEM) > 0 {
+				testExec, testErr := remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
+				if testErr != nil {
+					log.Printf("    Host %s (%s) exists but SSH authentication failed (%v). Re-provisioning with registered SSH key...\n", hostName, primaryHostIP, testErr)
+					_ = r.hostMgr.DestroyHost(ctx, hostCfg.Provider, existingHostID)
+					primaryHostIP = ""
+				} else {
+					testExec.Close()
+				}
+			}
+
+			// If not found (or destroyed due to stale auth), provision new host
 			if primaryHostIP == "" {
-				log.Printf("    Host %s not found in DigitalOcean. Provisioning with cloud-init...\n", hostName)
+				log.Printf("    Host %s not active. Provisioning with cloud-init...\n", hostName)
 				spec := config.HostSpec{
 					Name:     hostName,
 					Provider: "digitalocean",
@@ -288,21 +303,38 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// If target host is remote and we have an SSH key, execute deployments over SSH
 	if primaryHostIP != "" && primaryHostIP != "127.0.0.1" && primaryHostIP != "localhost" && len(privKeyPEM) > 0 {
 		log.Printf("==> [GitOps] Connecting to host %s:%d via SSH (%s)...\n", primaryHostIP, hostSSHPort, hostSSHUser)
-		if err := waitForSSH(ctx, primaryHostIP, hostSSHPort, 90*time.Second); err != nil {
+		if err := waitForSSH(ctx, primaryHostIP, hostSSHPort, 120*time.Second); err != nil {
 			return fmt.Errorf("wait for host SSH: %w", err)
 		}
 
-		sshExec, err := remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
-		if err != nil {
-			return fmt.Errorf("init SSH executor to %s: %w", primaryHostIP, err)
+		// Allow cloud-init to insert authorized_keys if just booted
+		var sshExec *remote.SSHExecutor
+		var sshErr error
+		for attempt := 1; attempt <= 10; attempt++ {
+			sshExec, sshErr = remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
+			if sshErr == nil {
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if sshErr != nil {
+			return fmt.Errorf("init SSH executor to %s: %w", primaryHostIP, sshErr)
 		}
 		defer sshExec.Close()
+
+		// Pre-flight host initialization
+		log.Printf("==> [GitOps] Verifying Incus runtime on %s...\n", primaryHostIP)
+		_, _ = sshExec.Run(ctx, "which cloud-init >/dev/null 2>&1 && cloud-init status --wait || true")
+		_, _ = sshExec.Run(ctx, "which incus >/dev/null 2>&1 || (apt-get update && apt-get install -y incus)")
+		_, _ = sshExec.Run(ctx, "incus profile show default >/dev/null 2>&1 || incus admin init --auto")
+
 		deployer = NewDeployer(sshExec)
 	}
 
 	servicesDir := filepath.Join(r.configDir, "services")
 	entries, err := os.ReadDir(servicesDir)
 	if err == nil {
+		var serviceConfigs []*config.ServiceConfig
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				continue
@@ -319,7 +351,21 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			if svcCfg.Name == "" {
 				svcCfg.Name = entry.Name()
 			}
+			serviceConfigs = append(serviceConfigs, svcCfg)
+		}
 
+		// Sort so 'edge' is deployed first to allow downstream services to register routes
+		sort.SliceStable(serviceConfigs, func(i, j int) bool {
+			if serviceConfigs[i].Name == "edge" {
+				return true
+			}
+			if serviceConfigs[j].Name == "edge" {
+				return false
+			}
+			return serviceConfigs[i].Name < serviceConfigs[j].Name
+		})
+
+		for _, svcCfg := range serviceConfigs {
 			if err := deployer.DeployService(ctx, svcCfg, r.configDir); err != nil {
 				return fmt.Errorf("deploy service %s: %w", svcCfg.Name, err)
 			}
@@ -329,3 +375,4 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	log.Printf("==> [GitOps] Full fleet reconciliation completed successfully!\n")
 	return nil
 }
+
