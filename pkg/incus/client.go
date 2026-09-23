@@ -127,6 +127,12 @@ func (c *Client) ContainerExists(ctx context.Context, name string) bool {
 
 // EnsureProfile ensures a named profile exists, creating and configuring standard profiles if needed.
 func (c *Client) EnsureProfile(ctx context.Context, name string) error {
+	// Ensure default storage and root disk device are active
+	_, _ = c.exec.Run(ctx, "incus storage list | grep -q default || incus storage create default dir || true")
+	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true")
+	_, _ = c.exec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 || true")
+	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true")
+
 	checkCmd := fmt.Sprintf("incus profile show %s", name)
 	if _, err := c.exec.Run(ctx, checkCmd); err == nil {
 		return nil
