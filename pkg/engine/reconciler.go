@@ -402,7 +402,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}
 		}
 
-		diagEdge, _ := activeExec.Run(ctx, "sleep 5; echo '--- EDGE CONSOLE ---'; incus console edge --show-log || true; echo '--- CURL LOCAL ---'; curl -kIv https://git.opsavor.us 2>&1 || true; echo '--- CERTS ---'; incus exec edge -- find /data /root/.local -name '*.crt' -o -name '*.json' 2>/dev/null || true")
+		diagEdge, _ := activeExec.Run(ctx, "sleep 15; echo '--- EDGE CONSOLE TAIL ---'; incus console edge --show-log | tail -n 80 || true; echo '--- CERTS ---'; incus exec edge -- find /data /root/.local -name '*.crt' -o -name '*.json' 2>/dev/null || true")
 		log.Printf("==> [GitOps] Edge container diagnostics:\n%s\n", diagEdge)
 	}
 
