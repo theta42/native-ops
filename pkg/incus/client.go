@@ -110,7 +110,7 @@ func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error
 		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", name))
 		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip addr add %s/24 dev eth0 || true", name, targetIP))
 		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip route replace default via 10.0.100.1 || true", name))
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"echo -e 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\nnameserver 10.0.100.1' > /tmp/resolv.conf && (mount --bind /tmp/resolv.conf /etc/resolv.conf || cp /tmp/resolv.conf /etc/resolv.conf)\" || true", name))
+		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf\" || true", name))
 
 		out, err := c.exec.Run(ctx, cmd)
 		if err == nil {
