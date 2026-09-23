@@ -75,9 +75,9 @@ func (e *EdgeManager) RemoveSite(ctx context.Context, siteName string) error {
 	return e.Reload(ctx)
 }
 
-// Reload executes a graceful caddy reload inside the edge container.
+// Reload executes a graceful caddy reload or container restart inside the edge container.
 func (e *EdgeManager) Reload(ctx context.Context) error {
-	cmd := fmt.Sprintf("incus exec %s -- caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile || incus exec %s -- systemctl reload caddy",
+	cmd := fmt.Sprintf("incus restart %s || incus exec %s -- caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile",
 		e.edgeContainer, e.edgeContainer)
 
 	if _, err := e.exec.Run(ctx, cmd); err != nil {
