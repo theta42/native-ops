@@ -77,8 +77,8 @@ func (e *EdgeManager) RemoveSite(ctx context.Context, siteName string) error {
 
 // Reload executes a graceful caddy reload or container restart inside the edge container.
 func (e *EdgeManager) Reload(ctx context.Context) error {
-	// 1. Ensure resolv.conf has valid nameservers using printf
-	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf\" || true", e.edgeContainer))
+	// 1. Ensure resolv.conf has valid nameservers and is world-readable
+	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\nnameserver 10.0.100.1\\n' > /etc/resolv.conf && chmod 644 /etc/resolv.conf\" || true", e.edgeContainer))
 
 	// 2. Try caddy reload
 	cmd := fmt.Sprintf("incus exec %s -- caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile", e.edgeContainer)
@@ -88,7 +88,7 @@ func (e *EdgeManager) Reload(ctx context.Context) error {
 		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", e.edgeContainer))
 		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip addr add 10.0.100.10/24 dev eth0 || true", e.edgeContainer))
 		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip route replace default via 10.0.100.1 || true", e.edgeContainer))
-		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf\" || true", e.edgeContainer))
+		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\nnameserver 10.0.100.1\\n' > /etc/resolv.conf && chmod 644 /etc/resolv.conf\" || true", e.edgeContainer))
 	}
 	return nil
 }
