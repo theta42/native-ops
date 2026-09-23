@@ -16,7 +16,7 @@ import (
 	"github.com/theta42/native-ops/pkg/remote"
 )
 
-const Version = "v0.1.0"
+var Version = "v1.0.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -30,6 +30,12 @@ func main() {
 	switch subcommand {
 	case "version", "-v", "--version":
 		fmt.Printf("native-ops %s (MIT License, theta42)\n", Version)
+
+	case "validate":
+		handleValidateCommand(ctx, os.Args[2:])
+
+	case "reconcile":
+		handleReconcileCommand(ctx, os.Args[2:])
 
 	case "host":
 		handleHostCommand(ctx, os.Args[2:])
@@ -56,7 +62,11 @@ func printUsage() {
 Usage:
   native-ops <command> [options]
 
-Commands:
+GitOps Commands:
+  validate         Validate manifests and show dry-run plan (used in PRs)
+  reconcile        End-to-end GitOps cluster reconciliation (Level 0 + DNS + Level 1)
+
+Core Commands:
   host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)
   host destroy     Tear down a host VM
   host list        List active hosts for a provider
@@ -68,6 +78,41 @@ Commands:
   instance migrate Move instance and volume across Incus remotes
   dns sync         Sync DNS records using configured provider or python plugin
   version          Print version information`)
+}
+
+func handleValidateCommand(ctx context.Context, args []string) {
+	flags := flag.NewFlagSet("validate", flag.ExitOnError)
+	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	_ = flags.Parse(args)
+
+	exec := remote.NewLocalExecutor()
+	rec := engine.NewReconciler(*configDir, exec)
+
+	summary, err := rec.Validate(ctx)
+	if err != nil {
+		log.Fatalf("Validation failed: %v", err)
+	}
+
+	fmt.Printf("✅ Validation Successful!\n")
+	fmt.Printf("  • Fleet:     %s (%s)\n", summary.FleetName, summary.Domain)
+	fmt.Printf("  • DNS:       %s\n", summary.DNSProvider)
+	fmt.Printf("  • Hosts:     %d (%v)\n", len(summary.Hosts), summary.Hosts)
+	fmt.Printf("  • Services:  %d (%v)\n", len(summary.Services), summary.Services)
+	fmt.Printf("  • Templates: %d (%v)\n", len(summary.Templates), summary.Templates)
+}
+
+func handleReconcileCommand(ctx context.Context, args []string) {
+	flags := flag.NewFlagSet("reconcile", flag.ExitOnError)
+	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	_ = flags.Parse(args)
+
+	exec := remote.NewLocalExecutor()
+	rec := engine.NewReconciler(*configDir, exec)
+
+	if err := rec.Reconcile(ctx); err != nil {
+		log.Fatalf("Reconciliation failed: %v", err)
+	}
+	fmt.Println("Fleet reconciliation completed.")
 }
 
 func handleHostCommand(ctx context.Context, args []string) {
@@ -318,7 +363,6 @@ func handleDNSCommand(ctx context.Context, args []string) {
 		}
 		dnsProv = do
 	} else {
-		// Fallback to python/script plugin
 		p, err := plugin.NewScriptDNSProvider(fleet.DNSProvider, *configDir)
 		if err != nil {
 			log.Fatalf("Plugin provider error: %v", err)
