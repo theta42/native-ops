@@ -167,8 +167,22 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 	var args []string
 	args = append(args, "incus", "launch", image, name)
 
+	// In Incus, ensure "default" profile is always included for root disk device and bridge NIC
+	hasDefault := false
 	for _, p := range profiles {
-		args = append(args, "--profile", p)
+		if p == "default" {
+			hasDefault = true
+			break
+		}
+	}
+	if !hasDefault {
+		args = append(args, "--profile", "default")
+	}
+
+	for _, p := range profiles {
+		if p != "default" {
+			args = append(args, "--profile", p)
+		}
 	}
 
 	for k, v := range limits {
