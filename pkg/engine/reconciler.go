@@ -402,7 +402,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}
 		}
 
-		diagEdge, _ := activeExec.Run(ctx, "echo '--- EDGE CONSOLE ---'; incus console edge --show-log || true; echo '--- RESOLV ---'; incus exec edge -- cat /etc/resolv.conf || true; echo '--- ACME REACHABILITY ---'; incus exec edge -- wget -qO- --timeout=5 https://acme-v02.api.letsencrypt.org/directory || true; echo '--- CADDYFILE ---'; incus exec edge -- cat /etc/caddy/Caddyfile || true; echo '--- SITES ---'; incus exec edge -- cat /etc/caddy/sites/gitea.caddy || true; echo '--- CERTS ---'; incus exec edge -- find /data /root/.local -name '*.crt' -o -name '*.json' 2>/dev/null || true")
+		diagEdge, _ := activeExec.Run(ctx, "sleep 5; echo '--- EDGE CONSOLE ---'; incus console edge --show-log || true; echo '--- CURL LOCAL ---'; curl -kIv https://git.opsavor.us 2>&1 || true; echo '--- CERTS ---'; incus exec edge -- find /data /root/.local -name '*.crt' -o -name '*.json' 2>/dev/null || true")
 		log.Printf("==> [GitOps] Edge container diagnostics:\n%s\n", diagEdge)
 	}
 
