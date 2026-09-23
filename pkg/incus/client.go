@@ -75,47 +75,50 @@ func (c *Client) ResolveImageFingerprint(ctx context.Context, alias string) (str
 	return "", fmt.Errorf("image alias not found: %s", alias)
 }
 
-// GetContainerIP extracts the eth0/incusbr0 IPv4 address from incus list JSON.
+// GetContainerIP extracts the eth0/incusbr0 IPv4 address from incus list JSON with retry polling.
 func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error) {
+	deadline := time.Now().Add(30 * time.Second)
 	cmd := fmt.Sprintf("incus list %s --format json", name)
-	out, err := c.exec.Run(ctx, cmd)
-	if err != nil {
-		return "", fmt.Errorf("get container state: %w", err)
-	}
 
-	var instances []struct {
-		Name  string `json:"name"`
-		State *struct {
-			Network map[string]struct {
-				Addresses []struct {
-					Family  string `json:"family"`
-					Address string `json:"address"`
-					Scope   string `json:"scope"`
-				} `json:"addresses"`
-			} `json:"network"`
-		} `json:"state"`
-	}
-
-	if err := json.Unmarshal([]byte(out), &instances); err != nil {
-		return "", fmt.Errorf("parse incus list JSON: %w", err)
-	}
-
-	if len(instances) == 0 || instances[0].State == nil {
-		return "", fmt.Errorf("container %s is not running or has no network state", name)
-	}
-
-	for netName, netInfo := range instances[0].State.Network {
-		if netName == "lo" {
-			continue
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
 		}
-		for _, addr := range netInfo.Addresses {
-			if addr.Family == "inet" && addr.Scope == "global" {
-				return addr.Address, nil
+
+		out, err := c.exec.Run(ctx, cmd)
+		if err == nil {
+			var instances []struct {
+				Name  string `json:"name"`
+				State *struct {
+					Network map[string]struct {
+						Addresses []struct {
+							Family  string `json:"family"`
+							Address string `json:"address"`
+							Scope   string `json:"scope"`
+						} `json:"addresses"`
+					} `json:"network"`
+				} `json:"state"`
+			}
+
+			if err := json.Unmarshal([]byte(out), &instances); err == nil && len(instances) > 0 && instances[0].State != nil {
+				for netName, netInfo := range instances[0].State.Network {
+					if netName == "lo" {
+						continue
+					}
+					for _, addr := range netInfo.Addresses {
+						if addr.Family == "inet" && addr.Scope == "global" && addr.Address != "" {
+							return addr.Address, nil
+						}
+					}
+				}
 			}
 		}
+		time.Sleep(1 * time.Second)
 	}
 
-	return "", fmt.Errorf("no global IPv4 address assigned to container %s", name)
+	return "", fmt.Errorf("no global IPv4 address assigned to container %s within 30s", name)
 }
 
 // ContainerExists checks if an instance exists.
