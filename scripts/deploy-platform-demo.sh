@@ -74,7 +74,8 @@ echo "[deploy] $NAME ready"
 echo "  url:     https://${NAME}.opsavor.app/app/   (health: https://${NAME}.opsavor.app/health)"
 echo "  control: https://${NAME}.opsavor.app/control/v1/health  (X-Control-Token: ${CTRL_TOKEN})"
 case "$PROFILE" in
-  bad)   echo "  login:   owner@riverside.test / opsavor" ;;
-  multi) echo "  login:   owner@group.test / opsavor" ;;
-  *)     echo "  login:   owner@sicily.test / opsavor" ;;
+  bad)   echo "  login:   owner@bad.test / opsavor" ;;
+  multi) echo "  login:   owner@multi.test / opsavor" ;;
+  *)     echo "  login:   owner@demo.test / opsavor" ;;
 esac
+echo "  (also manager@<site>.test, readonly@<site>.test, manager.scoped@<site>.test — same password)"
