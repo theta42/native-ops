@@ -71,8 +71,10 @@ else
     "$SLUG" "$NAME_DISPLAY" --owner "$OWNER_EMAIL" --password "$OWNER_PW"
 fi
 
-incus exec "$CT" -- systemctl enable --now platform
+# The seed/provision ran as root (incus exec); the service runs as `platform`.
+incus exec "$CT" -- chown -R platform:platform /app/.data
 
+incus exec "$CT" -- systemctl enable --now platform
 IP="$(container_ip "$CT")"
 echo "  health-gating http://$IP:${PORT}/health ..."
 for _ in $(seq 1 45); do curl -fsS "http://$IP:${PORT}/health" >/dev/null 2>&1 && break; sleep 2; done
