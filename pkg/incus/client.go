@@ -275,7 +275,7 @@ func (c *Client) EnsureVolume(ctx context.Context, pool, volumeName string) erro
 	return nil
 }
 
-// AttachVolume attaches a storage volume with security.shifted=true.
+// AttachVolume attaches a storage volume.
 func (c *Client) AttachVolume(ctx context.Context, containerName, pool, volumeName, mountPath string, shifted bool) error {
 	if pool == "" {
 		pool = "default"
@@ -286,13 +286,8 @@ func (c *Client) AttachVolume(ctx context.Context, containerName, pool, volumeNa
 		deviceName = "data-vol"
 	}
 
-	shiftedFlag := "false"
-	if shifted {
-		shiftedFlag = "true"
-	}
-
-	cmd := fmt.Sprintf("incus config device add %s %s disk pool=%s source=%s path=%s security.shifted=%s",
-		containerName, deviceName, pool, volumeName, mountPath, shiftedFlag)
+	cmd := fmt.Sprintf("incus config device add %s %s disk pool=%s source=%s path=%s",
+		containerName, deviceName, pool, volumeName, mountPath)
 
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("attach volume %s to %s at %s: %w", volumeName, containerName, mountPath, err)
