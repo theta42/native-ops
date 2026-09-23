@@ -397,8 +397,11 @@ func (c *Client) HealthGate(ctx context.Context, ip string, hc config.HealthChec
 	for time.Now().Before(deadline) {
 		cmd := fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' --max-time 2 '%s'", url)
 		code, err := c.exec.Run(ctx, cmd)
-		if err == nil && strings.TrimSpace(code) == "200" {
-			return nil
+		if err == nil {
+			trimmed := strings.TrimSpace(code)
+			if trimmed == "200" || trimmed == "301" || trimmed == "302" || trimmed == "308" {
+				return nil
+			}
 		}
 		time.Sleep(time.Duration(intervalSec) * time.Second)
 	}
