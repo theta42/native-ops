@@ -31,6 +31,8 @@ func NewHostManager() *HostManager {
 func GenerateCloudInitUserData(sshPubKey string) string {
 	var sb strings.Builder
 	sb.WriteString("#cloud-config\n")
+	sb.WriteString("chpasswd:\n  expire: false\n")
+	sb.WriteString("ssh_pwauth: false\n")
 	sb.WriteString("package_update: true\n")
 	sb.WriteString("package_upgrade: true\n")
 
@@ -47,6 +49,10 @@ func GenerateCloudInitUserData(sshPubKey string) string {
   - ca-certificates
 
 runcmd:
+  # 0. Ensure root account is active without password expiration
+  - chage -I -1 -m 0 -M 99999 -E -1 root || true
+  - passwd -d root || true
+
   # 1. Install Zabbly Incus repo
   - mkdir -p /etc/apt/keyrings
   - curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc

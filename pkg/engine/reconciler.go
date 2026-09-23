@@ -251,12 +251,20 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			// If not found (or destroyed due to stale auth), provision new host
 			if primaryHostIP == "" {
 				log.Printf("    Host %s not active. Provisioning with cloud-init...\n", hostName)
+				var sshKeyFingerprints []string
+				if pubKeyStr != "" {
+					fp, err := do.EnsureSSHKey(ctx, hostName+"-key", pubKeyStr)
+					if err == nil && fp != "" {
+						sshKeyFingerprints = append(sshKeyFingerprints, fp)
+					}
+				}
 				spec := config.HostSpec{
-					Name:     hostName,
-					Provider: "digitalocean",
-					Size:     fleet.Providers.DigitalOcean.DefaultSize,
-					Region:   fleet.Providers.DigitalOcean.Region,
-					UserData: GenerateCloudInitUserData(pubKeyStr),
+					Name:        hostName,
+					Provider:    "digitalocean",
+					Size:        fleet.Providers.DigitalOcean.DefaultSize,
+					Region:      fleet.Providers.DigitalOcean.Region,
+					UserData:    GenerateCloudInitUserData(pubKeyStr),
+					SSHKeyNames: sshKeyFingerprints,
 				}
 				newHost, err := r.hostMgr.CreateHost(ctx, spec)
 				if err != nil {
@@ -323,7 +331,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		defer sshExec.Close()
 
 		// Pre-flight host initialization
-		log.Printf("==> [GitOps] Verifying Incus runtime on %s...\n", primaryHostIP)
+		log.Printf("==> [GitOps] Verifying host runtime on %s...\n", primaryHostIP)
+		_, _ = sshExec.Run(ctx, "chage -I -1 -m 0 -M 99999 -E -1 root || true")
+		_, _ = sshExec.Run(ctx, "passwd -d root || true")
 		_, _ = sshExec.Run(ctx, "which cloud-init >/dev/null 2>&1 && cloud-init status --wait || true")
 		_, _ = sshExec.Run(ctx, "which incus >/dev/null 2>&1 || (apt-get update && apt-get install -y incus)")
 		_, _ = sshExec.Run(ctx, "incus profile show default >/dev/null 2>&1 || incus admin init --auto")

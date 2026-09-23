@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/theta42/native-ops/pkg/config"
@@ -138,6 +139,61 @@ func (c *Client) toHost(d *doDroplet) *provider.Host {
 	}
 
 	return host
+}
+
+type doSSHKey struct {
+	ID          int    `json:"id"`
+	Fingerprint string `json:"fingerprint"`
+	PublicKey   string `json:"public_key"`
+	Name        string `json:"name"`
+}
+
+type doSSHKeysResponse struct {
+	SSHKeys []doSSHKey `json:"ssh_keys"`
+}
+
+type doSSHKeyResponse struct {
+	SSHKey doSSHKey `json:"ssh_key"`
+}
+
+func (c *Client) EnsureSSHKey(ctx context.Context, name, pubKeyStr string) (string, error) {
+	if pubKeyStr == "" {
+		return "", nil
+	}
+	var res doSSHKeysResponse
+	if err := c.request(ctx, http.MethodGet, "/account/keys?per_page=100", nil, &res); err == nil {
+		for _, k := range res.SSHKeys {
+			if strings.TrimSpace(k.PublicKey) == strings.TrimSpace(pubKeyStr) {
+				return k.Fingerprint, nil
+			}
+		}
+	}
+
+	payload := map[string]string{
+		"name":       name,
+		"public_key": strings.TrimSpace(pubKeyStr),
+	}
+	var createRes doSSHKeyResponse
+	if err := c.request(ctx, http.MethodPost, "/account/keys", payload, &createRes); err != nil {
+		// If name collision, try listing again
+		if res2, err2 := c.ListSSHKeys(ctx); err2 == nil {
+			for _, k := range res2 {
+				if strings.TrimSpace(k.PublicKey) == strings.TrimSpace(pubKeyStr) {
+					return k.Fingerprint, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("register DO ssh key: %w", err)
+	}
+	return createRes.SSHKey.Fingerprint, nil
+}
+
+func (c *Client) ListSSHKeys(ctx context.Context) ([]doSSHKey, error) {
+	var res doSSHKeysResponse
+	if err := c.request(ctx, http.MethodGet, "/account/keys?per_page=100", nil, &res); err != nil {
+		return nil, err
+	}
+	return res.SSHKeys, nil
 }
 
 func (c *Client) CreateHost(ctx context.Context, spec config.HostSpec) (*provider.Host, error) {
