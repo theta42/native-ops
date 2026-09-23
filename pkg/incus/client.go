@@ -146,7 +146,8 @@ func (c *Client) EnsureProfile(ctx context.Context, name string) error {
 	// Ensure default storage and root disk device are active
 	_, _ = c.exec.Run(ctx, "incus storage list | grep -q default || incus storage create default dir || true")
 	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true")
-	_, _ = c.exec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 || true")
+	_, _ = c.exec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 ipv4.address=10.0.100.1/24 ipv4.nat=true ipv6.address=none || true")
+	_, _ = c.exec.Run(ctx, "incus network set incusbr0 ipv4.address=10.0.100.1/24 ipv4.nat=true || true")
 	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true")
 
 	checkCmd := fmt.Sprintf("incus profile show %s", name)
