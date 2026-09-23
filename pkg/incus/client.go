@@ -399,7 +399,7 @@ func (c *Client) HealthGate(ctx context.Context, ip string, hc config.HealthChec
 		code, err := c.exec.Run(ctx, cmd)
 		if err == nil {
 			trimmed := strings.TrimSpace(code)
-			if trimmed == "200" || trimmed == "301" || trimmed == "302" || trimmed == "308" {
+			if trimmed == "200" || trimmed == "301" || trimmed == "302" || trimmed == "308" || trimmed == "404" {
 				return nil
 			}
 		}
