@@ -22,6 +22,14 @@ ALIAS="opsavor-platform:${REF}"
 
 FP="$(image_fingerprint "$ALIAS")" || { echo "image $ALIAS not found — run: build-image.sh platform <ref>" >&2; exit 1; }
 
+# Re-running must NOT rotate the control token: the fleet manager stores it,
+# and a fresh token on every deploy would silently break its control-plane
+# access until it was re-imported. Preserve the existing one when present.
+KEEP_TOKEN=""
+if incus info "$NAME" >/dev/null 2>&1; then
+  KEEP_TOKEN="$(incus exec "$NAME" -- grep '^OPSAVOR_CONTROL_TOKEN=' /etc/default/platform 2>/dev/null | cut -d= -f2)"
+fi
+
 echo "[deploy] $NAME <- $ALIAS ($FP)  seed=$PROFILE"
 incus delete "$NAME" --force 2>/dev/null || true
 incus launch "$FP" "$NAME" --profile base --profile service \
@@ -30,7 +38,7 @@ incus launch "$FP" "$NAME" --profile base --profile service \
 echo "  waiting for network..."
 for _ in $(seq 1 30); do incus exec "$NAME" -- ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && break; sleep 2; done
 
-CTRL_TOKEN="$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+CTRL_TOKEN="${KEEP_TOKEN:-$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 ENVF="$(mktemp)"
 cat > "$ENVF" <<EOF
 PORT=${PORT}
