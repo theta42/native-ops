@@ -29,6 +29,17 @@ FP="$(image_fingerprint "$ALIAS")" || { echo "image $ALIAS not found — run: bu
 
 if ! echo "$SLUG" | grep -qE '^[a-z0-9-]{2,30}$'; then echo "invalid slug: $SLUG" >&2; exit 1; fi
 
+# Re-running to update the image must NOT wipe the tenant or rotate
+# credentials. Capture the existing env (control token) and note whether the
+# data volume already holds a provisioned tenant.
+PRESERVE_ENV=""
+if incus info "$CT" >/dev/null 2>&1; then
+  PRESERVE_ENV="$(incus exec "$CT" -- cat /etc/default/platform 2>/dev/null || true)"
+fi
+HAS_DATA=0
+incus storage volume show default "$VOL" >/dev/null 2>&1 && HAS_DATA=1
+KEEP_TOKEN="$(printf '%s\n' "$PRESERVE_ENV" | sed -n 's/^OPSAVOR_CONTROL_TOKEN=//p' | head -1)"
+
 echo "[deploy] $CT ($NAME_DISPLAY) <- $ALIAS ($FP)"
 incus delete "$CT" --force 2>/dev/null || true
 incus storage volume create default "$VOL" 2>/dev/null || true
@@ -41,7 +52,7 @@ for _ in $(seq 1 30); do incus exec "$CT" -- ping -c1 -W2 8.8.8.8 >/dev/null 2>&
 # Attach the volume BEFORE anything writes under /app/.data (see AGENTS.md).
 incus config device add "$CT" data disk pool=default source="$VOL" path=/app/.data
 
-CTRL_TOKEN="$(openssl rand -hex 16)"
+CTRL_TOKEN="${KEEP_TOKEN:-$(openssl rand -hex 16)}"
 ENVF="$(mktemp)"
 cat > "$ENVF" <<EOF
 PORT=${PORT}
@@ -57,8 +68,11 @@ rm -f "$ENVF"
 OWNER_PW="${OPSAVOR_OWNER_PASSWORD:-$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)}"
 
 # Create the real tenant + owner (and ingest artifacts if given) before the
-# service starts, so first boot sees them.
-if [ -n "$DUMP_DIR" ]; then
+# service starts, so first boot sees them. If the volume already holds the
+# tenant, leave it untouched (an image update, not a re-provision).
+if [ "$HAS_DATA" = "1" ]; then
+  echo "  existing tenant on $VOL — data and credentials preserved"
+elif [ -n "$DUMP_DIR" ]; then
   echo "  ingesting real artifacts from $DUMP_DIR ..."
   incus exec "$CT" -- mkdir -p /root/dump
   incus file push -r "$DUMP_DIR/." "$CT/root/dump/"
@@ -102,6 +116,10 @@ incus exec edge -- caddy reload --config /etc/caddy/Caddyfile --adapter caddyfil
 
 echo "[deploy] $CT ready"
 echo "  url:     https://${SLUG}.opsavor.app/app/"
-echo "  login:   ${OWNER_EMAIL} / ${OWNER_PW}"
+if [ "$HAS_DATA" = "1" ]; then
+  echo "  login:   ${OWNER_EMAIL} (unchanged — password not rotated on update)"
+else
+  echo "  login:   ${OWNER_EMAIL} / ${OWNER_PW}"
+fi
 echo "  control: https://${SLUG}.opsavor.app/control/v1/health  (X-Control-Token: ${CTRL_TOKEN})"
 echo "  volume:  ${VOL} -> /app/.data"
