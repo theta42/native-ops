@@ -125,8 +125,41 @@ func (c *Client) ContainerExists(ctx context.Context, name string) bool {
 	return err == nil
 }
 
+// EnsureProfile ensures a named profile exists, creating and configuring standard profiles if needed.
+func (c *Client) EnsureProfile(ctx context.Context, name string) error {
+	checkCmd := fmt.Sprintf("incus profile show %s", name)
+	if _, err := c.exec.Run(ctx, checkCmd); err == nil {
+		return nil
+	}
+
+	createCmd := fmt.Sprintf("incus profile create %s", name)
+	if _, err := c.exec.Run(ctx, createCmd); err != nil {
+		return fmt.Errorf("create profile %s: %w", name, err)
+	}
+
+	if name == "edge" {
+		// Attach port 80 and 443 proxy devices to edge profile
+		_, _ = c.exec.Run(ctx, "incus profile device add edge http proxy listen=tcp:0.0.0.0:80 connect=tcp:127.0.0.1:80")
+		_, _ = c.exec.Run(ctx, "incus profile device add edge https proxy listen=tcp:0.0.0.0:443 connect=tcp:127.0.0.1:443")
+	}
+
+	return nil
+}
+
 // LaunchContainer creates and starts an instance from an image with profiles and config overrides.
 func (c *Client) LaunchContainer(ctx context.Context, image string, name string, profiles []string, limits map[string]string) error {
+	// Normalize image for Incus: if not prefixed with images:, docker:, or local remote, prefix with docker:
+	if !strings.HasPrefix(image, "images:") && !strings.HasPrefix(image, "docker:") && !strings.HasPrefix(image, "local:") && len(image) != 64 {
+		image = "docker:" + image
+	}
+
+	// Ensure all required profiles exist
+	for _, p := range profiles {
+		if p != "default" {
+			_ = c.EnsureProfile(ctx, p)
+		}
+	}
+
 	var args []string
 	args = append(args, "incus", "launch", image, name)
 
