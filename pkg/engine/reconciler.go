@@ -4,8 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/provider"
@@ -97,6 +102,57 @@ func (r *Reconciler) Validate(ctx context.Context) (*PlanSummary, error) {
 	return summary, nil
 }
 
+func getSSHCredentials() ([]byte, string) {
+	var privKeyPEM []byte
+	if keyEnv := os.Getenv("SSH_PRIVATE_KEY"); keyEnv != "" {
+		privKeyPEM = []byte(keyEnv)
+	} else if keyEnv := os.Getenv("FLEET_SSH_KEY"); keyEnv != "" {
+		privKeyPEM = []byte(keyEnv)
+	} else {
+		home, _ := os.UserHomeDir()
+		candidates := []string{
+			filepath.Join(home, ".ssh", "id_ed25519"),
+			filepath.Join(home, ".ssh", "id_rsa"),
+			"/root/.ssh/id_ed25519",
+		}
+		for _, p := range candidates {
+			if data, err := os.ReadFile(p); err == nil {
+				privKeyPEM = data
+				break
+			}
+		}
+	}
+
+	var pubKeyStr string
+	if len(privKeyPEM) > 0 {
+		signer, err := ssh.ParsePrivateKey(privKeyPEM)
+		if err == nil {
+			pubKeyStr = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+		}
+	}
+
+	return privKeyPEM, pubKeyStr
+}
+
+func waitForSSH(ctx context.Context, host string, port int, timeout time.Duration) error {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for SSH port %s", addr)
+}
+
 // Reconcile executes Level 0 host verification/creation, DNS sync, and Level 1 service deployment.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	log.Printf("==> [GitOps] Starting complete fleet reconciliation from %s\n", r.configDir)
@@ -106,11 +162,21 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("load fleet config: %w", err)
 	}
 
+	privKeyPEM, pubKeyStr := getSSHCredentials()
 	var primaryHostIP string
+	var hostSSHUser string = "root"
+	var hostSSHPort int = 22
 
 	// 1. Level 0: Reconcile Cloud / Hypervisor Hosts
 	for hostName, hostCfg := range fleet.Hosts {
 		log.Printf("==> [GitOps] Reconciling host: %s (provider=%s)\n", hostName, hostCfg.Provider)
+
+		if hostCfg.SSHUser != "" {
+			hostSSHUser = hostCfg.SSHUser
+		}
+		if hostCfg.SSHPort > 0 {
+			hostSSHPort = hostCfg.SSHPort
+		}
 
 		if hostCfg.Address != "" && hostCfg.Address != "auto" {
 			primaryHostIP = hostCfg.Address
@@ -136,12 +202,13 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 			// If not found, provision new host
 			if primaryHostIP == "" {
-				log.Printf("    Host %s not found in DigitalOcean. Provisioning...\n", hostName)
+				log.Printf("    Host %s not found in DigitalOcean. Provisioning with cloud-init...\n", hostName)
 				spec := config.HostSpec{
 					Name:     hostName,
 					Provider: "digitalocean",
 					Size:     fleet.Providers.DigitalOcean.DefaultSize,
 					Region:   fleet.Providers.DigitalOcean.Region,
+					UserData: GenerateCloudInitUserData(pubKeyStr),
 				}
 				newHost, err := r.hostMgr.CreateHost(ctx, spec)
 				if err != nil {
@@ -183,6 +250,23 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	}
 
 	// 3. Level 1: Reconcile Declarative Services
+	deployer := r.deployer
+
+	// If target host is remote and we have an SSH key, execute deployments over SSH
+	if primaryHostIP != "" && primaryHostIP != "127.0.0.1" && primaryHostIP != "localhost" && len(privKeyPEM) > 0 {
+		log.Printf("==> [GitOps] Connecting to host %s:%d via SSH (%s)...\n", primaryHostIP, hostSSHPort, hostSSHUser)
+		if err := waitForSSH(ctx, primaryHostIP, hostSSHPort, 90*time.Second); err != nil {
+			return fmt.Errorf("wait for host SSH: %w", err)
+		}
+
+		sshExec, err := remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
+		if err != nil {
+			return fmt.Errorf("init SSH executor to %s: %w", primaryHostIP, err)
+		}
+		defer sshExec.Close()
+		deployer = NewDeployer(sshExec)
+	}
+
 	servicesDir := filepath.Join(r.configDir, "services")
 	entries, err := os.ReadDir(servicesDir)
 	if err == nil {
@@ -203,7 +287,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 				svcCfg.Name = entry.Name()
 			}
 
-			if err := r.deployer.DeployService(ctx, svcCfg, r.configDir); err != nil {
+			if err := deployer.DeployService(ctx, svcCfg, r.configDir); err != nil {
 				return fmt.Errorf("deploy service %s: %w", svcCfg.Name, err)
 			}
 		}

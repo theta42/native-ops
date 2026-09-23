@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/provider"
@@ -27,11 +28,18 @@ func NewHostManager() *HostManager {
 }
 
 // GenerateCloudInitUserData produces the cloud-init script for Debian 13 Incus host setup.
-func GenerateCloudInitUserData() string {
-	return `#cloud-config
-package_update: true
-package_upgrade: true
-packages:
+func GenerateCloudInitUserData(sshPubKey string) string {
+	var sb strings.Builder
+	sb.WriteString("#cloud-config\n")
+	sb.WriteString("package_update: true\n")
+	sb.WriteString("package_upgrade: true\n")
+
+	if sshPubKey != "" {
+		sb.WriteString("ssh_authorized_keys:\n")
+		sb.WriteString(fmt.Sprintf("  - %s\n", strings.TrimSpace(sshPubKey)))
+	}
+
+	sb.WriteString(`packages:
   - curl
   - ufw
   - git
@@ -53,15 +61,12 @@ runcmd:
   - ufw allow 80/tcp
   - ufw allow 443/tcp
   - ufw --force enable
-`
+`)
+	return sb.String()
 }
 
 func (h *HostManager) CreateHost(ctx context.Context, spec config.HostSpec) (*provider.Host, error) {
 	log.Printf("==> [Host] Provisioning %s host: %s (size=%s)\n", spec.Provider, spec.Name, spec.Size)
-
-	if spec.UserData == "" {
-		spec.UserData = GenerateCloudInitUserData()
-	}
 
 	var p provider.ComputeProvider
 	switch spec.Provider {
