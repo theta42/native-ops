@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net"
@@ -102,6 +105,28 @@ func (r *Reconciler) Validate(ctx context.Context) (*PlanSummary, error) {
 	return summary, nil
 }
 
+// GenerateSSHKeypair creates an in-memory ed25519 keypair if none is provided.
+func GenerateSSHKeypair() ([]byte, string, error) {
+	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, "", fmt.Errorf("generate ed25519 key: %w", err)
+	}
+
+	privBlock, err := ssh.MarshalPrivateKey(privKey, "")
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal openssh private key: %w", err)
+	}
+	privPEM := pem.EncodeToMemory(privBlock)
+
+	sshPub, err := ssh.NewPublicKey(pubKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal openssh public key: %w", err)
+	}
+	pubKeyStr := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub)))
+
+	return privPEM, pubKeyStr, nil
+}
+
 func getSSHCredentials() ([]byte, string) {
 	var privKeyPEM []byte
 	if keyEnv := os.Getenv("SSH_PRIVATE_KEY"); keyEnv != "" {
@@ -128,10 +153,18 @@ func getSSHCredentials() ([]byte, string) {
 		signer, err := ssh.ParsePrivateKey(privKeyPEM)
 		if err == nil {
 			pubKeyStr = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+			return privKeyPEM, pubKeyStr
 		}
 	}
 
-	return privKeyPEM, pubKeyStr
+	// Auto-generate fresh Ed25519 keypair if none configured
+	privPEM, pubStr, err := GenerateSSHKeypair()
+	if err == nil {
+		log.Printf("==> [GitOps] No existing SSH key found. Automatically generated fresh Ed25519 keypair for fleet.\n")
+		return privPEM, pubStr
+	}
+
+	return nil, ""
 }
 
 func waitForSSH(ctx context.Context, host string, port int, timeout time.Duration) error {
