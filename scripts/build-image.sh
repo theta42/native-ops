@@ -2,11 +2,11 @@
 # Build and publish an Incus image.
 #
 # Usage: ./scripts/build-image.sh <image-name> [ref]
-#   image-name: base | edge | manager | restaurant | home | gitea | plane | platform | plane-mcp | gitea-mcp
+#   image-name: base | edge | manager | home | gitea | plane | platform | plane-mcp | gitea-mcp
 #   ref:        git tag/branch for app images
 #
 # For base/edge/gitea/plane: builds from the image recipe in images/
-# For manager/restaurant/home: builds FROM opsavor-base; images/<name>/build.sh
+# For manager/home: builds FROM opsavor-base; images/<name>/build.sh
 # clones the app repo at <ref> itself (via $MANAGER_REPO / $RESTAURANT_REPO /
 # $HOME_REPO).
 #
@@ -30,7 +30,7 @@ case "$IMAGE_NAME" in
   base)
     FROM="images:debian/13"
     ;;
-  edge|manager|restaurant|home)
+  edge|manager|home)
     FROM="opsavor-base"
     ;;
   *)
@@ -39,7 +39,7 @@ case "$IMAGE_NAME" in
 esac
 
 # The `base` profile caps a container at 512MB, which is enough to run an
-# app but not to build one: `npm ci` on the restaurant app (Next.js +
+# app but not to build one: `npm ci` on an app (Next.js +
 # drizzle-kit + typescript + eslint as devDependencies, plus better-sqlite3
 # possibly compiling from source) gets OOM-killed well short of finishing —
 # and even at 3GB, `next build`'s TypeScript-checking phase (Next 16 +
@@ -63,18 +63,18 @@ done
 # Push the build recipe
 incus file push -r "$BUILD_DIR/" "$TMP_CT/tmp/build/"
 
-# manager/restaurant/home clone their own app source over SSH inside build.sh,
+# manager/home clone their own app source over SSH inside build.sh,
 # but the deploy key and its accept-new host config live on the HOST's
 # /root/.ssh, not inside this fresh temp container — without pushing them in
 # first, the clone fails outright with "Host key verification failed". The
 # container is destroyed right after this build, so the exposure is no wider
 # than the host's own already-standing trust in that key.
 #
-# manager/restaurant pull from git.theta42.com (gitea_deploy); home pulls from
+# manager pulls from git.theta42.com (gitea_deploy); home pulls from
 # the in-fleet Gitea at git.opsavor.work, which needs its own deploy key
 # (gitea_opsavor_deploy) — image/management as explicit, per-host keys.
 case "$IMAGE_NAME" in
-  manager|restaurant) DEPLOY_KEY_SRC=/root/.ssh/gitea_deploy; DEPLOY_KEY_NAME=gitea_deploy ;;
+  manager) DEPLOY_KEY_SRC=/root/.ssh/gitea_deploy; DEPLOY_KEY_NAME=gitea_deploy ;;
   home|platform)      DEPLOY_KEY_SRC=/root/.ssh/gitea_opsavor_deploy; DEPLOY_KEY_NAME=gitea_opsavor_deploy ;;
   *)                  DEPLOY_KEY_SRC="" ;;
 esac
@@ -93,7 +93,7 @@ if [ -n "$DEPLOY_KEY_SRC" ]; then
   [ -f /root/.ssh/config ] && incus exec "$TMP_CT" -- chmod 600 /root/.ssh/config
 fi
 
-# Run build (manager/restaurant/home clone their own app source inside
+# Run build (manager/home clone their own app source inside
 # build.sh; base/edge/gitea/plane ignore $2 entirely)
 if [ -n "$REF" ]; then
   incus exec "$TMP_CT" -- bash "/tmp/build/build.sh" "$REF"
@@ -111,8 +111,8 @@ if [ -n "$REF" ]; then
   # 1. `incus image alias create` has no --reuse flag (only `incus publish`
   #    does), so :latest was never actually repointed.
   # 2. Its <new alias name> argument is itself parsed as [<remote>:]<name>
-  #    on the FIRST colon — "opsavor-restaurant:latest" was read as remote
-  #    "opsavor-restaurant", resource "latest", and failed with "the remote
+  #    on the FIRST colon — "opsavor-platform:latest" was read as remote
+  #    "opsavor-platform", resource "latest", and failed with "the remote
   #    ... doesn't exist". Prefixing the explicit `local:` remote makes the
   #    colon split land where intended, leaving the alias itself intact.
   LATEST="opsavor-${IMAGE_NAME}:latest"

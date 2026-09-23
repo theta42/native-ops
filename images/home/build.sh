@@ -12,7 +12,7 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends ca-certificates curl git
 
 # The repo lives on the in-fleet Gitea (git.opsavor.work), not git.theta42.com
-# like manager/restaurant — so build-image.sh pushes a separate deploy key
+# like manager — so build-image.sh pushes a separate deploy key
 # (gitea_opsavor_deploy) and this build points SSH at it explicitly rather
 # than depending on a /root/.ssh/config entry.
 export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"

@@ -80,7 +80,7 @@ ufw route allow out on incusbr0 comment "Incus bridge forward out"
 ufw route allow in on incusbr0 out on eth0 comment "Incus bridge NAT out"
 ufw reload
 
-# The manager container controls Incus (launching/replacing restaurant and
+# The manager container controls Incus (launching/replacing platform and
 # service containers) by SSHing back to this host as a dedicated,
 # low-privilege user rather than mounting the Incus socket into the
 # container or giving it a root key: `manager-ctl` can run `incus` (it's in

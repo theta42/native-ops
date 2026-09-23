@@ -1,11 +1,12 @@
 # Opsavor native ops (`native-ops`)
 
 Infrastructure-as-files for `opsavor.app` on Incus/LXC: edge proxy, fleet
-orchestrator, internal services, and per-restaurant containers — all on a
+orchestrator, internal services, and per-tenant containers — all on a
 single host (Phase 1), scaling to multi-host with live migration (Phase 2).
-No Docker, no droplet-per-restaurant. Containers are replaced, never patched.
-This repo replaces `do-ops`; code lives in `opsavor/restaurant` (app) and
-`opsavor/management` (fleet API); this repo is everything around them.
+No Docker, no droplet-per-tenant. Containers are replaced, never patched.
+This repo replaces `do-ops`; code lives in `opsavor/platform` (the
+owner-intelligence app) and `opsavor/management` (fleet API); this repo is
+everything around them. The old `opsavor/restaurant` app is retired.
 
 ## Design principles
 
@@ -36,16 +37,16 @@ This repo replaces `do-ops`; code lives in `opsavor/restaurant` (app) and
 
 ```
                         git.opsavor.app (Gitea container, self-hosted)
-                        org `opsavor`: restaurant / management / native-ops
+                        org `opsavor`: platform / management / native-ops
                                      |
             +------------------------+--------------------------------+
-            | push manager-v* / restaurant-v* (tags deploy)           |
+            | push manager-v* (tags deploy)           |
             v                                                         v
 opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   Incus daemon (ZFS pool `default`, incusbr0 10.0.100.0/24)  (per release,
   │                                                            then deleted)
   ├─ edge          10.0.100.10   Caddy, DNS-01 wildcard       v
-  │    ├─ ports 80/443 via incus proxy devices          image: restaurant
+  │    ├─ ports 80/443 via incus proxy devices          image: platform
   │    ├─ manage.opsavor.app → manager.incus:3001         vX.Y.Z
   │    ├─ git.opsavor.app    → gitea.incus:3000    (published to local
   │    ├─ plane.opsavor.app  → plane.incus:3001      image store)
@@ -60,7 +61,7 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   │
   ├─ gitea         10.0.100.12   Git hosting + Actions. opsavor/opsavor.ai
   │    │                          now lives here (the home image clones it);
-  │    │                          restaurant/management/native-ops still live
+  │    │                          platform/management/native-ops still live
   │    │                          on git.theta42.com — see "CI/CD" below.
   │
   ├─ home          10.0.100.15   opsavor.ai home page — Node static server
@@ -77,7 +78,7 @@ opsavor-node-1 (nyc1, 4vCPU / 8GB / 160GB, Debian 13)        temp build ct
   ├─ outline-redis  10.0.100.1x   Outline's Redis/valkey
   │
   ├─ rest-sicily   10.0.100.101  Next.js standalone + SQLite (:3000)
-  ├─ rest-<slug>   10.0.100.1xx  one container per restaurant
+  ├─ rest-<slug>   10.0.100.1xx  one container per tenant
   │                                ↑ replaced on update, never patched
   │
   └─ custom storage volumes (on the `default` pool — `dir` driver, not ZFS;
@@ -117,7 +118,7 @@ opsavor-node-1 (control plane)          opsavor-node-2 … N (workers)
 
 Phase 2 triggers when node-1 is capacity-bound (see Capacity section). The
 manager learns `--target <node>` on launch calls. Edge and gitea stay on
-node-1; restaurant containers are the movable units. Live migration
+node-1; tenant containers are the movable units. Live migration
 (`incus move`) requires CRIU on both endpoints and a shared storage pool.
 
 ## Incus setup
@@ -133,7 +134,6 @@ Provisioned by `incus/preseed.yml` (non-interactive `incus admin init
 | `edge` | 1 | 256MB | no | no | Caddy + proxy devices for :80/:443 |
 | `service` | 2 | 2GB | yes | no | gitea, plane, outline |
 | `ci` | 2 | 4GB | yes | **yes** | ct-runner (Incus-in-Incus for image builds) |
-| `restaurant` | 1 | 1GB | yes | no | per-site Next.js + SQLite |
 
 The `ci` profile mounts the host Incus socket into the container so the CI
 runner can launch sibling containers for image builds. It is the only
@@ -164,8 +164,8 @@ scoped to `default + tenants`.
 | `outline` | services | base, service | 10.0.100.1x | 2C / 1GB | :3000 (via edge Caddy) |
 | `outline-db` | services | base, service | 10.0.100.1x | 1C / 512MB | Postgres (internal only) |
 | `outline-redis` | services | base, service | 10.0.100.1x | 1C / 512MB | Redis/valkey (internal only) |
-| `rest-sicily` | tenants | base, restaurant | 10.0.100.101 | 1C / 1GB | :3000 (via edge Caddy) |
-| `rest-<slug>` | tenants | base, restaurant | 10.0.100.1xx | 1C / 1GB | :3000 (via edge Caddy) |
+| `rest-sicily` | tenants | base, service | 10.0.100.101 | 1C / 1GB | :8787 (via edge Caddy) |
+| `rest-<slug>` | tenants | base, service | 10.0.100.1xx | 1C / 1GB | :8787 (via edge Caddy) |
 
 Container IPs are assigned by the manager at create time via
 `incus config set <name> volatile.eth0.ipv4.address …`. The edge Caddyfile
@@ -183,35 +183,34 @@ the local image store (`incus image list`).
 | `opsavor-edge` | `opsavor-base` | `images/edge/` — Caddy binary + Caddyfile | ct-runner |
 | `opsavor-manager` | `opsavor-base` | `images/manager/` — `npm ci` + `server.mjs` | ct-runner |
 | `opsavor-home` | `opsavor-base` | `images/home/` — clone opsavor/opsavor.ai + `server.mjs` | ct-runner |
-| `opsavor-restaurant` | `opsavor-base` | `images/restaurant/` — `npm ci && npm run build` + standalone | ct-runner |
+| `opsavor-platform` | `opsavor-base` | `images/platform/` — clone `opsavor/platform` at the ref (zero deps) | ct-runner |
 | `opsavor-gitea` | `opsavor-base` | `images/gitea/` — Gitea binary + config | ct-runner |
 | `opsavor-plane` | `opsavor-base` | `images/plane/` — Plane distribution | one-time manual |
 
 ### Build pipeline (no Docker)
 
 ```
-ct-runner receives: build image opsavor-restaurant from tag restaurant-v1.2.3
+ct-runner receives: build image opsavor-platform from ref main
   │
-  ├─ 1. incus launch images:debian/13 tmp-build-<tag> --profile base --profile ci
+  ├─ 1. incus launch opsavor-base tmp-build-<tag> --profile base
   │
-  ├─ 2. incus file push (or git clone) the repo at the tag into the build ct
+  ├─ 2. push the deploy key; build.sh git-clones opsavor/platform at the ref
   │
-  ├─ 3. incus exec tmp-build-<tag> -- bash /build/build.sh
-  │       (npm ci, npm run build, prune to standalone, write metadata.yaml)
+  ├─ 3. incus exec tmp-build-<tag> -- bash /build/build.sh <ref>
+  │       (git clone, `npm ci` no-op — zero runtime deps — user + unit)
   │
-  ├─ 4. Verify: incus exec tmp-build-<tag> -- curl -fsS localhost:3000/api/health
-  │       (boots the standalone briefly, health-checks, stops)
+  ├─ 4. incus stop tmp-build-<tag>
   │
-  ├─ 5. incus publish tmp-build-<tag> --alias opsavor-restaurant-vX.Y.Z
+  ├─ 5. incus publish tmp-build-<tag> --alias opsavor-platform:<ref>
   │       compression: zstd (fast, ~2x better than gzip)
   │
   └─ 6. incus delete tmp-build-<tag>
 ```
 
 The build container is temporary and deleted after publish. The published
-image is the immutable artifact. A restaurant container update means:
-`incus launch opsavor-restaurant-vX.Y.Z rest-<slug>-new` → health-gate →
-swap Caddy route → `incus delete rest-<slug>-old`.
+image is the immutable artifact. A platform container update means:
+`incus launch opsavor-platform:<ref> rest-<slug>` → health-gate →
+(no Caddy route change needed — it targets the name, not the IP).
 
 The `opsavor-base` image (Debian 13 + node:22 + curl + ca-certificates +
 zfsutils) is built once and cached locally. All service images extend it.
@@ -253,7 +252,7 @@ based, not copy-on-write), which is what `scripts/snapshot-all.sh` uses.
 
 **Snapshots and backups** (three layers, same model as do-ops):
 
-1. **In-app backups** — the restaurant app takes its own SQLite online
+1. **In-app backups** — the platform app takes its own SQLite online
    backup + bucket tarball, same as before. Lives on the container's own
    data volume. Survives operator error, not volume loss.
 2. **Volume snapshots** — each `deploy-*.sh` takes a `pre-update-*`
@@ -275,7 +274,7 @@ the DO console.
 
 ## CI/CD
 
-The repos (`opsavor/restaurant`, `opsavor/management`, `opsavor/native-ops`)
+The repos (`opsavor/platform`, `opsavor/management`, `opsavor/native-ops`)
 are hosted on `git.theta42.com`, a separate Gitea instance — not the
 `gitea` container in the topology diagram above. That container is
 provisioned and reachable but not yet populated; the repos will move there
@@ -302,12 +301,12 @@ DNS, and that name keeps resolving to whatever IP the replacement container
 gets. The tradeoff: the site really is down for the few seconds between
 `incus delete` and the replacement passing its health-gate — not the
 zero-downtime swap an earlier draft of this section described. Both
-`deploy-manager.sh` and the restaurant fleet roll (via
+`deploy-manager.sh` and the instance fleet roll (via
 `management/lib/incus.mjs`'s `buildUpdateScript`) build the new image
 *before* deleting anything, so a failed build never touches the running
 instance; a failure between delete and health-gate is not automatically
 rolled back (a `manager-data` ZFS snapshot is taken first for manual
-recovery — see "Storage" above; restaurant sites don't currently get an
+recovery — see "Storage" above; instances do not currently get an
 equivalent pre-replace snapshot).
 
 ### Manager release (`manager-vX.Y.Z`)
@@ -339,35 +338,29 @@ the runner is reachable, but it runs the real deploy script with that ref,
 which only works if `opsavor-manager:refs/heads/main` can actually be
 built and launched. Worth tightening later; not blocking today.
 
-### Restaurant release (`restaurant-vX.Y.Z`)
+### Platform release (`opsavor/platform`)
+
+`opsavor/platform` is hosted on `git.opsavor.work`. No release workflow is
+wired for it yet (no Actions runner is registered there), so builds are run
+by hand on the host:
 
 ```
-git.theta42.com receives tag restaurant-v1.2.3
-  │
-  v
-act-runner picks it up (restaurant/.gitea/workflows/release.yml)
-  │
-  ├─ 1. Prove green: test-restaurant.sh restaurant-v1.2.3
-  │     (temp container clones restaurant @ the tag, npm ci, npm test —
-  │     which runs `next build` + the full suite; container always deleted
-  │     after, pass or fail)
-  │
-  ├─ 2. Build image: build-image.sh restaurant restaurant-v1.2.3
-  │     → publish as opsavor-restaurant:restaurant-v1.2.3, repoint
-  │       opsavor-restaurant:latest at it (so fresh on-boards use it too)
-  │
-  └─ 3. Roll the fleet: POST /api/update-all {ref} to the manager
-        (reached at its live bridge IP — container_ip() in lib.sh, since
-        `.incus` names don't resolve from the host act-runner runs on)
-        — the manager then, for each ACTIVE restaurant, in sequence:
-          incus delete rest-<slug> --force
-          incus launch opsavor-restaurant:restaurant-v1.2.3 rest-<slug>
-            --profile base --profile restaurant --config limits.cpu=<size>
-            --config limits.memory=<size>
-          reattach rest-<slug>-data at /app/.data
-          incus restart rest-<slug>
-          health-gate: incus exec rest-<slug> -- curl 127.0.0.1:3000/api/health
-            (36 tries, 5s apart)
+# 1. Build image: build-image.sh platform main
+#    → publish as opsavor-platform:main, repoint opsavor-platform:latest
+#      (so fresh on-boards use it too)
+# 2. Roll the fleet: POST /api/update-all {ref} to the manager
+#    (reached at its live bridge IP — container_ip() in lib.sh, since
+#    `.incus` names don't resolve from the host act-runner runs on)
+#    — the manager, for each ACTIVE instance, in sequence:
+#      incus delete rest-<slug> --force
+#      incus launch opsavor-platform:<ref> rest-<slug>
+#        --profile base --profile service --config limits.cpu=<size>
+#        --config limits.memory=<size>
+#      reattach rest-<slug>-data at /app/.data
+#      incus exec rest-<slug> -- chown -R platform:platform /app/.data
+#      incus exec rest-<slug> -- systemctl enable --now platform
+#      health-gate: incus exec rest-<slug> -- curl 127.0.0.1:8787/health
+#        (36 tries, 5s apart)
 ```
 
 `/api/update-all` is synchronous and per-site: the manager walks every
@@ -379,22 +372,24 @@ rest of the fleet or the ones already done.
 ```
 Manager API: POST /api/restaurants {slug, name, ownerEmail, ownerPassword}
   │
-  ├─ 1. Validate slug, check host capacity (incus info resources)
+  ├─ 1. Validate slug; resolve opsavor-platform:latest → fingerprint
   │
-  ├─ 2. Launch: incus launch $GOLDEN_IMAGE_ALIAS rest-<slug>
-  │       --profile base --profile restaurant
-  │       attach new ZFS volume rest-<slug>-data
-  │       incus config set rest-<slug> environment.BASE_URL …
-  │       incus config set rest-<slug> environment.OWNER_EMAIL …
-  │       (etc., from manager-generated per-site env)
+  ├─ 2. Launch: incus launch <fingerprint> rest-<slug>
+  │       --profile base --profile service
+  │       attach a new volume rest-<slug>-data at /app/.data
+  │       write /etc/default/platform (control token; first-touch only)
+  │       incus exec rest-<slug> -- chown -R platform:platform /app/.data
+  │       incus exec rest-<slug> -- systemctl enable --now platform
   │
-  ├─ 3. Wait for: incus exec rest-<slug> -- systemctl is-system-running
-  │       then health-gate on the app's /api/health
+  ├─ 3. Health-gate: incus exec rest-<slug> -- curl 127.0.0.1:8787/health
   │
-  ├─ 4. Write Caddy site: incus file push <slug>.caddy edge/etc/caddy/sites/
+  ├─ 4. Create the tenant + owner over the control API
+  │       (POST /control/v1/tenants, reached on the bridge IP)
+  │
+  ├─ 5. Write Caddy site: incus file push <slug>.caddy edge/etc/caddy/sites/
   │       incus exec edge -- caddy reload
   │
-  └─ 5. Record in fleet.db (container name, IP, image alias, created_at)
+  └─ 6. Record in fleet.db (container name, size, status, control_token)
 ```
 
 No DO API call, no droplet wait, no cloud-init poll. Container launches are
@@ -406,7 +401,7 @@ sub-second from a cached image.
 |---|---|---|---|
 | `DO_API_TOKEN` | host `/root/.env` (600) | edge Caddy DNS-01, `scripts/add-edge-dns.sh` | git, CI logs, containers |
 | `MANAGER_TOKEN` | host `/root/.env` (600) | manager API auth (injected at launch) | git, CI logs |
-| `OLLAMA_DEFAULT_TOKEN` | host `/root/.env` (600) | fleet Savy default (injected per-restaurant) | git, CI logs |
+| `OLLAMA_DEFAULT_TOKEN` | host `/root/.env` (600) | fleet Savy default (injected per-instance) | git, CI logs |
 | `GOLDEN_IMAGE_ALIAS` | host `/root/.env` (600) | manager: which image alias to launch for onboards | git |
 | `GITEA_ADMIN_TOKEN` | host `/root/.env` (600) | manager: user provisioning via Gitea API | git, CI logs |
 | `opsavor_ed25519` | operator laptop `~/.ssh` | break-glass SSH to the host | git |
@@ -461,11 +456,11 @@ SSD, NYC1).
 **Reality**: ct-runner is idle 99% of the time. When it runs, it needs 4GB
 temporarily, and its limits only apply while it exists. The `ci` profile's
 4GB is a ceiling, not a reservation. In practice: stop ct-runner when not
-deploying, or accept that a running deploy + all services + 2-3 restaurants
+deploying, or accept that a running deploy + all services + 2-3 instances
 will swap briefly.
 
 **Phase 2 trigger**: sustained > 6GB RSS with ct-runner idle, or > 5
-restaurant containers. At that point, move restaurants to worker nodes and
+instances. At that point, move tenants to worker nodes and
 keep control plane on node-1.
 
 **Disk**: 160GB. Images are ~2-4GB each. Keep last 3 per service type.
@@ -486,7 +481,7 @@ API scripts (`do.sh`, `make-golden-image.sh`, `onboard-restaurant.sh`,
 | `add-edge-dns.sh` | kept (still DO DNS) |
 | `ensure-firewall.sh` | dropped — replaced by host nftables + Incus proxy |
 | `make-golden-image.sh` | `scripts/build-image.sh` — Incus build + publish |
-| `onboard-restaurant.sh` | kept, fixed to match `lib/incus.mjs`'s onboarding flow (env path, volume attach order) — a manual/CLI fallback; the manager's `POST /api/restaurants` is the normal path |
+| `onboard-restaurant.sh` | (dropped — the manager's `POST /api/restaurants` is the only path) |
 | `deploy-manager.sh` | kept under the same name — builds via `scripts/build-image.sh manager`, replaces the container, keeps its data volume |
 | `edge/cloud-init.yml` | `scripts/provision-host.sh` — host setup (not cloud-init) |
 | `restaurant/cloud-init.yml` | (dropped — containers boot from images, not cloud-init) |
@@ -516,26 +511,27 @@ Key endpoint changes:
 
 | old behavior (droplet) | new behavior (container) |
 |---|---|
-| `POST /api/restaurants` → deploy droplet from snapshot | launch container from the `opsavor-restaurant:latest` image fingerprint |
+| `POST /api/restaurants` → deploy droplet from snapshot | launch container from the `opsavor-platform:latest` image fingerprint |
 | `POST /:slug/resize` → power off → DO resize → power on | live `incus config set limits.cpu/memory` — no stop/start at all |
-| rolling update → SSH in, `git fetch` + rebuild in place | delete + relaunch from a pre-built `opsavor-restaurant:<ref>` image, keeping the same data volume (containers are immutable — see AGENTS.md principle 1) |
+| rolling update → SSH in, `git fetch` + rebuild in place | delete + relaunch from a pre-built `opsavor-platform:<ref>` image, keeping the same data volume (containers are immutable — see AGENTS.md principle 1) |
 | `POST /:slug/backup` → instance self-backup | unchanged (in-app backup); no ZFS snapshot layer (host uses the `dir` storage backend, not ZFS — see gotcha) |
 | `DELETE /:slug` → destroy droplet | `incus delete <ct>` + delete its custom volume |
 | `GET/POST /:slug/droplet` | renamed `/:slug/container`; actions are `start\|stop\|restart` |
 
-### restaurant
+### platform (replaces the retired restaurant app)
 
-The app itself does not change. The entrypoint, health check, and
-Dockerfile logic move into `images/restaurant/build.sh` and a systemd
-unit — its `ExecStart` runs the same `scripts/docker-entrypoint.sh` the
-Docker image used (staged restore → migrate → optional owner seed →
-`server.js`), not `node server.js` directly. Per-instance config (owner
-email/password, service token, Ollama settings) lands in
-`/app/.data/env` on the container's data volume — NOT via `incus config
-set environment.*`, which (per the gotcha above) never reaches a
-systemd-managed process; the systemd unit reads it via
-`EnvironmentFile=-/app/.data/env`. `AGENTS.md` / `README.md` deployment
-sections reference `native-ops` instead of `do-ops`.
+The old `opsavor/restaurant` app (Next.js + SQLite) is retired. Its image
+(`images/restaurant/`), profile (`incus/profiles/restaurant.yml`), and
+scripts (`onboard-restaurant.sh`, `test-restaurant.sh`) are removed.
+
+The replacement is `opsavor/platform` — a zero-dependency Node app whose
+image lives in `images/platform/build.sh`: it clones the repo at the ref,
+adds a non-root `platform` user, and ships a systemd unit
+(`platform.service`) that is enabled at deploy time, not baked enabled.
+Per-instance config (control token, data dir, port) lands in
+`/etc/default/platform` on the container's data volume and is read via
+`EnvironmentFile=`; the tenant and its owner are created over the app's own
+`/control/v1` API, not from env.
 
 ## Runbooks
 
@@ -661,12 +657,11 @@ build → delete `home` → launch → health-gate `http://127.0.0.1:3000/health
 Caddy reaches it as `home:3000` over the bridge. To change page content,
 edit the `opsavor/opsavor.ai` repo and re-run `deploy-home.sh`.
 
-### Onboard a restaurant
+### Onboard a tenant instance
 
 ```sh
-# Build the image once per release tag (build-image.sh restaurant, needs
-# real memory — see the build-container-memory gotcha):
-./scripts/build-image.sh restaurant restaurant-v0.2.2
+# Build the image once per ref (git-clones opsavor/platform at the ref):
+./scripts/build-image.sh platform main
 
 # Via the manager UI: dashboard → Onboard card → slug, name, owner, size
 # Via the manager API:
@@ -677,7 +672,7 @@ curl -X POST -H "Authorization: Bearer $MANAGER_TOKEN" \
 
 # Watch provisioning:
 incus list
-incus exec rest-acme -- journalctl -u restaurant --no-pager -n 40
+incus exec rest-acme -- journalctl -u platform --no-pager -n 40
 ```
 
 ### Deploy Outline (wiki.opsavor.work, docs.opsavor.app)
@@ -869,7 +864,7 @@ echo 'GOOGLE_CLIENT_SECRET=<client secret>' >> /root/.plane-secrets.env
 ./scripts/deploy-plane.sh   # only replaces the plane container; infra is untouched
 ```
 
-### Migrate a restaurant between nodes (Phase 2)
+### Migrate an instance between nodes (Phase 2)
 
 ```sh
 # On the manager (which talks to both nodes' Incus):
@@ -884,7 +879,7 @@ incus start rest-sicily  # on node-2 (now the live one)
 # Verify, then delete the node-1 copy
 ```
 
-### Destroy a restaurant
+### Destroy an instance
 
 ```sh
 # Via the manager UI: dashboard → Manage → Decommission
@@ -899,7 +894,7 @@ incus start rest-sicily  # on node-2 (now the live one)
 
 ### Backup / restore
 
-**In-app** (same as do-ops): the restaurant instance takes its own SQLite
+**In-app**: the platform instance takes its own SQLite
 online backup + bucket tarball daily. Lives on the container's volume.
 
 **ZFS snapshot** (structural):
@@ -917,7 +912,7 @@ incus restore rest-sicily snap0                 # roll back to snapshot
 **Volume-level restore** (surgical):
 ```sh
 # The volume survives container deletion. Attach it to a fresh container:
-incus launch opsavor-restaurant-vX.Y.Z rest-sicily-recovered
+incus launch opsavor-platform:<ref> rest-sicily-recovered
 incus storage volume attach default rest-sicily-data rest-sicily-recovered /app/.data
 incus start rest-sicily-recovered
 ```
@@ -968,15 +963,14 @@ native-ops/
     profiles/
       base.yml                 ← least-privilege defaults (inherited by all)
       edge.yml                 ← Caddy + proxy devices for :80/:443
-      service.yml              ← internal tooling (gitea, plane, outline)
+      service.yml              ← internal tooling + platform instances
       ci.yml                   ← CI runner (privileged, Incus socket mounted)
-      restaurant.yml           ← per-site Next.js + SQLite
   images/
     base/                      ← Debian 13 + node:22 + common tools (build.sh)
     edge/                      ← Caddy binary + Caddyfile (build.sh)
     manager/                   ← management app (build.sh)
     home/                      ← opsavor/opsavor.ai home page (build.sh)
-    restaurant/                ← restaurant app (build.sh)
+    platform/                  ← opsavor/platform (build.sh)
     gitea/                     ← Gitea binary + config (build.sh)
     plane/                     ← Plane distribution (build.sh)
   edge/
@@ -988,7 +982,7 @@ native-ops/
     build-image.sh             ← generic image build pipeline (tmp ct → publish)
     deploy-service.sh          ← generic rolling update (launch → swap → cleanup)
     launch-core.sh             ← boot edge + manager + gitea + ct-runner
-    launch-tenants.sh          ← boot all restaurant containers from fleet.db
+    launch-tenants.sh          ← boot all instance containers from fleet.db
     add-edge-dns.sh            ← idempotent apex + wildcard A-records
     snapshot-all.sh            ← ZFS snapshot every volume (cron)
     prune-images.sh            ← keep 3 latest per alias
@@ -1001,7 +995,7 @@ generated). Image build scripts write nothing to this repo at runtime.
 ## Troubleshooting
 
 - **Container won't start**: `incus info <ct>` shows last error. Most common
-  cause: profile not applied (`incus profile assign <ct> base,restaurant`).
+  cause: profile not applied (`incus profile assign <ct> base,service`).
   Second: ZFS pool full (`zfs list` / `incus storage info default`).
 
 - **`.incus` DNS not resolving**: the managed bridge runs dnsmasq. Verify
@@ -1026,7 +1020,7 @@ generated). Image build scripts write nothing to this repo at runtime.
   not-found error.
 
 - **`incus publish` hangs or is very slow**: ZFS snapshot + export of a
-  large container. Normal for the restaurant image (~3-4GB uncompressed,
+  large container. Normal for a large image (~3-4GB uncompressed,
   ~1.5GB zstd). Do not Ctrl-C; the published image will be corrupt.
 
 - **Host out of RAM**: `incus list --format csv | awk -F, '{print $1}'`

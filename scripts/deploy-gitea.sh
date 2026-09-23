@@ -23,7 +23,7 @@ echo "[deploy] Building opsavor-gitea..."
 "$REPO_DIR/scripts/build-image.sh" gitea
 
 incus storage volume create default gitea-data 2>/dev/null || true
-# Same fix as bookstack/restaurant/manager: lets the container's own uid
+# Same fix as bookstack/manager: lets the container's own uid
 # mapping (the `git` user) apply to this volume, so the entrypoint
 # (running as container-root before it drops to git) can chown it without
 # any host-side permission workaround.
