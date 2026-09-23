@@ -123,9 +123,22 @@ func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error
 
 // ContainerExists checks if an instance exists.
 func (c *Client) ContainerExists(ctx context.Context, name string) bool {
-	cmd := fmt.Sprintf("incus info %s --format json", name)
-	_, err := c.exec.Run(ctx, cmd)
-	return err == nil
+	cmd := fmt.Sprintf("incus list %s --format json", name)
+	out, err := c.exec.Run(ctx, cmd)
+	if err != nil {
+		return false
+	}
+	var instances []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(out), &instances); err == nil {
+		for _, inst := range instances {
+			if inst.Name == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // EnsureProfile ensures a named profile exists, creating and configuring standard profiles if needed.
@@ -207,12 +220,8 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 
 // StopAndDeleteContainer gracefully stops and purges a container.
 func (c *Client) StopAndDeleteContainer(ctx context.Context, name string) error {
-	if !c.ContainerExists(ctx, name) {
-		return nil
-	}
-	// Stop with timeout, then force delete
-	_, _ = c.exec.Run(ctx, fmt.Sprintf("incus stop %s --timeout 15 || incus stop %s --force", name, name))
-	_, err := c.exec.Run(ctx, fmt.Sprintf("incus delete %s", name))
+	_, _ = c.exec.Run(ctx, fmt.Sprintf("incus stop %s --force || true", name))
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus delete %s --force || true", name))
 	if err != nil {
 		return fmt.Errorf("delete container %s: %w", name, err)
 	}

@@ -68,9 +68,7 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 	// 4. Stop and delete old container
 	if d.incus.ContainerExists(ctx, svc.Name) {
 		log.Printf("    Deleting old container: %s...\n", svc.Name)
-		if err := d.incus.StopAndDeleteContainer(ctx, svc.Name); err != nil {
-			return fmt.Errorf("delete old container %s: %w", svc.Name, err)
-		}
+		_ = d.incus.StopAndDeleteContainer(ctx, svc.Name)
 	}
 
 	// 5. Launch new container
