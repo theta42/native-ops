@@ -400,8 +400,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}
 		}
 
-		caddyLogs, _ := activeExec.Run(ctx, "incus info --show-log edge || true")
-		log.Printf("==> [GitOps] Edge container console logs:\n%s\n", caddyLogs)
+		diagEdge, _ := activeExec.Run(ctx, "echo '--- EDGE CONSOLE ---'; incus console edge --show-log || true; echo '--- RESOLV ---'; incus exec edge -- cat /etc/resolv.conf || true; echo '--- ACME REACHABILITY ---'; incus exec edge -- wget -qO- --timeout=5 https://acme-v02.api.letsencrypt.org/directory || true; echo '--- CADDYFILE ---'; incus exec edge -- cat /etc/caddy/Caddyfile || true; echo '--- SITES ---'; incus exec edge -- cat /etc/caddy/sites/gitea.caddy || true; echo '--- CERTS ---'; incus exec edge -- find /data /root/.local -name '*.crt' -o -name '*.json' 2>/dev/null || true")
+		log.Printf("==> [GitOps] Edge container diagnostics:\n%s\n", diagEdge)
 	}
 
 	log.Printf("==> [GitOps] Full fleet reconciliation completed successfully!\n")
