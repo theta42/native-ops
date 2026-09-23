@@ -73,9 +73,5 @@ incus exec edge -- caddy reload --config /etc/caddy/Caddyfile --adapter caddyfil
 echo "[deploy] $NAME ready"
 echo "  url:     https://${NAME}.opsavor.app/app/   (health: https://${NAME}.opsavor.app/health)"
 echo "  control: https://${NAME}.opsavor.app/control/v1/health  (X-Control-Token: ${CTRL_TOKEN})"
-case "$PROFILE" in
-  bad)   echo "  login:   owner@bad.test / opsavor" ;;
-  multi) echo "  login:   owner@multi.test / opsavor" ;;
-  *)     echo "  login:   owner@demo.test / opsavor" ;;
-esac
-echo "  (also manager@<site>.test, readonly@<site>.test, manager.scoped@<site>.test — same password)"
+echo "  login:   owner@demo.test / opsavor   (identical on every demo)"
+echo "  also:    manager@demo.test, readonly@demo.test, manager.scoped@demo.test"
