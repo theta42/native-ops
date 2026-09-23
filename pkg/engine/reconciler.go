@@ -402,7 +402,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}
 		}
 
-		diagEdge, _ := activeExec.Run(ctx, "sleep 20; echo '--- CADDY ACME & ERRORS ---'; incus exec edge -- grep -iE 'error|warn|fail|challenge|obtain|cert|let|zero' /var/log/caddy.log || true; echo '--- CERTS DIR ---'; incus exec edge -- ls -laR /data/caddy || true")
+		diagEdge, _ := activeExec.Run(ctx, "sleep 10; echo '--- TAIL 40 CADDY LOG ---'; incus exec edge -- tail -n 40 /var/log/caddy.log || true")
 		log.Printf("==> [GitOps] Edge container diagnostics:\n%s\n", diagEdge)
 	}
 
