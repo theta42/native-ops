@@ -342,9 +342,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		_, _ = sshExec.Run(ctx, "which incus >/dev/null 2>&1 || (apt-get update && apt-get install -y incus)")
 		_, _ = sshExec.Run(ctx, "incus profile show default >/dev/null 2>&1 || incus admin init --auto")
 		_, _ = sshExec.Run(ctx, "incus storage list | grep -q default || incus storage create default dir || true")
-		_, _ = sshExec.Run(ctx, "incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true")
-		_, _ = sshExec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 ipv4.address=10.0.100.1/24 ipv4.nat=true ipv6.address=none || true")
-		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv4.address=10.0.100.1/24 ipv4.nat=true || true")
+		_, _ = sshExec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 || true")
+		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv4.address 10.0.100.1/24 || true")
+		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv4.nat true || true")
+		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv6.address none || true")
 		_, _ = sshExec.Run(ctx, "incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true")
 		_, _ = sshExec.Run(ctx, "incus remote list | grep -q ' docker ' || incus remote add docker https://docker.io --protocol=oci --public || true")
 
