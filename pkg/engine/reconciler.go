@@ -311,6 +311,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 	// 3. Level 1: Reconcile Declarative Services
 	deployer := r.deployer
+	var activeExec remote.Executor = r.exec
 
 	// If target host is remote and we have an SSH key, execute deployments over SSH
 	if primaryHostIP != "" && primaryHostIP != "127.0.0.1" && primaryHostIP != "localhost" && len(privKeyPEM) > 0 {
@@ -333,6 +334,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			return fmt.Errorf("init SSH executor to %s: %w", primaryHostIP, sshErr)
 		}
 		defer sshExec.Close()
+		activeExec = sshExec
 
 		// Pre-flight host initialization
 		log.Printf("==> [GitOps] Verifying host runtime on %s...\n", primaryHostIP)
@@ -397,6 +399,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 				return fmt.Errorf("deploy service %s: %w", svcCfg.Name, err)
 			}
 		}
+
+		caddyLogs, _ := activeExec.Run(ctx, "incus info --show-log edge || true")
+		log.Printf("==> [GitOps] Edge container console logs:\n%s\n", caddyLogs)
 	}
 
 	log.Printf("==> [GitOps] Full fleet reconciliation completed successfully!\n")
