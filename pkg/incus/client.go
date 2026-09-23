@@ -153,6 +153,10 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 		image = "docker:" + image
 	}
 
+	if strings.HasPrefix(image, "docker:") {
+		_, _ = c.exec.Run(ctx, "incus remote list | grep -q ' docker ' || incus remote add docker https://docker.io --protocol=oci --public || true")
+	}
+
 	// Ensure all required profiles exist
 	for _, p := range profiles {
 		if p != "default" {

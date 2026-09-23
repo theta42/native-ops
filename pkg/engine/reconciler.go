@@ -341,6 +341,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		_, _ = sshExec.Run(ctx, "which cloud-init >/dev/null 2>&1 && cloud-init status --wait || true")
 		_, _ = sshExec.Run(ctx, "which incus >/dev/null 2>&1 || (apt-get update && apt-get install -y incus)")
 		_, _ = sshExec.Run(ctx, "incus profile show default >/dev/null 2>&1 || incus admin init --auto")
+		_, _ = sshExec.Run(ctx, "incus remote list | grep -q ' docker ' || incus remote add docker https://docker.io --protocol=oci --public || true")
 
 		deployer = NewDeployer(sshExec)
 	}
