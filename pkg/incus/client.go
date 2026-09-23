@@ -123,7 +123,8 @@ func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error
 		time.Sleep(2 * time.Second)
 	}
 
-	return "", fmt.Errorf("no global IPv4 address assigned to container %s within 30s", name)
+	info, _ := c.exec.Run(ctx, fmt.Sprintf("incus info %s; incus list %s --format json", name, name))
+	return "", fmt.Errorf("no global IPv4 address assigned to container %s within 30s. Diagnostic:\n%s", name, info)
 }
 
 // ContainerExists checks if an instance exists.
