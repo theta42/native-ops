@@ -111,53 +111,27 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 		env[k] = v
 	}
 
-	if svc.Name == "manager" {
-		log.Printf("    Setting up Opsavor Manager application inside container %s...\n", svc.Name)
-		setupScript := `#!/bin/bash
-set -e
-which node >/dev/null 2>&1 || (
-  apt-get update -qq
-  apt-get install -y -qq --no-install-recommends ca-certificates curl git gnupg
-  mkdir -p /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -qq
-  apt-get install -y -qq nodejs
-)
-NODE_BIN=$(which node || echo "/usr/bin/node")
-if [ ! -f "/app/server.mjs" ]; then
-  mkdir -p /tmp/app-clone
-  git clone https://git.opsavor.work/opsavor/management.git /tmp/app-clone
-  cp -r /tmp/app-clone/. /app/
-  rm -rf /tmp/app-clone
-else
-  cd /app && git pull || true
-fi
-mkdir -p /app/.data
-cd /app && npm ci
-cat > /etc/systemd/system/manager.service <<EOF
-[Unit]
-Description=Opsavor Fleet Manager
-After=network.target
+	// 7. Execute Container Init Hook (if specified)
+	if svc.Hooks.ContainerInit != "" {
+		log.Printf("    Running container_init hook for %s...\n", svc.Name)
+		var scriptContent string
+		svcScriptPath := filepath.Join(configDir, "services", svc.Name, svc.Hooks.ContainerInit)
+		scriptPath := filepath.Join(configDir, svc.Hooks.ContainerInit)
 
-[Service]
-User=root
-WorkingDirectory=/app
-ExecStart=${NODE_BIN} /app/server.mjs
-Restart=on-failure
-RestartSec=5
-EnvironmentFile=-/etc/default/manager
+		if data, err := os.ReadFile(svcScriptPath); err == nil {
+			scriptContent = string(data)
+		} else if data, err := os.ReadFile(scriptPath); err == nil {
+			scriptContent = string(data)
+		} else {
+			scriptContent = svc.Hooks.ContainerInit
+		}
 
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable manager
-systemctl restart manager || true
-`
-		b64 := base64.StdEncoding.EncodeToString([]byte(setupScript))
+		b64 := base64.StdEncoding.EncodeToString([]byte(scriptContent))
 		out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- bash", b64, svc.Name))
-		log.Printf("    Manager setup output: %s (err: %v)\n", out, err)
+		if err != nil {
+			log.Printf("    Container init failed for %s: %s (err: %v)\n", svc.Name, out, err)
+			return fmt.Errorf("container_init hook failed for %s: %w (output: %s)", svc.Name, err, out)
+		}
 	}
 
 	if len(env) > 0 {

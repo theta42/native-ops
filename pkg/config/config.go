@@ -66,7 +66,7 @@ type HealthCheckConfig struct {
 
 // RoutingConfig defines Caddy edge routing rules.
 type RoutingConfig struct {
-	Domain       string   `yaml:"domain"`       // e.g. "git.opsavor.work" or "*.opsavor.app"
+	Domain       string   `yaml:"domain"`       // e.g. "git.example.com" or "*.example.com"
 	UpstreamPort int      `yaml:"upstream_port"`// e.g. 3000
 	TLS          string   `yaml:"tls,omitempty"`// e.g. "dns digitalocean" or "internal"
 	ExtraDirectives []string `yaml:"extra_directives,omitempty"`
@@ -88,8 +88,9 @@ type ServiceConfig struct {
 }
 
 type ServiceHooks struct {
-	PreDeploy  string `yaml:"pre_deploy,omitempty"`
-	PostDeploy string `yaml:"post_deploy,omitempty"`
+	PreDeploy     string `yaml:"pre_deploy,omitempty"`
+	ContainerInit string `yaml:"container_init,omitempty"`
+	PostDeploy    string `yaml:"post_deploy,omitempty"`
 }
 
 // TemplateConfig defines a blueprint for dynamic tenant workloads (e.g. platform instances).
@@ -101,7 +102,7 @@ type TemplateConfig struct {
 	DefaultLimits  map[string]string `yaml:"default_limits,omitempty"`
 	EnvTemplate    map[string]string `yaml:"env_template,omitempty"`
 	HealthCheck    HealthCheckConfig `yaml:"healthcheck,omitempty"`
-	RoutingPattern string            `yaml:"routing_pattern,omitempty"` // e.g. "{slug}.opsavor.app"
+	RoutingPattern string            `yaml:"routing_pattern,omitempty"` // e.g. "{slug}.example.com"
 	Hooks          ServiceHooks      `yaml:"hooks,omitempty"`
 }
 

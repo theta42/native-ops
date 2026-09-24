@@ -32,7 +32,7 @@ type LaunchParams struct {
 	Template     *config.TemplateConfig
 	Name         string            // e.g. "rest-acme"
 	Slug         string            // e.g. "acme"
-	Domain       string            // e.g. "acme.opsavor.app"
+	Domain       string            // e.g. "acme.example.com"
 	CustomDomain string            // optional custom domain
 	Env          map[string]string
 	Limits       map[string]string

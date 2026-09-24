@@ -80,16 +80,12 @@ func DeterministicIPForService(name string) string {
 	switch name {
 	case "edge":
 		return "10.0.100.10"
-	case "gitea":
-		return "10.0.100.20"
-	case "manager":
-		return "10.0.100.30"
 	default:
 		h := 0
 		for _, c := range name {
 			h = (h*31 + int(c)) % 200
 		}
-		return fmt.Sprintf("10.0.100.%d", 40+h)
+		return fmt.Sprintf("10.0.100.%d", 20+h)
 	}
 }
 
