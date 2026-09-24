@@ -124,14 +124,18 @@ which node >/dev/null 2>&1 || (
   apt-get update -qq
   apt-get install -y -qq nodejs
 )
+NODE_BIN=$(which node || echo "/usr/bin/node")
 if [ ! -f "/app/server.mjs" ]; then
-  rm -rf /app/*
-  git clone https://git.opsavor.work/opsavor/management.git /app
+  mkdir -p /tmp/app-clone
+  git clone https://git.opsavor.work/opsavor/management.git /tmp/app-clone
+  cp -r /tmp/app-clone/. /app/
+  rm -rf /tmp/app-clone
 else
   cd /app && git pull || true
 fi
+mkdir -p /app/.data
 cd /app && npm ci
-cat > /etc/systemd/system/manager.service <<'EOF'
+cat > /etc/systemd/system/manager.service <<EOF
 [Unit]
 Description=Opsavor Fleet Manager
 After=network.target
@@ -139,7 +143,7 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=/app
-ExecStart=/usr/bin/node server.mjs
+ExecStart=${NODE_BIN} /app/server.mjs
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=-/etc/default/manager
@@ -152,7 +156,8 @@ systemctl enable manager
 systemctl restart manager || true
 `
 		b64 := base64.StdEncoding.EncodeToString([]byte(setupScript))
-		_, _ = d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- bash", b64, svc.Name))
+		out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- bash", b64, svc.Name))
+		log.Printf("    Manager setup output: %s (err: %v)\n", out, err)
 	}
 
 	if len(env) > 0 {
@@ -178,6 +183,8 @@ systemctl restart manager || true
 	if svc.HealthCheck.Path != "" {
 		log.Printf("    Probing healthcheck (%s:%d%s)...\n", ip, svc.HealthCheck.Port, svc.HealthCheck.Path)
 		if err := d.incus.HealthGate(ctx, ip, svc.HealthCheck); err != nil {
+			diag, _ := d.exec.Run(ctx, fmt.Sprintf("incus exec %s -- journalctl -u %s --no-pager -n 30 || true", svc.Name, svc.Name))
+			log.Printf("    Health gate failed! Container %s logs:\n%s\n", svc.Name, diag)
 			return fmt.Errorf("health gate failed: %w", err)
 		}
 		log.Printf("    Healthcheck passed!\n")
