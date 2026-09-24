@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
@@ -108,6 +109,50 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 	}
 	for k, v := range svc.Env {
 		env[k] = v
+	}
+
+	if svc.Name == "manager" {
+		log.Printf("    Setting up Opsavor Manager application inside container %s...\n", svc.Name)
+		setupScript := `#!/bin/bash
+set -e
+which node >/dev/null 2>&1 || (
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends ca-certificates curl git gnupg
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+  apt-get update -qq
+  apt-get install -y -qq nodejs
+)
+if [ ! -f "/app/server.mjs" ]; then
+  rm -rf /app/*
+  git clone https://git.opsavor.work/opsavor/management.git /app
+else
+  cd /app && git pull || true
+fi
+cd /app && npm ci
+cat > /etc/systemd/system/manager.service <<'EOF'
+[Unit]
+Description=Opsavor Fleet Manager
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/app
+ExecStart=/usr/bin/node server.mjs
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/etc/default/manager
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable manager
+systemctl restart manager || true
+`
+		b64 := base64.StdEncoding.EncodeToString([]byte(setupScript))
+		_, _ = d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- bash", b64, svc.Name))
 	}
 
 	if len(env) > 0 {
