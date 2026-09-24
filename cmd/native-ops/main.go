@@ -82,6 +82,7 @@ Core Commands:
   instance resize  Live CPU/memory cgroup resizing
   instance destroy Delete an instance and its Caddy route
   instance migrate Move instance and volume across Incus remotes
+  backup init      Create the destination bucket if it does not exist
   backup create    Back up one custom volume to S3-compatible object storage
   backup all       Back up every (allowlisted) custom volume
   backup list      List stored backups for a volume
@@ -437,6 +438,12 @@ func handleBackupCommand(ctx context.Context, args []string) {
 	}
 
 	switch action {
+	case "init":
+		if err := mgr.EnsureBucket(ctx); err != nil {
+			log.Fatalf("Bucket init failed: %v", err)
+		}
+		fmt.Println("Backup bucket is ready.")
+
 	case "create":
 		if flags.NArg() < 1 {
 			log.Fatal("Error: backup create requires a <volume> name")
@@ -482,7 +489,14 @@ func handleBackupCommand(ctx context.Context, args []string) {
 	case "prune":
 		volumes := flags.Args()
 		if len(volumes) == 0 {
-			volumes = []string{""}
+			del, err := mgr.PruneAll(ctx, *pool)
+			if err != nil {
+				log.Fatalf("Prune failed: %v", err)
+			}
+			for _, k := range del {
+				fmt.Printf("  deleted %s\n", k)
+			}
+			break
 		}
 		for _, v := range volumes {
 			del, err := mgr.Prune(ctx, v)

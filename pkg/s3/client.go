@@ -111,6 +111,31 @@ func (c *Client) PutObject(ctx context.Context, key string, body io.Reader, size
 	return nil
 }
 
+// CreateBucket creates the configured bucket if it does not already exist.
+func (c *Client) CreateBucket(ctx context.Context) error {
+	u := *c.base
+	if c.cfg.PathStyle {
+		u.Path = "/" + c.cfg.Bucket
+	} else {
+		u.Host = c.cfg.Bucket + "." + c.base.Host
+		u.Path = "/"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req, emptySHA256, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// 200 = created; 409 = already exists and owned by this account.
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusConflict {
+		return nil
+	}
+	return statusError("create bucket", resp)
+}
+
 // GetObject downloads key. The caller must close the returned reader.
 func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(key).String(), nil)

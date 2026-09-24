@@ -72,6 +72,19 @@ func (m *Manager) manifestKey(volume string) string {
 	return m.keyPrefix(volume) + "latest.json"
 }
 
+// EnsureBucket creates the destination bucket if the store supports it and
+// it does not already exist.
+func (m *Manager) EnsureBucket(ctx context.Context) error {
+	if m.store == nil {
+		return errors.New("backup: no object store configured")
+	}
+	creator, ok := m.store.(interface{ CreateBucket(context.Context) error })
+	if !ok {
+		return errors.New("backup: object store does not support bucket creation")
+	}
+	return creator.CreateBucket(ctx)
+}
+
 // CreateVolume snapshots, exports and uploads one custom volume, then writes
 // its manifest. The transient snapshot is removed unless KeepLocalSnapshots.
 func (m *Manager) CreateVolume(ctx context.Context, pool, volume string) (*Manifest, error) {
@@ -256,6 +269,31 @@ func (m *Manager) Restore(ctx context.Context, o RestoreOptions) error {
 		}
 	}
 	return nil
+}
+
+// PruneAll applies retention to every allowlisted (or all) custom volume,
+// one volume at a time so keys never rank across volumes.
+func (m *Manager) PruneAll(ctx context.Context, pool string) ([]string, error) {
+	if pool == "" {
+		pool = "default"
+	}
+	names := m.cfg.Volumes
+	if len(names) == 0 {
+		all, err := m.incus.ListCustomVolumes(ctx, pool)
+		if err != nil {
+			return nil, err
+		}
+		names = all
+	}
+	var deleted []string
+	for _, v := range names {
+		del, err := m.Prune(ctx, v)
+		if err != nil {
+			return deleted, err
+		}
+		deleted = append(deleted, del...)
+	}
+	return deleted, nil
 }
 
 // Prune applies retention to a volume's objects, keeping the newest
