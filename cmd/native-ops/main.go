@@ -7,13 +7,16 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/theta42/native-ops/pkg/backup"
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/provider"
 	"github.com/theta42/native-ops/pkg/provider/digitalocean"
 	"github.com/theta42/native-ops/pkg/provider/plugin"
 	"github.com/theta42/native-ops/pkg/remote"
+	"github.com/theta42/native-ops/pkg/s3"
 )
 
 var Version = "v1.0.0"
@@ -46,6 +49,9 @@ func main() {
 	case "instance":
 		handleInstanceCommand(ctx, os.Args[2:])
 
+	case "backup":
+		handleBackupCommand(ctx, os.Args[2:])
+
 	case "dns":
 		handleDNSCommand(ctx, os.Args[2:])
 
@@ -76,6 +82,11 @@ Core Commands:
   instance resize  Live CPU/memory cgroup resizing
   instance destroy Delete an instance and its Caddy route
   instance migrate Move instance and volume across Incus remotes
+  backup create    Back up one custom volume to S3-compatible object storage
+  backup all       Back up every (allowlisted) custom volume
+  backup list      List stored backups for a volume
+  backup restore   Restore a volume from a stored backup
+  backup prune     Apply retention to a volume's stored backups
   dns sync         Sync DNS records using configured provider or python plugin
   version          Print version information`)
 }
@@ -374,4 +385,117 @@ func handleDNSCommand(ctx context.Context, args []string) {
 		log.Fatalf("DNS sync failed: %v", err)
 	}
 	fmt.Printf("DNS records synced for %s (apex and wildcard -> %s)\n", dom, *targetIP)
+}
+
+func loadBackupStore(configDir string) (*backup.Manager, error) {
+	fleet, err := config.LoadFleetConfig(configDir)
+	if err != nil {
+		return nil, err
+	}
+	if fleet.Backup == nil {
+		return nil, fmt.Errorf("no 'backup:' section in %s/fleet.yml", configDir)
+	}
+	cfg := fleet.Backup
+	if err := cfg.ValidateForBackup(); err != nil {
+		return nil, err
+	}
+	access, secret, err := cfg.Credentials()
+	if err != nil {
+		return nil, err
+	}
+	store, err := s3.New(s3.Config{
+		Endpoint:  cfg.Endpoint,
+		Region:    cfg.Region,
+		Bucket:    cfg.Bucket,
+		AccessKey: access,
+		SecretKey: secret,
+		PathStyle: cfg.S3PathStyle(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return backup.New(remote.NewLocalExecutor(), store, cfg), nil
+}
+
+func handleBackupCommand(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: native-ops backup [create <volume>|all|list [volume]|restore <volume>|prune [volume]]")
+		os.Exit(1)
+	}
+	action := args[0]
+	flags := flag.NewFlagSet("backup "+action, flag.ExitOnError)
+	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	pool := flags.String("pool", "default", "Incus storage pool")
+	from := flags.String("from", "latest", "Object key or 'latest'")
+	as := flags.String("as", "", "Import under a new volume name (non-destructive)")
+	force := flags.Bool("force", false, "Stop dependent containers to restore in place")
+	_ = flags.Parse(args[1:])
+
+	mgr, err := loadBackupStore(*configDir)
+	if err != nil {
+		log.Fatalf("backup config: %v", err)
+	}
+
+	switch action {
+	case "create":
+		if flags.NArg() < 1 {
+			log.Fatal("Error: backup create requires a <volume> name")
+		}
+		man, err := mgr.CreateVolume(ctx, *pool, flags.Arg(0))
+		if err != nil {
+			log.Fatalf("Backup failed: %v", err)
+		}
+		fmt.Printf("Backed up %s (%d bytes, sha256 %s)\n  -> %s\n", man.Volume, man.SizeBytes, man.SHA256[:12], man.Key)
+
+	case "all":
+		mans, err := mgr.CreateVolumes(ctx, *pool)
+		for _, man := range mans {
+			fmt.Printf("  ok  %-24s %10d bytes  %s\n", man.Volume, man.SizeBytes, man.Key)
+		}
+		if err != nil {
+			log.Fatalf("Backup failed: %v", err)
+		}
+		fmt.Printf("Backed up %d volume(s).\n", len(mans))
+
+	case "list":
+		objs, man, err := mgr.ListVolume(ctx, flags.Arg(0))
+		if err != nil {
+			log.Fatalf("List failed: %v", err)
+		}
+		if man != nil {
+			fmt.Printf("  latest: %s (%d bytes, sha256 %s)\n", man.Key, man.SizeBytes, man.SHA256[:12])
+		}
+		for _, o := range objs {
+			fmt.Printf("  %10d  %s  %s\n", o.Size, o.LastModified.UTC().Format(time.RFC3339), o.Key)
+		}
+
+	case "restore":
+		if flags.NArg() < 1 {
+			log.Fatal("Error: backup restore requires a <volume> name")
+		}
+		err := mgr.Restore(ctx, backup.RestoreOptions{Pool: *pool, Volume: flags.Arg(0), FromKey: *from, AsName: *as, Force: *force})
+		if err != nil {
+			log.Fatalf("Restore failed: %v", err)
+		}
+		fmt.Printf("Restored %s from %s\n", flags.Arg(0), *from)
+
+	case "prune":
+		volumes := flags.Args()
+		if len(volumes) == 0 {
+			volumes = []string{""}
+		}
+		for _, v := range volumes {
+			del, err := mgr.Prune(ctx, v)
+			if err != nil {
+				log.Fatalf("Prune failed: %v", err)
+			}
+			for _, k := range del {
+				fmt.Printf("  deleted %s\n", k)
+			}
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown backup action: %s\n", action)
+		os.Exit(1)
+	}
 }
