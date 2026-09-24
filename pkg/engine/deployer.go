@@ -57,12 +57,26 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 		}
 	}
 
-	// 3. Pre-deploy hook
+	// 3. Pre-deploy hook (executed on the host)
 	if svc.Hooks.PreDeploy != "" {
-		hookPath := filepath.Join(configDir, svc.Hooks.PreDeploy)
-		log.Printf("    Running pre-deploy hook: %s\n", hookPath)
-		if _, err := d.exec.Run(ctx, hookPath); err != nil {
-			return fmt.Errorf("pre-deploy hook failed: %w", err)
+		log.Printf("    Running pre-deploy hook for %s...\n", svc.Name)
+		var scriptContent string
+		svcScriptPath := filepath.Join(configDir, "services", svc.Name, svc.Hooks.PreDeploy)
+		scriptPath := filepath.Join(configDir, svc.Hooks.PreDeploy)
+
+		if data, err := os.ReadFile(svcScriptPath); err == nil {
+			scriptContent = string(data)
+		} else if data, err := os.ReadFile(scriptPath); err == nil {
+			scriptContent = string(data)
+		} else {
+			scriptContent = svc.Hooks.PreDeploy
+		}
+
+		b64 := base64.StdEncoding.EncodeToString([]byte(scriptContent))
+		out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | bash", b64))
+		if err != nil {
+			log.Printf("    Pre-deploy hook failed for %s: %s (err: %v)\n", svc.Name, out, err)
+			return fmt.Errorf("pre-deploy hook failed for %s: %w (output: %s)", svc.Name, err, out)
 		}
 	}
 
@@ -172,12 +186,26 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 		}
 	}
 
-	// 10. Post-deploy hook
+	// 10. Post-deploy hook (executed on the host)
 	if svc.Hooks.PostDeploy != "" {
-		hookPath := filepath.Join(configDir, svc.Hooks.PostDeploy)
-		log.Printf("    Running post-deploy hook: %s\n", hookPath)
-		if _, err := d.exec.Run(ctx, hookPath); err != nil {
-			return fmt.Errorf("post-deploy hook failed: %w", err)
+		log.Printf("    Running post-deploy hook for %s...\n", svc.Name)
+		var scriptContent string
+		svcScriptPath := filepath.Join(configDir, "services", svc.Name, svc.Hooks.PostDeploy)
+		scriptPath := filepath.Join(configDir, svc.Hooks.PostDeploy)
+
+		if data, err := os.ReadFile(svcScriptPath); err == nil {
+			scriptContent = string(data)
+		} else if data, err := os.ReadFile(scriptPath); err == nil {
+			scriptContent = string(data)
+		} else {
+			scriptContent = svc.Hooks.PostDeploy
+		}
+
+		b64 := base64.StdEncoding.EncodeToString([]byte(scriptContent))
+		out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | bash", b64))
+		if err != nil {
+			log.Printf("    Post-deploy hook failed for %s: %s (err: %v)\n", svc.Name, out, err)
+			return fmt.Errorf("post-deploy hook failed for %s: %w (output: %s)", svc.Name, err, out)
 		}
 	}
 
