@@ -17,3 +17,8 @@ Thumbs.db
 /tmp/
 
 bin/
+
+# Release binaries — built by .github/workflows/release.yml, never committed
+native-ops_v*
+/native-ops
+dist/
