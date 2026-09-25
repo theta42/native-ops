@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -169,7 +170,8 @@ func getSSHCredentials() ([]byte, string) {
 }
 
 func waitForSSH(ctx context.Context, host string, port int, timeout time.Duration) error {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	// JoinHostPort brackets IPv6 literals correctly (host:port breaks on "::1").
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {

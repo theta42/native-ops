@@ -10,12 +10,86 @@ import (
 
 // FleetConfig defines global fleet configuration.
 type FleetConfig struct {
-	Name        string            `yaml:"name"`
-	Domain      string            `yaml:"domain"`
-	DNSProvider string            `yaml:"dns_provider"` // "digitalocean", "proxmox", or custom plugin
-	Network     NetworkConfig     `yaml:"network"`
-	Providers   ProvidersConfig   `yaml:"providers"`
+	Name        string                `yaml:"name"`
+	Domain      string                `yaml:"domain"`
+	DNSProvider string                `yaml:"dns_provider"` // "digitalocean", "proxmox", or custom plugin
+	Network     NetworkConfig         `yaml:"network"`
+	Providers   ProvidersConfig       `yaml:"providers"`
 	Hosts       map[string]HostConfig `yaml:"hosts"`
+	Backup      *BackupConfig         `yaml:"backup,omitempty"`
+}
+
+// BackupConfig configures off-host volume backups to any S3-compatible
+// object store (DigitalOcean Spaces, MinIO, AWS S3, ...). Credentials are
+// never stored here: only the names of the environment variables that hold
+// the access key and secret.
+type BackupConfig struct {
+	// Provider is informational; "s3" (default) and "spaces" are both
+	// generic S3-compatible stores.
+	Provider string `yaml:"provider,omitempty"`
+	// Endpoint is the S3 endpoint, e.g. https://nyc3.digitaloceanspaces.com.
+	Endpoint string `yaml:"endpoint"`
+	Region   string `yaml:"region"`
+	Bucket   string `yaml:"bucket"`
+	// Prefix is prepended to every object key (e.g. "incus/").
+	Prefix string `yaml:"prefix,omitempty"`
+	// PathStyle selects path-style addressing (bucket in the path). Defaults
+	// to true, which is what most S3-compatible providers (incl. Spaces) use.
+	PathStyle *bool `yaml:"path_style,omitempty"`
+	// AccessKeyEnv / SecretKeyEnv name the environment variables holding the
+	// S3 credentials. Default: BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY.
+	AccessKeyEnv string `yaml:"access_key_env,omitempty"`
+	SecretKeyEnv string `yaml:"secret_key_env,omitempty"`
+	// Volumes is an allowlist for `backup all`. Empty means every custom volume.
+	Volumes []string `yaml:"volumes,omitempty"`
+	// Retention. Zero means "keep everything".
+	RetainDaily   int `yaml:"retain_daily,omitempty"`
+	RetainMonthly int `yaml:"retain_monthly,omitempty"`
+	// KeepLocalSnapshots keeps the transient pre-backup snapshot on the host
+	// after a successful upload (default false).
+	KeepLocalSnapshots bool `yaml:"keep_local_snapshots,omitempty"`
+}
+
+// ApplyDefaults fills in optional backup settings.
+func (b *BackupConfig) ApplyDefaults() {
+	if b.Provider == "" {
+		b.Provider = "s3"
+	}
+	if b.AccessKeyEnv == "" {
+		b.AccessKeyEnv = "BACKUP_S3_ACCESS_KEY"
+	}
+	if b.SecretKeyEnv == "" {
+		b.SecretKeyEnv = "BACKUP_S3_SECRET_KEY"
+	}
+}
+
+// S3PathStyle reports the effective addressing style (default path-style).
+func (b *BackupConfig) S3PathStyle() bool { return b.PathStyle == nil || *b.PathStyle }
+
+// Credentials resolves the S3 key pair from the configured environment
+// variables. Secrets are read from the environment only, never from git.
+func (b *BackupConfig) Credentials() (access, secret string, err error) {
+	b.ApplyDefaults()
+	access = os.Getenv(b.AccessKeyEnv)
+	secret = os.Getenv(b.SecretKeyEnv)
+	if access == "" || secret == "" {
+		return "", "", fmt.Errorf("missing S3 credentials: set %s and %s", b.AccessKeyEnv, b.SecretKeyEnv)
+	}
+	return access, secret, nil
+}
+
+// ValidateForBackup checks the fields required to talk to the object store.
+func (b *BackupConfig) ValidateForBackup() error {
+	if b.Endpoint == "" {
+		return fmt.Errorf("backup.endpoint is required")
+	}
+	if b.Bucket == "" {
+		return fmt.Errorf("backup.bucket is required")
+	}
+	if b.Region == "" {
+		return fmt.Errorf("backup.region is required")
+	}
+	return nil
 }
 
 type NetworkConfig struct {
@@ -140,6 +214,9 @@ func LoadFleetConfig(dir string) (*FleetConfig, error) {
 	}
 	if cfg.Network.IPv4CIDR == "" {
 		cfg.Network.IPv4CIDR = "10.0.100.0/24"
+	}
+	if cfg.Backup != nil {
+		cfg.Backup.ApplyDefaults()
 	}
 
 	return &cfg, nil

@@ -203,6 +203,50 @@ routing_pattern: "{slug}.example.com"
 
 ---
 
+## Backup & Restore (S3-compatible)
+
+Custom storage volumes can be backed up off-host to any S3-compatible object
+store (DigitalOcean Spaces, MinIO, AWS S3, ...). A backup snapshots the volume,
+exports it to a compressed artifact, uploads it with a SHA-256 manifest, and
+records a `latest.json` pointer for easy restores. Credentials live only in the
+environment — never in git.
+
+### `fleet.yml`
+```yaml
+backup:
+  provider: s3                         # generic S3-compatible (Spaces, MinIO, AWS)
+  endpoint: https://nyc3.digitaloceanspaces.com
+  region: nyc3
+  bucket: my-fleet-backups
+  prefix: incus/                       # optional key prefix
+  path_style: true                     # default; required for Spaces/MinIO
+  access_key_env: BACKUP_S3_ACCESS_KEY # default
+  secret_key_env: BACKUP_S3_SECRET_KEY # default
+  volumes: [gitea-data, rest-sicily-data]  # optional allowlist for `backup all`
+  retain_daily: 30                     # keep newest N objects
+  retain_monthly: 12                   # + newest object in each of the last N months
+```
+
+### Commands
+```bash
+export BACKUP_S3_ACCESS_KEY=... BACKUP_S3_SECRET_KEY=...
+
+native-ops backup all                  # every allowlisted (or all) custom volume
+native-ops backup create gitea-data    # one volume
+native-ops backup list gitea-data      # stored objects + latest manifest
+native-ops backup restore rest-sicily-data --as sicily-drill   # non-destructive
+native-ops backup restore rest-sicily-data --force             # in place (stops dependents)
+native-ops backup prune gitea-data     # apply retention
+```
+
+Restores are safe by default: the artifact's SHA-256 is verified before import,
+a pre-restore snapshot is always taken, and an in-place restore refuses to touch
+a volume that is mounted by a running container unless `--force` is given (which
+stops and restarts those containers). Use `--as <name>` to import under a new
+volume name without touching anything live.
+
+---
+
 ## License
 
 MIT License. Copyright (c) 2026 theta42.
