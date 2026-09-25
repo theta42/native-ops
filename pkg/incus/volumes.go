@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// ownerRE validates a unix user/group name for chown (also used as a group).
+var ownerRE = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
 // CreateVolumeSnapshot creates a named snapshot of a custom volume.
 func (c *Client) CreateVolumeSnapshot(ctx context.Context, pool, volume, snapshot string) error {
@@ -123,6 +127,19 @@ func (c *Client) VolumeDependents(ctx context.Context, volume string) ([]string,
 		}
 	}
 	return names, nil
+}
+
+// ChownPath recursively changes ownership of a path inside a container.
+// Used after attaching a fresh volume so the service user can write to it.
+func (c *Client) ChownPath(ctx context.Context, containerName, path, owner string) error {
+	if !ownerRE.MatchString(owner) {
+		return fmt.Errorf("invalid owner %q", owner)
+	}
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- chown -R %s:%s %s", containerName, owner, owner, path))
+	if err != nil {
+		return fmt.Errorf("chown %s %s in %s: %w", owner, path, containerName, err)
+	}
+	return nil
 }
 
 // StopContainer stops an instance, ignoring an already-stopped state.

@@ -78,6 +78,14 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		}
 	}
 
+	// 4b. Make the mounted data volume writable by the service user — the
+	// volume shadows the data dir the image pre-created for that user.
+	if p.Template.Service != "" {
+		for _, vol := range p.Template.Volumes {
+			_ = m.incus.ChownPath(ctx, p.Name, vol.Path, p.Template.Service)
+		}
+	}
+
 	// 5. Build and write env
 	env := make(map[string]string)
 	for k, v := range p.Template.EnvTemplate {
