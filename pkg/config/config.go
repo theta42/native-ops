@@ -94,7 +94,7 @@ func (b *BackupConfig) ValidateForBackup() error {
 
 type NetworkConfig struct {
 	BridgeName string `yaml:"bridge_name"` // default: incusbr0
-	IPv4CIDR   string `yaml:"ipv4_cidr"`    // default: 10.0.100.0/24
+	IPv4CIDR   string `yaml:"ipv4_cidr"`   // default: 10.0.100.0/24
 }
 
 type ProvidersConfig struct {
@@ -103,31 +103,31 @@ type ProvidersConfig struct {
 }
 
 type DOConfig struct {
-	Region    string `yaml:"region"`
+	Region      string `yaml:"region"`
 	DefaultSize string `yaml:"default_size"` // e.g. "s-4vcpu-8gb"
 }
 
 type ProxmoxConfig struct {
-	Endpoint   string `yaml:"endpoint"`
-	Node       string `yaml:"node"`
+	Endpoint    string `yaml:"endpoint"`
+	Node        string `yaml:"node"`
 	DefaultPool string `yaml:"default_pool"`
 }
 
 type HostConfig struct {
-	Provider   string `yaml:"provider"` // "digitalocean", "proxmox", "static"
-	Address    string `yaml:"address"`
-	SSHUser    string `yaml:"ssh_user"`
-	SSHPort    int    `yaml:"ssh_port"`
+	Provider    string `yaml:"provider"` // "digitalocean", "proxmox", "static"
+	Address     string `yaml:"address"`
+	SSHUser     string `yaml:"ssh_user"`
+	SSHPort     int    `yaml:"ssh_port"`
 	IncusRemote string `yaml:"incus_remote"` // optional Incus remote name
 }
 
 // VolumeMount represents a storage volume attachment.
 type VolumeMount struct {
-	Name      string `yaml:"name"`
-	Path      string `yaml:"path"`
-	Pool      string `yaml:"pool,omitempty"`
-	Shifted   bool   `yaml:"shifted"`   // default: true (security.shifted=true)
-	ReadOnly  bool   `yaml:"read_only"`
+	Name     string `yaml:"name"`
+	Path     string `yaml:"path"`
+	Pool     string `yaml:"pool,omitempty"`
+	Shifted  bool   `yaml:"shifted"` // default: true (security.shifted=true)
+	ReadOnly bool   `yaml:"read_only"`
 }
 
 // HealthCheckConfig defines how to verify a container after launch.
@@ -140,18 +140,18 @@ type HealthCheckConfig struct {
 
 // RoutingConfig defines Caddy edge routing rules.
 type RoutingConfig struct {
-	Domain       string   `yaml:"domain"`       // e.g. "git.example.com" or "*.example.com"
-	UpstreamPort int      `yaml:"upstream_port"`// e.g. 3000
-	TLS          string   `yaml:"tls,omitempty"`// e.g. "dns digitalocean" or "internal"
+	Domain          string   `yaml:"domain"`        // e.g. "git.example.com" or "*.example.com"
+	UpstreamPort    int      `yaml:"upstream_port"` // e.g. 3000
+	TLS             string   `yaml:"tls,omitempty"` // e.g. "dns digitalocean" or "internal"
 	ExtraDirectives []string `yaml:"extra_directives,omitempty"`
 }
 
 // ServiceConfig defines a static infrastructure service (e.g. gitea, plane, edge).
 type ServiceConfig struct {
 	Name        string            `yaml:"name"`
-	Image       string            `yaml:"image"` // local alias or OCI image
+	Image       string            `yaml:"image"`               // local alias or OCI image
 	BuildDir    string            `yaml:"build_dir,omitempty"` // path relative to config repo
-	Profiles    []string          `yaml:"profiles"` // e.g. ["base", "service"]
+	Profiles    []string          `yaml:"profiles"`            // e.g. ["base", "service"]
 	Volumes     []VolumeMount     `yaml:"volumes"`
 	Env         map[string]string `yaml:"env,omitempty"`
 	EnvFile     string            `yaml:"env_file,omitempty"`
@@ -170,7 +170,8 @@ type ServiceHooks struct {
 // TemplateConfig defines a blueprint for dynamic tenant workloads (e.g. platform instances).
 type TemplateConfig struct {
 	Name           string            `yaml:"name"`
-	Image          string            `yaml:"image"` // base image alias
+	Image          string            `yaml:"image"`             // base image alias
+	Service        string            `yaml:"service,omitempty"` // service/unit + /etc/default/<service> name
 	Profiles       []string          `yaml:"profiles"`
 	Volumes        []VolumeMount     `yaml:"volumes"`
 	DefaultLimits  map[string]string `yaml:"default_limits,omitempty"`
@@ -182,18 +183,18 @@ type TemplateConfig struct {
 
 // HostSpec defines the parameters to create or resize a host VM / Droplet.
 type HostSpec struct {
-	Name        string            `yaml:"name"`
-	Provider    string            `yaml:"provider"`
-	Region      string            `yaml:"region,omitempty"`
-	Size        string            `yaml:"size,omitempty"` // DO size or CPU/RAM
-	Cores       int               `yaml:"cores,omitempty"`
-	MemoryMB    int               `yaml:"memory_mb,omitempty"`
-	DiskGB      int               `yaml:"disk_gb,omitempty"`
-	Image       string            `yaml:"image,omitempty"` // e.g. "debian-13-x64" or PVE template
-	SSHKeyNames []string          `yaml:"ssh_keys,omitempty"`
-	UserData    string            `yaml:"user_data,omitempty"`
-	Tags        []string          `yaml:"tags,omitempty"`
-	FloatingIP  bool              `yaml:"floating_ip,omitempty"`
+	Name        string   `yaml:"name"`
+	Provider    string   `yaml:"provider"`
+	Region      string   `yaml:"region,omitempty"`
+	Size        string   `yaml:"size,omitempty"` // DO size or CPU/RAM
+	Cores       int      `yaml:"cores,omitempty"`
+	MemoryMB    int      `yaml:"memory_mb,omitempty"`
+	DiskGB      int      `yaml:"disk_gb,omitempty"`
+	Image       string   `yaml:"image,omitempty"` // e.g. "debian-13-x64" or PVE template
+	SSHKeyNames []string `yaml:"ssh_keys,omitempty"`
+	UserData    string   `yaml:"user_data,omitempty"`
+	Tags        []string `yaml:"tags,omitempty"`
+	FloatingIP  bool     `yaml:"floating_ip,omitempty"`
 }
 
 // LoadFleetConfig reads fleet.yml from a directory.

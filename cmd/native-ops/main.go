@@ -52,6 +52,12 @@ func main() {
 	case "backup":
 		handleBackupCommand(ctx, os.Args[2:])
 
+	case "image":
+		handleImageCommand(ctx, os.Args[2:])
+
+	case "preview":
+		handlePreviewCommand(ctx, os.Args[2:])
+
 	case "dns":
 		handleDNSCommand(ctx, os.Args[2:])
 
@@ -88,6 +94,11 @@ Core Commands:
   backup list      List stored backups for a volume
   backup restore   Restore a volume from a stored backup
   backup prune     Apply retention to a volume's stored backups
+  image build      Build + publish an app image from a git ref (conf recipe)
+  preview launch   Deploy an ephemeral preview from a template + ref
+  preview list     List active previews (with TTL)
+  preview destroy  Tear down a preview (container + volume + route)
+  preview gc       Destroy expired previews
   dns sync         Sync DNS records using configured provider or python plugin
   version          Print version information`)
 }
@@ -510,6 +521,94 @@ func handleBackupCommand(ctx context.Context, args []string) {
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown backup action: %s\n", action)
+		os.Exit(1)
+	}
+}
+
+func handleImageCommand(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: native-ops image build <app> <ref> --config-dir <dir>")
+		os.Exit(1)
+	}
+	action := args[0]
+	flags := flag.NewFlagSet("image "+action, flag.ExitOnError)
+	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	_ = flags.Parse(args[1:])
+	if action != "build" {
+		fmt.Fprintf(os.Stderr, "Unknown image action: %s\n", action)
+		os.Exit(1)
+	}
+	if flags.NArg() < 2 {
+		log.Fatal("Error: image build requires <app> and <ref>")
+	}
+	exec := remote.NewLocalExecutor()
+	if err := engine.BuildImage(ctx, exec, *configDir, flags.Arg(0), flags.Arg(1)); err != nil {
+		log.Fatalf("Image build failed: %v", err)
+	}
+	fmt.Printf("Built image %s@%s\n", flags.Arg(0), flags.Arg(1))
+}
+
+func handlePreviewCommand(ctx context.Context, args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: native-ops preview [launch <app> <ref>|list|destroy <name>|gc]")
+		os.Exit(1)
+	}
+	action := args[0]
+	flags := flag.NewFlagSet("preview "+action, flag.ExitOnError)
+	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	ttl := flags.Duration("ttl", 72*time.Hour, "Preview lifetime")
+	_ = flags.Parse(args[1:])
+
+	exec := remote.NewLocalExecutor()
+	mgr := engine.NewPreviewManager(exec)
+
+	switch action {
+	case "launch", "create":
+		if flags.NArg() < 2 {
+			log.Fatal("Error: preview launch requires <app> and <ref>")
+		}
+		ip, name, err := mgr.Launch(ctx, engine.PreviewParams{
+			ConfigDir: *configDir, App: flags.Arg(0), Ref: flags.Arg(1), TTL: *ttl,
+		})
+		if err != nil {
+			log.Fatalf("Preview launch failed: %v", err)
+		}
+		fmt.Printf("Preview %s live at %s (ttl %s)\n", name, ip, ttl.String())
+
+	case "list":
+		list, err := mgr.List(ctx)
+		if err != nil {
+			log.Fatalf("Preview list failed: %v", err)
+		}
+		for _, p := range list {
+			exp := "-"
+			if !p.Expires.IsZero() {
+				exp = p.Expires.UTC().Format(time.RFC3339)
+			}
+			fmt.Printf("  %-40s app=%-10s ref=%-20s expires=%s running=%v\n", p.Name, p.App, p.Ref, exp, p.Running)
+		}
+
+	case "destroy":
+		if flags.NArg() < 1 {
+			log.Fatal("Error: preview destroy requires <name>")
+		}
+		if err := mgr.Destroy(ctx, flags.Arg(0)); err != nil {
+			log.Fatalf("Preview destroy failed: %v", err)
+		}
+		fmt.Printf("Destroyed preview %s\n", flags.Arg(0))
+
+	case "gc":
+		deleted, err := mgr.Gc(ctx, time.Now().UTC())
+		if err != nil {
+			log.Fatalf("Preview gc failed: %v", err)
+		}
+		for _, n := range deleted {
+			fmt.Printf("  removed %s\n", n)
+		}
+		fmt.Printf("Removed %d expired preview(s).\n", len(deleted))
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown preview action: %s\n", action)
 		os.Exit(1)
 	}
 }

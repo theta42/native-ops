@@ -30,10 +30,10 @@ func NewInstanceManager(exec remote.Executor) *InstanceManager {
 
 type LaunchParams struct {
 	Template     *config.TemplateConfig
-	Name         string            // e.g. "rest-acme"
-	Slug         string            // e.g. "acme"
-	Domain       string            // e.g. "acme.example.com"
-	CustomDomain string            // optional custom domain
+	Name         string // e.g. "rest-acme"
+	Slug         string // e.g. "acme"
+	Domain       string // e.g. "acme.example.com"
+	CustomDomain string // optional custom domain
 	Env          map[string]string
 	Limits       map[string]string
 }
@@ -87,7 +87,10 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		env[k] = v
 	}
 	if len(env) > 0 {
-		serviceName := strings.TrimPrefix(p.Name, "rest-")
+		serviceName := p.Template.Service
+		if serviceName == "" {
+			serviceName = strings.TrimPrefix(p.Name, "rest-")
+		}
 		if serviceName == "" {
 			serviceName = "platform"
 		}
