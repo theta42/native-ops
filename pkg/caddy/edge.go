@@ -41,13 +41,19 @@ func RenderSiteBlock(domain, upstreamIP string, upstreamPort int, tls string, ex
 	return sb.String()
 }
 
-// EnsureBaseCaddyfile ensures /etc/caddy/Caddyfile exists and imports /etc/caddy/sites/*.caddy
+// EnsureBaseCaddyfile seeds a minimal Caddyfile ONLY when the edge has none.
+// It must never overwrite an existing Caddyfile: the edge is shared and may be
+// hand-maintained (per-site blocks, wildcard TLS matchers, landing routes), and
+// clobbering it would take down every route and certificate behind it.
 func (e *EdgeManager) EnsureBaseCaddyfile(ctx context.Context) error {
+	if _, err := e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- test -f /etc/caddy/Caddyfile", e.edgeContainer)); err == nil {
+		return nil
+	}
 	baseConfig := "{\n    email wmantly@gmail.com\n    debug\n    log {\n        output file /var/log/caddy.log\n        level DEBUG\n    }\n}\n\nimport /etc/caddy/sites/*.caddy\n"
 	b64 := base64.StdEncoding.EncodeToString([]byte(baseConfig))
 	cmd := fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- sh -c 'mkdir -p /etc/caddy /etc/caddy/sites && cat > /etc/caddy/Caddyfile && chmod 644 /etc/caddy/Caddyfile'", b64, e.edgeContainer)
-	_, _ = e.exec.Run(ctx, cmd)
-	return nil
+	_, err := e.exec.Run(ctx, cmd)
+	return err
 }
 
 // PublishSite writes a .caddy file into /etc/caddy/sites/ and reloads Caddy.
@@ -77,19 +83,13 @@ func (e *EdgeManager) RemoveSite(ctx context.Context, siteName string) error {
 
 // Reload executes a graceful caddy reload or container restart inside the edge container.
 func (e *EdgeManager) Reload(ctx context.Context) error {
-	// 1. Ensure resolv.conf has valid nameservers and is world-readable
-	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\nnameserver 10.0.100.1\\n' > /etc/resolv.conf && chmod 644 /etc/resolv.conf\" || true", e.edgeContainer))
-
-	// 2. Try caddy reload
+	// Graceful reload only. Do NOT rewrite the edge's resolv.conf and do NOT
+	// restart the shared edge container: a failed reload leaves Caddy running
+	// on its previous (valid) config, while a restart/misconfigured network
+	// would drop every site behind the edge.
 	cmd := fmt.Sprintf("incus exec %s -- caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile", e.edgeContainer)
-	if _, err := e.exec.Run(ctx, cmd); err != nil {
-		// If reload fails, restart edge and re-apply networking + resolv.conf
-		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus restart %s", e.edgeContainer))
-		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", e.edgeContainer))
-		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip addr add 10.0.100.10/24 dev eth0 || true", e.edgeContainer))
-		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip route replace default via 10.0.100.1 || true", e.edgeContainer))
-		_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\nnameserver 10.0.100.1\\n' > /etc/resolv.conf && chmod 644 /etc/resolv.conf\" || true", e.edgeContainer))
+	if out, err := e.exec.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("caddy reload failed (edge left unchanged): %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
 }
-
