@@ -246,10 +246,16 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 
 // StopAndDeleteContainer gracefully stops and purges a container.
 func (c *Client) StopAndDeleteContainer(ctx context.Context, name string) error {
-	_, _ = c.exec.Run(ctx, fmt.Sprintf("incus stop %s --force || true", name))
-	_, err := c.exec.Run(ctx, fmt.Sprintf("incus delete %s --force || true", name))
-	if err != nil {
-		return fmt.Errorf("delete container %s: %w", name, err)
+	if !c.ContainerExists(ctx, name) {
+		return nil
+	}
+	// Best effort: `delete --force` stops a running container itself.
+	_, _ = c.exec.Run(ctx, fmt.Sprintf("incus stop %s --force", ShQuote(name)))
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus delete %s --force", ShQuote(name))); err != nil {
+		// A failed delete is only fine if the container is in fact gone.
+		if c.ContainerExists(ctx, name) {
+			return fmt.Errorf("delete container %s: %w", name, err)
+		}
 	}
 	return nil
 }

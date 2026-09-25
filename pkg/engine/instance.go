@@ -18,13 +18,17 @@ type InstanceManager struct {
 	incus *incus.Client
 	caddy *caddy.EdgeManager
 	exec  remote.Executor
+	// healthGate is a field so tests can stub the wait.
+	healthGate func(ctx context.Context, ip string, hc config.HealthCheckConfig) error
 }
 
 func NewInstanceManager(exec remote.Executor) *InstanceManager {
+	ic := incus.NewClient(exec)
 	return &InstanceManager{
-		incus: incus.NewClient(exec),
-		caddy: caddy.NewEdgeManager(exec, "edge"),
-		exec:  exec,
+		incus:      ic,
+		caddy:      caddy.NewEdgeManager(exec, "edge"),
+		exec:       exec,
+		healthGate: ic.HealthGate,
 	}
 }
 
@@ -135,38 +139,111 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 	return ip, nil
 }
 
-// Update replaces an existing instance's container with a new image while preserving volume data.
-func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef string, serviceName string) error {
+// UpdateOptions controls an immutable instance update.
+type UpdateOptions struct {
+	// Service names the systemd unit whose /etc/default/<Service> environment
+	// file is carried over to the replacement container. Default "platform".
+	Service string
+	// HealthCheck, when Path is set, gates the update: if the new container is
+	// not healthy the previous image is relaunched with the same configuration.
+	HealthCheck config.HealthCheckConfig
+	// SkipSnapshot opts out of the pre-update volume snapshot. By default a
+	// snapshot is required, and a failed snapshot aborts the update untouched.
+	SkipSnapshot bool
+}
+
+// Update replaces an instance's container with a new image. Only the image
+// changes: profiles, local config (limits, ...), devices (data volumes, ...)
+// and the service's environment file are read from the running container and
+// replayed onto the replacement. Every attached custom volume is snapshotted
+// first, and a failed snapshot aborts before anything is deleted. If the
+// replacement fails to start or to pass its health check, the previous image
+// is relaunched with the same configuration, so a bad release does not leave
+// the instance down. Errors are always returned (never swallowed), so a CI
+// job running this fails visibly.
+func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef string, opts UpdateOptions) error {
+	if !incus.ValidName(name) {
+		return fmt.Errorf("invalid instance name %q", name)
+	}
+	service := opts.Service
+	if service == "" {
+		service = "platform"
+	}
+	if !incus.ValidName(service) {
+		return fmt.Errorf("invalid service name %q", service)
+	}
 	log.Printf("==> [Instance] Immutable update for instance: %s\n", name)
 
-	// Snapshot volume first
-	volumeName := name + "-data"
-	snapName := fmt.Sprintf("pre-update-%s", time.Now().UTC().Format("20060102-150405"))
-	_ = m.incus.SnapshotVolume(ctx, "default", volumeName, snapName)
-
-	// Delete container
-	if err := m.incus.StopAndDeleteContainer(ctx, name); err != nil {
-		return fmt.Errorf("delete container for update: %w", err)
+	// 1. Resolve the target and read the running state. Nothing is changed yet.
+	target, err := m.incus.ResolveImage(ctx, newImageRef)
+	if err != nil {
+		return err
+	}
+	st, err := m.incus.CaptureInstanceState(ctx, name)
+	if err != nil {
+		return err
+	}
+	envPath := "/etc/default/" + service
+	env, hadEnv, err := m.incus.PullFile(ctx, name, envPath)
+	if err != nil {
+		return err
 	}
 
-	// Launch new container
-	profiles := []string{"base", "service"}
-	if err := m.incus.LaunchContainer(ctx, newImageRef, name, profiles, nil); err != nil {
-		return fmt.Errorf("launch updated container: %w", err)
+	// 2. Snapshot every attached custom volume; abort untouched on failure.
+	if !opts.SkipSnapshot {
+		snap := fmt.Sprintf("pre-update-%s", time.Now().UTC().Format("20060102-150405"))
+		for _, v := range st.Volumes() {
+			log.Printf("    Snapshotting volume %s/%s (%s)...\n", v.Pool, v.Name, snap)
+			if err := m.incus.SnapshotVolume(ctx, v.Pool, v.Name, snap); err != nil {
+				return fmt.Errorf("pre-update snapshot failed, nothing was changed: %w", err)
+			}
+		}
 	}
 
-	// Reattach volume
-	if err := m.incus.AttachVolume(ctx, name, "default", volumeName, "/app/.data", true); err != nil {
-		return fmt.Errorf("reattach volume %s: %w", volumeName, err)
+	replace := func(image string) error {
+		if err := m.incus.StopAndDeleteContainer(ctx, name); err != nil {
+			return err
+		}
+		if err := m.incus.LaunchContainer(ctx, image, name, st.Profiles, st.Config); err != nil {
+			return err
+		}
+		for _, dn := range st.DeviceNames() {
+			if err := m.incus.SetDevice(ctx, name, dn, st.Devices[dn]); err != nil {
+				return err
+			}
+		}
+		if hadEnv {
+			if err := m.incus.PushFile(ctx, name, envPath, env, "0600"); err != nil {
+				return err
+			}
+		}
+		if err := m.incus.RestartService(ctx, name, service); err != nil {
+			return err
+		}
+		if opts.HealthCheck.Path == "" {
+			return nil
+		}
+		ip, err := m.incus.ContainerIPv4(ctx, name, 30*time.Second)
+		if err != nil {
+			return err
+		}
+		return m.healthGate(ctx, ip, opts.HealthCheck)
 	}
 
-	// Restart
-	if serviceName == "" {
-		serviceName = "platform"
+	// 3. Replace, and roll back to the previous image if the new one is not healthy.
+	updateErr := replace(target)
+	if updateErr == nil {
+		log.Printf("==> [Instance] Updated %s to %s\n", name, newImageRef)
+		return nil
 	}
-	_ = m.incus.RestartService(ctx, name, serviceName)
-
-	return nil
+	if st.BaseImage == "" {
+		return fmt.Errorf("update failed and the previous image is unknown, so no automatic rollback was possible (volume snapshots are named pre-update-*): %w", updateErr)
+	}
+	log.Printf("    Update failed (%v); rolling back to the previous image %s...\n", updateErr, st.BaseImage)
+	if rbErr := replace(st.BaseImage); rbErr != nil {
+		return fmt.Errorf("update failed: %v; rollback ALSO failed (volume snapshots are named pre-update-*): %w", updateErr, rbErr)
+	}
+	return fmt.Errorf("update to %s failed and %s was rolled back to its previous image: %w", newImageRef, name, updateErr)
 }
 
 // Resize applies live CPU/memory cgroup updates without container downtime.

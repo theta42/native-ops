@@ -282,15 +282,26 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 
 	case "update":
 		name := flags.String("name", "", "Instance container name")
-		image := flags.String("image", "", "New image ref or fingerprint")
-		service := flags.String("service", "platform", "Service name inside container")
+		image := flags.String("image", "", "New image alias or fingerprint (e.g. my-app:v2)")
+		service := flags.String("service", "platform", "systemd unit whose /etc/default/<service> env file is carried over")
+		healthPath := flags.String("health-path", "", "HTTP path to gate the update on (enables automatic rollback)")
+		healthPort := flags.Int("health-port", 0, "Port for --health-path")
+		healthTimeout := flags.Int("health-timeout", 60, "Seconds to wait for the health check")
+		noSnapshot := flags.Bool("no-snapshot", false, "Skip the pre-update volume snapshot (not recommended)")
 		_ = flags.Parse(args[1:])
 
 		if *name == "" || *image == "" {
 			log.Fatal("Error: --name and --image are required")
 		}
+		if *healthPath != "" && *healthPort <= 0 {
+			log.Fatal("Error: --health-port is required with --health-path")
+		}
 
-		if err := mgr.Update(ctx, *name, *image, *service); err != nil {
+		opts := engine.UpdateOptions{Service: *service, SkipSnapshot: *noSnapshot}
+		if *healthPath != "" {
+			opts.HealthCheck = config.HealthCheckConfig{Path: *healthPath, Port: *healthPort, Timeout: *healthTimeout}
+		}
+		if err := mgr.Update(ctx, *name, *image, opts); err != nil {
 			log.Fatalf("Update failed: %v", err)
 		}
 		fmt.Printf("Instance %s updated to %s\n", *name, *image)

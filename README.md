@@ -123,7 +123,27 @@ native-ops instance launch \
   --domain bistro.example.com
 ```
 
-#### 5. Cross-Host Workload Migration
+#### 5. Immutable Instance Update (safe for CI)
+```bash
+native-ops instance update \
+  --name rest-bistro \
+  --image "app-platform:v1.4.0" \
+  --service platform \
+  --health-path /health --health-port 8787
+```
+Only the image changes. Before anything is deleted, `native-ops` reads the running
+container's profiles, local config (`limits.*`, ...), devices (data volumes) and
+`/etc/default/<service>` environment file, then snapshots every attached custom
+volume — **a failed snapshot aborts the update with nothing changed** (`--no-snapshot`
+is an explicit opt-out). The replacement is launched from the new image, gets the same
+configuration and the env file back byte-for-byte, and — when `--health-path` is given —
+must pass its health check. If it does not, the previous image is relaunched with the
+same configuration and the command exits non-zero, so a bad release fails the CI job
+visibly instead of leaving the instance down. Image aliases (`app:v1.4.0`) are resolved
+to a fingerprint; an alias that isn't present locally is an error rather than being
+pulled from a public registry.
+
+#### 6. Cross-Host Workload Migration
 ```bash
 native-ops instance migrate \
   --source node-01 \
