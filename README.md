@@ -247,6 +247,15 @@ volume name without touching anything live.
 
 ---
 
+## Repository & git best practices
+
+How to lay out repositories and protect them (branch protection, tag
+protection, secret scoping, runner scoping, and the staging→production lane
+model) so production is reachable only through review is documented in
+[docs/git-organization.md](docs/git-organization.md).
+
+---
+
 ## License
 
 MIT License. Copyright (c) 2026 theta42.
