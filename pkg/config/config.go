@@ -167,11 +167,25 @@ type ServiceHooks struct {
 	PostDeploy    string `yaml:"post_deploy,omitempty"`
 }
 
+// PreviewConfig declares how an app can be run as an ephemeral preview.
+// {app} and {ref} are substituted (sanitized) from the launch arguments.
+type PreviewConfig struct {
+	Enabled      bool              `yaml:"enabled"`
+	Image        string            `yaml:"image,omitempty"`   // e.g. "opsavor-platform:{ref}"
+	Routing      string            `yaml:"routing,omitempty"` // e.g. "{app}-{ref}.preview.example.com"
+	TTL          string            `yaml:"ttl,omitempty"`     // duration, e.g. "72h"
+	Data         string            `yaml:"data,omitempty"`    // ephemeral | seed (informational)
+	Limits       map[string]string `yaml:"limits,omitempty"`
+	Env          map[string]string `yaml:"env,omitempty"`
+	MaxInstances int               `yaml:"max_instances,omitempty"`
+}
+
 // TemplateConfig defines a blueprint for dynamic tenant workloads (e.g. platform instances).
 type TemplateConfig struct {
 	Name           string            `yaml:"name"`
 	Image          string            `yaml:"image"`             // base image alias
 	Service        string            `yaml:"service,omitempty"` // service/unit + /etc/default/<service> name
+	Preview        *PreviewConfig    `yaml:"preview,omitempty"`
 	Profiles       []string          `yaml:"profiles"`
 	Volumes        []VolumeMount     `yaml:"volumes"`
 	DefaultLimits  map[string]string `yaml:"default_limits,omitempty"`

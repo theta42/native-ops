@@ -47,13 +47,12 @@ func NewPreviewManager(exec remote.Executor) *PreviewManager {
 // defaultPreviewTTL is used when no TTL is given.
 const defaultPreviewTTL = 72 * time.Hour
 
-// PreviewName derives a deterministic, Incus-safe instance name from app+ref.
-// e.g. ("platform", "feat/savy") -> "preview-platform-feat-savy".
-func PreviewName(app, ref string) string {
-	raw := strings.ToLower("preview-" + app + "-" + ref)
+// slugify lowercases and reduces a string to [a-z0-9-], collapsing runs and
+// trimming dashes. Used for instance names, image tags and routing labels.
+func slugify(s string) string {
 	var b strings.Builder
 	dash := false
-	for _, r := range raw {
+	for _, r := range strings.ToLower(s) {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
@@ -65,7 +64,13 @@ func PreviewName(app, ref string) string {
 			}
 		}
 	}
-	s := strings.Trim(b.String(), "-")
+	return strings.Trim(b.String(), "-")
+}
+
+// PreviewName derives a deterministic, Incus-safe instance name from app+ref.
+// e.g. ("platform", "feat/savy") -> "preview-platform-feat-savy".
+func PreviewName(app, ref string) string {
+	s := slugify("preview-" + app + "-" + ref)
 	if len(s) > 40 {
 		s = strings.Trim(s[:40], "-")
 	}
@@ -81,25 +86,66 @@ func (m *PreviewManager) Launch(ctx context.Context, p PreviewParams) (ip, name 
 		return "", "", fmt.Errorf("preview requires an app and a ref")
 	}
 	tmplPath := filepath.Join(p.ConfigDir, "templates", p.App, "template.yml")
-	tmpl, err := config.LoadTemplateConfig(tmplPath)
+	src, err := config.LoadTemplateConfig(tmplPath)
 	if err != nil {
 		return "", "", fmt.Errorf("load template %s: %w", p.App, err)
 	}
+	if src.Preview != nil && !src.Preview.Enabled {
+		return "", "", fmt.Errorf("previews are disabled for %s", p.App)
+	}
+
 	name = PreviewName(p.App, p.Ref)
 	if m.incus.ContainerExists(ctx, name) {
-		return "", name, fmt.Errorf("preview %s already exists (update it, or destroy first)", name)
+		return "", name, fmt.Errorf("preview %s already exists (destroy it first)", name)
 	}
-	ip, err = m.instances.Launch(ctx, LaunchParams{
-		Template: tmpl,
-		Name:     name,
-		Slug:     name,
-		Env:      p.Env,
-		Limits:   p.Limits,
-	})
+
+	// Apply the preview policy: a per-ref image and a routing domain, with
+	// {app}/{ref}/{slug} substituted.
+	tmpl := *src
+	repl := strings.NewReplacer("{app}", slugify(p.App), "{ref}", slugify(p.Ref), "{slug}", name)
+	if src.Preview != nil {
+		if src.Preview.Image != "" {
+			tmpl.Image = repl.Replace(src.Preview.Image)
+		}
+		if src.Preview.Routing != "" {
+			tmpl.RoutingPattern = repl.Replace(src.Preview.Routing)
+		}
+	}
+
+	env := map[string]string{}
+	for k, v := range src.EnvTemplate {
+		env[k] = repl.Replace(v)
+	}
+	limits := map[string]string{}
+	for k, v := range src.DefaultLimits {
+		limits[k] = v
+	}
+	if src.Preview != nil {
+		for k, v := range src.Preview.Env {
+			env[k] = v
+		}
+		for k, v := range src.Preview.Limits {
+			limits[k] = v
+		}
+	}
+	for k, v := range p.Env {
+		env[k] = v
+	}
+	for k, v := range p.Limits {
+		limits[k] = v
+	}
+
+	ip, err = m.instances.Launch(ctx, LaunchParams{Template: &tmpl, Name: name, Slug: name, Env: env, Limits: limits})
 	if err != nil {
 		return "", name, err
 	}
+
 	ttl := p.TTL
+	if ttl <= 0 && src.Preview != nil && src.Preview.TTL != "" {
+		if d, e := time.ParseDuration(src.Preview.TTL); e == nil {
+			ttl = d
+		}
+	}
 	if ttl <= 0 {
 		ttl = defaultPreviewTTL
 	}
