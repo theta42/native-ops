@@ -13,9 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +25,7 @@ import (
 	"github.com/theta42/native-ops/pkg/status"
 )
 
-//go:embed ui/index.html ui/app.js ui/style.css
+//go:embed ui
 var uiFS embed.FS
 
 // Options configures a Server.
@@ -138,8 +140,35 @@ func (s *Server) snapshot(ctx context.Context) (*status.Snapshot, error) {
 	return snap, nil
 }
 
-// uiFiles maps a request path to an embedded file. Only these are ever served.
-var uiFiles = map[string]string{"/": "ui/index.html", "/index.html": "ui/index.html", "/app.js": "ui/app.js", "/style.css": "ui/style.css"}
+// uiFiles maps a request path to an embedded file: "/" is the page and every
+// other file is served at its path under ui/ (/static/..., /static-modules/...).
+// It is built from what is actually embedded, so only those files are ever served.
+var uiFiles = func() map[string]string {
+	m := map[string]string{"/": "ui/index.html"}
+	err := fs.WalkDir(uiFS, "ui", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			m[strings.TrimPrefix(p, "ui")] = p
+		}
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	return m
+}()
+
+// uiTypes is explicit because the host's mime database may be missing or lack woff2,
+// and the daemon sends nosniff.
+var uiTypes = map[string]string{
+	".html":  "text/html; charset=utf-8",
+	".css":   "text/css; charset=utf-8",
+	".js":    "text/javascript; charset=utf-8",
+	".svg":   "image/svg+xml",
+	".woff2": "font/woff2",
+}
 
 var uiStarted = time.Now()
 
@@ -156,11 +185,14 @@ func (s *Server) uiHandler() http.Handler {
 			return
 		}
 		h := w.Header()
-		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cache-Control", "no-cache")
-		// ServeContent (unlike FileServer) never redirects and sets Content-Type from the name.
+		if ct, ok := uiTypes[path.Ext(name)]; ok {
+			h.Set("Content-Type", ct)
+		}
+		// ServeContent (unlike FileServer) never redirects.
 		http.ServeContent(w, r, name, uiStarted, bytes.NewReader(data))
 	})
 }
@@ -187,8 +219,8 @@ func (s *Server) Handler() http.Handler {
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)
 	mux.Handle("GET /index.html", ui)
-	mux.Handle("GET /app.js", ui)
-	mux.Handle("GET /style.css", ui)
+	mux.Handle("GET /static/", ui)
+	mux.Handle("GET /static-modules/", ui)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
 			// Known prefix, unknown route or method: still requires a token to find out which.
