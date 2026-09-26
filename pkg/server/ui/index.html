@@ -1,42 +1,64 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>native-ops</title>
-  <link rel="stylesheet" href="/style.css">
-</head>
-<body>
-  <header>
-    <h1>native-ops</h1>
-    <span id="host" class="muted"></span>
-    <span class="spacer"></span>
-    <span id="who" class="muted"></span>
-    <button id="signout" hidden>Sign out</button>
-  </header>
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+		<title>native-ops</title>
+		<!-- Same shell as the theta-suite apps (proxy, jump-host, sso-manager): a dark
+		     fixed navbar, Bootstrap cards, Font Awesome icons, a dark footer. The
+		     assets are vendored and served from this binary because the CSP allows
+		     'self' only: no CDN, no inline script, no inline style. -->
+		<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+		<link rel="stylesheet" href="/static-modules/bootstrap/css/bootstrap.min.css">
+		<link rel="stylesheet" href="/static-modules/fontawesome-free/css/fontawesome.min.css">
+		<link rel="stylesheet" href="/static-modules/fontawesome-free/css/solid.min.css">
+		<link rel="stylesheet" href="/static/css/styles.css">
+		<script src="/static-modules/bootstrap/js/bootstrap.bundle.min.js" defer></script>
+		<script src="/static/js/app.js" defer></script>
+	</head>
+	<body>
 
-  <main>
-    <section id="login" hidden>
-      <h2>Sign in</h2>
-      <p class="muted">Paste an API token. It is kept for this browser tab only.</p>
-      <form id="loginForm" autocomplete="off">
-        <input id="token" type="password" placeholder="nops_…" autocomplete="off" spellcheck="false" required>
-        <button type="submit">Sign in</button>
-      </form>
-      <p id="loginError" class="error"></p>
-    </section>
+		<nav class="navbar navbar-expand-md navbar-dark fixed-top bg-dark">
+			<a class="navbar-brand" href="#/"><img src="/static/favicon.svg" height="28" class="me-2" alt="">native-ops <i class="fa-solid fa-server"></i></a>
+			<button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+				<span class="navbar-toggler-icon"></span>
+			</button>
+			<div class="collapse navbar-collapse justify-content-end" id="navbarSupportedContent">
+				<ul class="navbar-nav top-nav" id="top-nav" hidden>
+					<li class="nav-item"><a class="nav-link" href="#/"><i class="fa-solid fa-gauge-high"></i> Overview</a></li>
+					<li class="nav-item"><a class="nav-link" href="#/instances"><i class="fa-solid fa-cubes"></i> Instances</a></li>
+					<li class="nav-item"><a class="nav-link" href="#/volumes"><i class="fa-solid fa-hard-drive"></i> Volumes</a></li>
+				</ul>
+				<div class="d-flex align-items-center mt-2 mt-md-0">
+					<span id="who" class="navbar-text text-light me-3" hidden><i class="fa-solid fa-user me-1"></i><span id="who-text"></span></span>
+					<button id="signout" type="button" class="btn btn-outline-danger my-2 my-sm-0" hidden><i class="fa-solid fa-right-from-bracket"></i> Log Out</button>
+				</div>
+			</div>
+		</nav>
 
-    <section id="app" hidden>
-      <div id="warnings"></div>
-      <h2>Instances <span id="instCount" class="muted"></span></h2>
-      <div class="scroll"><table id="instances"></table></div>
-      <h2>Volumes <span id="volCount" class="muted"></span></h2>
-      <div class="scroll"><table id="volumes"></table></div>
-      <h2>Images</h2>
-      <p id="images" class="muted"></p>
-      <p id="updated" class="muted"></p>
-    </section>
-  </main>
-  <script src="/app.js"></script>
-</body>
+		<div id="spa-shell" class="container-fluid">
+			<div id="view"></div>
+		</div><!-- end spa-shell -->
+
+		<footer class="py-2 bg-dark text-light mt-4">
+			<div class="container-fluid d-flex flex-wrap justify-content-between align-items-center small gap-2">
+				<span class="d-flex align-items-center gap-2">
+					<a href="https://theta42.com" target="_blank" rel="noopener noreferrer">
+						<img width="64" src="/static/img/theta42.svg" alt="theta42">
+					</a>
+					&copy; theta42 &middot;
+					<a href="https://github.com/theta42/native-ops/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" class="text-light">MIT License</a>
+				</span>
+				<span class="d-flex align-items-center gap-3">
+					<a href="https://github.com/theta42/native-ops/blob/main/docs/daemon.md" target="_blank" rel="noopener noreferrer" class="text-light text-decoration-none">
+						<i class="fa-solid fa-book"></i> Docs
+					</a>
+					<a href="https://github.com/theta42/native-ops" target="_blank" rel="noopener noreferrer" class="text-light text-decoration-none">
+						<i class="fa-solid fa-code-branch"></i> Source
+					</a>
+				</span>
+				<span id="version"></span>
+			</div>
+		</footer>
+	</body>
 </html>
