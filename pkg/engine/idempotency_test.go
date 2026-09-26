@@ -617,3 +617,109 @@ func TestDestroyIsRepeatable(t *testing.T) {
 		t.Fatal("the route should be gone")
 	}
 }
+
+// ---- route follows the container through `instance update` ----
+
+func siteOf(sim *hostSim, name string) string {
+	return sim.ctrs["edge"].files["/etc/caddy/sites/"+name+".caddy"]
+}
+
+// Found on a real host: replacing a container gives it a new DHCP address, and
+// `instance update` left the Caddy route pointing at the old one.
+func TestUpdateMovesTheRouteToTheReplacementsAddress(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["gitea:latest"] = fpA
+	d := newTestDeployer(sim)
+	ctx := context.Background()
+	svc := giteaSvc()
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	oldIP := sim.ctrs["gitea"].ip
+	if !strings.Contains(siteOf(sim, "gitea"), oldIP+":3000") {
+		t.Fatalf("precondition: route should point at %s: %s", oldIP, siteOf(sim, "gitea"))
+	}
+	reloads := sim.ctrs["edge"].reloads
+
+	opts := UpdateOptions{Service: "gitea", Force: true, HealthCheck: svc.HealthCheck}
+	if err := d.inst.Update(ctx, "gitea", "gitea:latest", opts); err != nil {
+		t.Fatal(err)
+	}
+	newIP := sim.ctrs["gitea"].ip
+	if newIP == oldIP {
+		t.Fatal("the simulator should have given the replacement a new address")
+	}
+	site := siteOf(sim, "gitea")
+	if !strings.Contains(site, "reverse_proxy "+newIP+":3000") || strings.Contains(site, oldIP) || !strings.HasPrefix(site, "git.example.com {") {
+		t.Fatalf("the route must follow the container and keep everything else:\n%s", site)
+	}
+	if sim.ctrs["edge"].reloads != reloads+1 {
+		t.Fatalf("exactly one reload expected, got %d", sim.ctrs["edge"].reloads-reloads)
+	}
+
+	// An update that finds nothing to do leaves the route alone.
+	sim.reset()
+	opts.Force = false
+	sim.aliases["gitea:latest"] = sim.ctrs["gitea"].config["volatile.base_image"]
+	if err := d.inst.Update(ctx, "gitea", "gitea:latest", opts); err != nil {
+		t.Fatal(err)
+	}
+	if m := sim.mutations(); len(m) != 0 {
+		t.Fatalf("a no-op update must not touch the route:\n%s", strings.Join(m, "\n"))
+	}
+}
+
+func TestUpdateRollbackAlsoMovesTheRouteToTheRestoredContainer(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["gitea:latest"] = fpA
+	sim.aliases["gitea:v2"] = fpB
+	d := newTestDeployer(sim)
+	ctx := context.Background()
+	svc := giteaSvc()
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	// The deploy above was launch #1 (the edge is pre-created); the update's new-image
+	// launch is #2 and is unhealthy, then the relaunch of the old image (#3) is fine.
+	d.inst.healthGate = func(context.Context, string, config.HealthCheckConfig) error {
+		if sim.count("incus launch") == 2 {
+			return errors.New("503")
+		}
+		return nil
+	}
+	err := d.inst.Update(ctx, "gitea", "gitea:v2", UpdateOptions{Service: "gitea", HealthCheck: svc.HealthCheck})
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("expected a rollback, got %v", err)
+	}
+	c := sim.ctrs["gitea"]
+	if c.config["volatile.base_image"] != fpA {
+		t.Fatalf("the old image must be running again: %v", c.config)
+	}
+	if !strings.Contains(siteOf(sim, "gitea"), "reverse_proxy "+c.ip+":3000") {
+		t.Fatalf("after a rollback the route must point at the restored container %s:\n%s", c.ip, siteOf(sim, "gitea"))
+	}
+}
+
+func TestUpdateOfAnInstanceWithoutARouteDoesNotTouchTheEdge(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["db:latest"] = fpA
+	d := newTestDeployer(sim)
+	ctx := context.Background()
+	svc := &config.ServiceConfig{Name: "db", Image: "db:latest", Limits: map[string]string{"limits.cpu": "1"}}
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	reloads := sim.ctrs["edge"].reloads
+	sim.reset()
+	if err := d.inst.Update(ctx, "db", "db:latest", UpdateOptions{Service: "db", Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if sim.ctrs["edge"].reloads != reloads {
+		t.Fatal("an instance without a published route must not cause a Caddy reload")
+	}
+	for _, c := range sim.cmds {
+		if strings.Contains(c, "incus file push") && strings.Contains(c, "'edge/") {
+			t.Fatalf("nothing may be written to the edge: %s", c)
+		}
+	}
+}

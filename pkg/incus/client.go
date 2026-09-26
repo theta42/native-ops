@@ -75,73 +75,24 @@ func (c *Client) ResolveImageFingerprint(ctx context.Context, alias string) (str
 	return "", fmt.Errorf("image alias not found: %s", alias)
 }
 
-// DeterministicIPForService returns a stable IP in the 10.0.100.0/24 subnet for a given service name.
-func DeterministicIPForService(name string) string {
-	switch name {
-	case "edge":
-		return "10.0.100.10"
-	default:
-		h := 0
-		for _, c := range name {
-			h = (h*31 + int(c)) % 200
-		}
-		return fmt.Sprintf("10.0.100.%d", 20+h)
-	}
-}
+// containerIPTimeout is how long GetContainerIP waits for a lease (a variable so tests can shorten it).
+var containerIPTimeout = 30 * time.Second
 
-// GetContainerIP extracts the eth0/incusbr0 IPv4 address from incus list JSON with retry polling.
+// GetContainerIP waits for the container to get a global IPv4 address from the
+// bridge's DHCP and returns it. It only reads: it used to also push a
+// hash-derived static address, a default route and a rewritten resolv.conf into
+// the container on every poll, which left containers with two addresses (so the
+// "current" one was arbitrary), collided across services (the hash was mod 200),
+// vanished on restart, and hardcoded the 10.0.100.0/24 subnet. A container that
+// cannot get a DHCP address has a host firewall or bridge problem, and the error
+// says so instead of papering over it. When several addresses exist the lowest is returned.
 func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error) {
-	targetIP := DeterministicIPForService(name)
-	deadline := time.Now().Add(30 * time.Second)
-	cmd := fmt.Sprintf("incus list %s --format json", name)
-
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-		}
-
-		// Configure static IP, default route, and DNS resolvers inside the container namespace directly
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", name))
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip addr add %s/24 dev eth0 || true", name, targetIP))
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip route replace default via 10.0.100.1 || true", name))
-		_, _ = c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- sh -c \"rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\nnameserver 10.0.100.1\\n' > /etc/resolv.conf && chmod 644 /etc/resolv.conf\" || true", name))
-
-		out, err := c.exec.Run(ctx, cmd)
-		if err == nil {
-			var instances []struct {
-				Name  string `json:"name"`
-				State *struct {
-					Network map[string]struct {
-						Addresses []struct {
-							Family  string `json:"family"`
-							Address string `json:"address"`
-							Scope   string `json:"scope"`
-						} `json:"addresses"`
-					} `json:"network"`
-				} `json:"state"`
-			}
-
-			if err := json.Unmarshal([]byte(out), &instances); err == nil && len(instances) > 0 && instances[0].State != nil {
-				for netName, netInfo := range instances[0].State.Network {
-					if netName == "lo" {
-						continue
-					}
-					for _, addr := range netInfo.Addresses {
-						if addr.Family == "inet" && addr.Scope == "global" && addr.Address != "" {
-							return addr.Address, nil
-						}
-					}
-				}
-			}
-		}
-
-		time.Sleep(1 * time.Second)
+	ip, err := c.ContainerIPv4(ctx, name, containerIPTimeout)
+	if err != nil {
+		info, _ := c.exec.Run(ctx, "incus info "+ShQuote(name))
+		return "", fmt.Errorf("%w: the container did not get an address from the bridge (is DHCP allowed on it in the host firewall?). Diagnostic:\n%s", err, info)
 	}
-
-	info, _ := c.exec.Run(ctx, fmt.Sprintf("incus info %s; incus list %s --format json", name, name))
-	return "", fmt.Errorf("no global IPv4 address assigned to container %s within 30s. Diagnostic:\n%s", name, info)
+	return ip, nil
 }
 
 // InstanceExists reports whether an instance exists on the default remote. An

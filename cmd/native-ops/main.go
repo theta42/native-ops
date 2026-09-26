@@ -167,11 +167,19 @@ func handleHostCommand(ctx context.Context, args []string) {
 			Region:   *region,
 		}
 
+		// Register the operator's SSH key first, so the host can be logged in to. A key
+		// generated on the fly is refused: it would be lost when this command exits.
+		_, pub, generated := engine.LoadSSHCredentials()
+		if err := hm.PrepareAccess(ctx, &spec, pub, generated, false); err != nil {
+			log.Fatalf("Host creation failed: %v", err)
+		}
+
 		host, err := hm.CreateHost(ctx, spec)
 		if err != nil {
 			log.Fatalf("Host creation failed: %v", err)
 		}
 		fmt.Printf("Created host %s (%s) at IP: %s\n", host.Name, host.ID, host.PublicIP)
+		fmt.Printf("Log in with the private key whose public half was registered: ssh root@%s\n", host.PublicIP)
 
 	case "destroy":
 		providerName := flags.String("provider", "digitalocean", "Provider (digitalocean, proxmox)")

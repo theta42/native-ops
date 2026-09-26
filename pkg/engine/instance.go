@@ -341,6 +341,9 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 	forward[incus.ImageKey] = newImageRef // the rollback keeps the old recorded reference
 	updateErr := replace(target, forward)
 	if updateErr == nil {
+		if err := m.repointRoute(ctx, name); err != nil {
+			return fmt.Errorf("%s was updated to %s, but its Caddy route could not be pointed at the new container: %w", name, newImageRef, err)
+		}
 		log.Printf("==> [Instance] Updated %s to %s\n", name, newImageRef)
 		return nil
 	}
@@ -351,7 +354,28 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 	if rbErr := replace(st.BaseImage, st.Config); rbErr != nil {
 		return fmt.Errorf("update failed: %v; rollback ALSO failed (volume snapshots are named pre-update-*): %w", updateErr, rbErr)
 	}
+	if err := m.repointRoute(ctx, name); err != nil {
+		return fmt.Errorf("update to %s failed and %s was rolled back to its previous image, but its Caddy route could not be pointed at the restored container (%v): %w", newImageRef, name, err, updateErr)
+	}
 	return fmt.Errorf("update to %s failed and %s was rolled back to its previous image: %w", newImageRef, name, updateErr)
+}
+
+// repointRoute makes an instance's published Caddy route (if it has one) follow
+// the instance to its new address. A replaced container gets a new DHCP lease.
+func (m *InstanceManager) repointRoute(ctx context.Context, name string) error {
+	changed, err := m.caddy.RepointUpstream(ctx, name, func(ctx context.Context) ([]string, error) {
+		if _, err := m.incus.ContainerIPv4(ctx, name, 45*time.Second); err != nil {
+			return nil, err
+		}
+		return m.incus.GlobalIPv4s(ctx, name)
+	})
+	if err != nil {
+		return err
+	}
+	if changed {
+		log.Printf("    Pointed the Caddy route of %s at its new address\n", name)
+	}
+	return nil
 }
 
 // Resize applies live CPU/memory cgroup updates without container downtime.

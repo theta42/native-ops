@@ -129,14 +129,21 @@ func (e *EdgeManager) PublishSite(ctx context.Context, siteName string, routing 
 	}
 
 	desired := RenderSiteBlock(routing.Domain, upstreamIP, routing.UpstreamPort, routing.TLS, routing.ExtraDirectives)
-	path := sitePathFor(siteName)
-	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, path)
+	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
 	if err != nil {
 		return err
 	}
 	if hadPrev && prev == desired {
 		return nil
 	}
+	return e.replaceSite(ctx, siteName, desired, prev, hadPrev)
+}
+
+// replaceSite writes a site file, validates the whole Caddy config, and reloads.
+// If Caddy rejects the config the previous file is restored (or the new one
+// removed), so one bad site can never take the edge down on its next restart.
+func (e *EdgeManager) replaceSite(ctx context.Context, siteName, desired, prev string, hadPrev bool) error {
+	path := sitePathFor(siteName)
 	if err := e.incus.PushFile(ctx, e.edgeContainer, path, desired, "0644"); err != nil {
 		return fmt.Errorf("write site config %s to %s: %w", path, e.edgeContainer, err)
 	}
@@ -149,6 +156,51 @@ func (e *EdgeManager) PublishSite(ctx context.Context, siteName string, routing 
 		return fmt.Errorf("caddy rejected the new config for %s; the previous one was restored: %w", siteName, err)
 	}
 	return e.Reload(ctx)
+}
+
+// RepointUpstream points an already-published site at the instance's current
+// address. Replacing a container gives it a new DHCP lease, so without this a
+// route keeps pointing at an address nobody has any more. Only the upstream
+// address is rewritten (domain, TLS and other directives stay as they are). It
+// does nothing, and never asks for the addresses, when the instance has no
+// published site; and does nothing when the published address is still one of
+// the instance's. changed reports whether the route was rewritten.
+func (e *EdgeManager) RepointUpstream(ctx context.Context, siteName string, addrs func(context.Context) ([]string, error)) (changed bool, err error) {
+	if !incus.ValidName(siteName) {
+		return false, fmt.Errorf("invalid site name %q", siteName)
+	}
+	cur, found, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	loc := upstreamRe.FindStringSubmatchIndex(cur)
+	if loc == nil {
+		return false, nil
+	}
+	published := cur[loc[2]:loc[3]]
+	candidates, err := addrs(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(candidates) == 0 {
+		return false, fmt.Errorf("no upstream address for %s", siteName)
+	}
+	for _, ip := range candidates {
+		if ip == published {
+			return false, nil
+		}
+	}
+	if net.ParseIP(candidates[0]) == nil {
+		return false, fmt.Errorf("invalid upstream address %q", candidates[0])
+	}
+	desired := cur[:loc[2]] + candidates[0] + cur[loc[3]:]
+	if err := e.replaceSite(ctx, siteName, desired, cur, true); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // PublishSiteFor is PublishSite for an upstream that may have several
@@ -201,7 +253,8 @@ func (e *EdgeManager) RemoveSite(ctx context.Context, siteName string) error {
 const resolvScript = `grep -qx 'nameserver 10.0.100.1' /etc/resolv.conf 2>/dev/null || { rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 10.0.100.1\n' > /etc/resolv.conf && chmod 644 /etc/resolv.conf; }`
 
 // Reload executes a graceful caddy reload. If that fails it restarts the edge
-// container, re-applies its networking and tries once more. A reload that
+// container and tries once more (the edge gets its address from the bridge's
+// DHCP like every other container; nothing pins one). A reload that
 // still fails is returned as an error: a route that is not live is not "published".
 func (e *EdgeManager) Reload(ctx context.Context) error {
 	c := incus.ShQuote(e.edgeContainer)
@@ -214,9 +267,6 @@ func (e *EdgeManager) Reload(ctx context.Context) error {
 		return nil
 	}
 	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus restart %s", c))
-	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip link set eth0 up || true", c))
-	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip addr add 10.0.100.10/24 dev eth0 || true", c))
-	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- ip route replace default via 10.0.100.1 || true", c))
 	_, _ = e.exec.Run(ctx, resolv)
 	if _, err := e.exec.Run(ctx, reload); err != nil {
 		return fmt.Errorf("caddy reload failed (%v) and failed again after restarting %s: %w", firstErr, e.edgeContainer, err)

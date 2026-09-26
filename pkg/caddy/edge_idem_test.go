@@ -268,3 +268,68 @@ func TestPublishSiteRejectsUnsafeInput(t *testing.T) {
 		})
 	}
 }
+
+func TestRepointUpstreamRewritesOnlyTheAddress(t *testing.T) {
+	sim := newEdgeSim()
+	m := NewEdgeManager(sim, "edge")
+	ctx := context.Background()
+	r := config.RoutingConfig{Domain: "git.example.com", UpstreamPort: 3000, TLS: "internal", ExtraDirectives: []string{"encode gzip"}}
+	if err := m.PublishSite(ctx, "gitea", r, "10.0.100.50"); err != nil {
+		t.Fatal(err)
+	}
+	reloads := sim.reloads
+
+	changed, err := m.RepointUpstream(ctx, "gitea", func(context.Context) ([]string, error) { return []string{"10.0.100.99"}, nil })
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	want := RenderSiteBlock("git.example.com", "10.0.100.99", 3000, "internal", []string{"encode gzip"})
+	if sim.files["/etc/caddy/sites/gitea.caddy"] != want {
+		t.Fatalf("only the address may change:\n%s", sim.files["/etc/caddy/sites/gitea.caddy"])
+	}
+	if sim.reloads != reloads+1 {
+		t.Fatalf("one reload expected, got %d", sim.reloads-reloads)
+	}
+	before := sim.mutations()
+	if changed, err := m.RepointUpstream(ctx, "gitea", func(context.Context) ([]string, error) { return []string{"10.0.100.99"}, nil }); err != nil || changed || sim.mutations() != before {
+		t.Fatalf("the second call must be a no-op: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestRepointUpstreamLeavesAValidAddressAloneAndSkipsInstancesWithoutARoute(t *testing.T) {
+	sim := newEdgeSim()
+	m := NewEdgeManager(sim, "edge")
+	ctx := context.Background()
+
+	asked := false
+	spy := func(context.Context) ([]string, error) { asked = true; return []string{"10.0.100.1"}, nil }
+	if changed, err := m.RepointUpstream(ctx, "nothing", spy); err != nil || changed || asked || sim.mutations() != 0 {
+		t.Fatalf("no site: nothing to do and no address lookup (changed=%v err=%v asked=%v)", changed, err, asked)
+	}
+
+	_ = m.PublishSite(ctx, "gitea", route, "10.0.100.50")
+	before := sim.mutations()
+	if changed, err := m.RepointUpstream(ctx, "gitea", func(context.Context) ([]string, error) { return []string{"10.0.100.21", "10.0.100.50"}, nil }); err != nil || changed || sim.mutations() != before {
+		t.Fatalf("the published address is still one of the container's: leave it (changed=%v err=%v)", changed, err)
+	}
+}
+
+func TestRepointUpstreamRestoresTheRouteIfCaddyRejectsIt(t *testing.T) {
+	sim := newEdgeSim()
+	m := NewEdgeManager(sim, "edge")
+	ctx := context.Background()
+	_ = m.PublishSite(ctx, "gitea", route, "10.0.100.50")
+	good := sim.files["/etc/caddy/sites/gitea.caddy"]
+	reloads := sim.reloads
+	sim.rejectWhen = "10.0.100.77"
+	changed, err := m.RepointUpstream(ctx, "gitea", func(context.Context) ([]string, error) { return []string{"10.0.100.77"}, nil })
+	if err == nil || changed || !strings.Contains(err.Error(), "previous one was restored") {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if sim.files["/etc/caddy/sites/gitea.caddy"] != good || sim.reloads != reloads {
+		t.Fatalf("a rejected repoint must roll back without a reload")
+	}
+	if _, err := m.RepointUpstream(ctx, "gitea", func(context.Context) ([]string, error) { return nil, nil }); err == nil {
+		t.Fatal("an instance with a route but no address is an error")
+	}
+}

@@ -129,7 +129,12 @@ func GenerateSSHKeypair() ([]byte, string, error) {
 	return privPEM, pubKeyStr, nil
 }
 
-func getSSHCredentials() ([]byte, string) {
+// LoadSSHCredentials returns the operator's SSH private key and its public
+// half: $SSH_PRIVATE_KEY, $FLEET_SSH_KEY, or ~/.ssh/id_ed25519 / id_rsa. If none
+// is configured a throwaway ed25519 pair is generated and generated is true; its
+// private half exists only in this process, so a host that only trusts it can
+// never be logged in to again by anyone.
+func LoadSSHCredentials() (priv []byte, pub string, generated bool) {
 	var privKeyPEM []byte
 	if keyEnv := os.Getenv("SSH_PRIVATE_KEY"); keyEnv != "" {
 		privKeyPEM = []byte(keyEnv)
@@ -150,23 +155,21 @@ func getSSHCredentials() ([]byte, string) {
 		}
 	}
 
-	var pubKeyStr string
 	if len(privKeyPEM) > 0 {
 		signer, err := ssh.ParsePrivateKey(privKeyPEM)
 		if err == nil {
-			pubKeyStr = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
-			return privKeyPEM, pubKeyStr
+			return privKeyPEM, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))), false
 		}
 	}
 
-	// Auto-generate fresh Ed25519 keypair if none configured
+	// Auto-generate a fresh Ed25519 keypair if none configured
 	privPEM, pubStr, err := GenerateSSHKeypair()
 	if err == nil {
-		log.Printf("==> [GitOps] No existing SSH key found. Automatically generated fresh Ed25519 keypair for fleet.\n")
-		return privPEM, pubStr
+		log.Printf("==> [GitOps] No usable SSH key found. Generated a throwaway Ed25519 keypair for this run only.\n")
+		return privPEM, pubStr, true
 	}
 
-	return nil, ""
+	return nil, "", false
 }
 
 func waitForSSH(ctx context.Context, host string, port int, timeout time.Duration) error {
@@ -198,7 +201,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("load fleet config: %w", err)
 	}
 
-	privKeyPEM, pubKeyStr := getSSHCredentials()
+	privKeyPEM, pubKeyStr, generatedKey := LoadSSHCredentials()
 	var primaryHostIP string
 	var hostSSHUser string = "root"
 	var hostSSHPort int = 22
@@ -264,20 +267,16 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			// Not found: provision it
 			if primaryHostIP == "" {
 				log.Printf("    Host %s not found. Provisioning with cloud-init...\n", hostName)
-				var sshKeyFingerprints []string
-				if pubKeyStr != "" {
-					fp, err := do.EnsureSSHKey(ctx, hostName+"-key", pubKeyStr)
-					if err == nil && fp != "" {
-						sshKeyFingerprints = append(sshKeyFingerprints, fp)
-					}
-				}
 				spec := config.HostSpec{
-					Name:        hostName,
-					Provider:    "digitalocean",
-					Size:        fleet.Providers.DigitalOcean.DefaultSize,
-					Region:      fleet.Providers.DigitalOcean.Region,
-					UserData:    GenerateCloudInitUserData(pubKeyStr),
-					SSHKeyNames: sshKeyFingerprints,
+					Name:     hostName,
+					Provider: "digitalocean",
+					Size:     fleet.Providers.DigitalOcean.DefaultSize,
+					Region:   fleet.Providers.DigitalOcean.Region,
+				}
+				// A throwaway key is acceptable here: this run uses it to SSH in. But a failure to
+				// register the key must stop the run BEFORE a droplet nobody can log in to is created.
+				if err := r.hostMgr.PrepareAccess(ctx, &spec, pubKeyStr, generatedKey, true); err != nil {
+					return fmt.Errorf("provision host %s: %w", hostName, err)
 				}
 				newHost, err := r.hostMgr.CreateHost(ctx, spec)
 				if err != nil {

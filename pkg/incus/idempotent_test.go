@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseRenderMergeEnv(t *testing.T) {
@@ -170,6 +171,37 @@ func TestLaunchContainerAlwaysIncludesTheDefaultProfileInTheRightPlace(t *testin
 	} {
 		if got := launch(tc.profiles); got != tc.want {
 			t.Errorf("%s:\n got %s\nwant %s", name, got, tc.want)
+		}
+	}
+}
+
+const twoAddrJSON = `[{"name":"web","state":{"network":{"eth0":{"addresses":[{"family":"inet","address":"10.0.100.50","scope":"global"},{"family":"inet","address":"10.0.100.21","scope":"global"}]}}}}]`
+
+func TestGetContainerIPOnlyReadsAndIsDeterministic(t *testing.T) {
+	ex := &stubExec{out: twoAddrJSON}
+	ip, err := NewClient(ex).GetContainerIP(context.Background(), "web")
+	if err != nil || ip != "10.0.100.21" {
+		t.Fatalf("got %q, %v", ip, err)
+	}
+	for _, cmd := range ex.cmds {
+		if !strings.HasPrefix(cmd, "incus list") {
+			t.Fatalf("looking up an address must not change the container (it used to push a static IP, a route and resolv.conf into it): %s", cmd)
+		}
+	}
+}
+
+func TestGetContainerIPExplainsAMissingLeaseInsteadOfWorkingAroundIt(t *testing.T) {
+	old := containerIPTimeout
+	containerIPTimeout = 50 * time.Millisecond
+	defer func() { containerIPTimeout = old }()
+	ex := &stubExec{out: `[{"name":"web","state":{"network":{}}}]`}
+	_, err := NewClient(ex).GetContainerIP(context.Background(), "web")
+	if err == nil || !strings.Contains(err.Error(), "DHCP") {
+		t.Fatalf("got %v", err)
+	}
+	for _, cmd := range ex.cmds {
+		if strings.Contains(cmd, "ip addr") || strings.Contains(cmd, "resolv.conf") || strings.Contains(cmd, "ip route") {
+			t.Fatalf("no in-container networking hacks: %s", cmd)
 		}
 	}
 }

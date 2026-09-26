@@ -91,12 +91,18 @@ Commands:
 #### 1. Provision a Cloud Host (DigitalOcean)
 ```bash
 export DO_API_TOKEN="dop_v1_..."
+export SSH_PRIVATE_KEY="$(cat ~/.ssh/id_ed25519)"   # or FLEET_SSH_KEY, or have ~/.ssh/id_ed25519
 native-ops host create \
   --provider digitalocean \
   --name node-01 \
   --size s-4vcpu-8gb \
   --region nyc1
 ```
+The public half of that key is registered with your DigitalOcean account and authorized on
+the new host, so `ssh root@<ip>` works. This is required: a droplet created with no key comes up
+with a random, already-expired root password and cannot be logged in to at all. `host create`
+therefore **refuses to run without a configured key** (it will not invent a throwaway one that
+is lost when the command exits), and stops before creating anything if the key can't be registered.
 
 #### 2. Provision a Proxmox VE KVM Host
 ```bash
@@ -142,6 +148,18 @@ same configuration and the command exits non-zero, so a bad release fails the CI
 visibly instead of leaving the instance down. Image aliases (`app:v1.4.0`) are resolved
 to a fingerprint; an alias that isn't present locally is an error rather than being
 pulled from a public registry.
+
+A replaced container gets a new DHCP address, so if the instance has a published Caddy route
+(`/etc/caddy/sites/<name>.caddy` on the edge), `update` points it at the new address before
+reporting success — on a rollback too — rewriting only the upstream address and validating the
+Caddy config before the reload. An instance with no route is not touched at the edge, and if
+the route can't be repointed the command fails saying so.
+
+**Addressing.** Containers get their address from the bridge's DHCP. native-ops no longer pushes
+a hash-derived static address, a default route or a rewritten `resolv.conf` into containers
+(that left them with two addresses, could collide between services, was lost on restart and
+hardcoded the subnet). A container that gets no address is reported with a hint to check that
+DHCP is allowed on the bridge in the host firewall (the `reconcile` bootstrap does this).
 
 #### 6. Cross-Host Workload Migration (safe for CI)
 `--source` and `--target` are Incus remotes (`incus remote list`) configured where
