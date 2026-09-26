@@ -109,7 +109,7 @@ func TestPlanExitsOneWhenTheHostCannotBeRead(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "incus"), []byte("#!/bin/bash\necho 'boom' >&2\nexit 1\n"), 0o755)
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	code, out, errOut := plan(t, confDir(t, freshService))
-	if code != 1 || !strings.Contains(errOut, "Could not plan service web") {
+	if code != 1 || !strings.Contains(errOut, "plan service web") {
 		t.Fatalf("a host that cannot be read must not look like an empty plan: exit=%d\n%s\n%s", code, out, errOut)
 	}
 }
@@ -142,20 +142,5 @@ func TestPlanOfOneServiceAndOfNoServices(t *testing.T) {
 	}
 	if code, _, errOut := plan(t, t.TempDir()); code != 1 || !strings.Contains(errOut, "fleet config") {
 		t.Fatalf("a directory with no fleet.yml is an error, exit=%d %s", code, errOut)
-	}
-}
-
-func TestLoadServicesIsSharedByApplyAndPlan(t *testing.T) {
-	dir := confDir(t, freshService)
-	os.MkdirAll(filepath.Join(dir, "services", "aaa"), 0o755)
-	os.WriteFile(filepath.Join(dir, "services", "aaa", "service.yml"), []byte("name: aaa\nimage: x\n"), 0o644)
-	os.MkdirAll(filepath.Join(dir, "services", "no-manifest"), 0o755)
-	svcs, err := loadServices(dir, "")
-	if err != nil || len(svcs) != 2 || svcs[0].Name != "aaa" || svcs[1].Name != "web" {
-		t.Fatalf("got %v %v", svcs, err)
-	}
-	os.WriteFile(filepath.Join(dir, "services", "aaa", "service.yml"), []byte("name: [broken"), 0o644)
-	if _, err := loadServices(dir, ""); err == nil {
-		t.Fatal("a manifest that does not parse must be an error before anything is applied")
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 
+	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/server"
 	"github.com/theta42/native-ops/pkg/status"
@@ -79,6 +80,14 @@ func printStatus(s *status.Snapshot) {
 	}
 }
 
+// planSource is what POST /v1/plan plans with. engine.PlanFleet wraps exec in remote.ReadOnly, so
+// an uploaded tree can be planned against this host but never applied to it.
+func planSource(exec remote.Executor) server.PlanFunc {
+	return func(ctx context.Context, dir, service string) (*engine.FleetPlan, error) {
+		return engine.PlanFleet(ctx, exec, dir, service)
+	}
+}
+
 func stateDirFlag(flags *flag.FlagSet) *string {
 	return flags.String("state-dir", "/var/lib/native-ops", "Directory for the daemon's tokens and audit log")
 }
@@ -121,6 +130,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	srv, err := server.New(server.Options{
 		Addr: *addr, Tokens: tokens, Audit: audit, Version: Version,
 		Status: func(ctx context.Context) (*status.Snapshot, error) { return status.Collect(ctx, exec, *pool) },
+		Plan:   planSource(exec),
 	})
 	if err != nil {
 		log.Fatal(err)

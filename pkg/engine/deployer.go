@@ -148,11 +148,15 @@ func ensureEnv(ctx context.Context, ic *incus.Client, container, service string,
 // hookScript resolves a hook to its script text: a file under services/<svc>/
 // or the config root, else the hook value itself is the script.
 func hookScript(configDir, svcName, hook string) string {
-	if data, err := os.ReadFile(filepath.Join(configDir, "services", svcName, hook)); err == nil {
-		return string(data)
-	}
-	if data, err := os.ReadFile(filepath.Join(configDir, hook)); err == nil {
-		return string(data)
+	// A hook that names a path outside the config directory is never read as a file: it is
+	// the script text itself, like any other value that is not a file here.
+	if config.RelativeInside(hook) {
+		if data, err := os.ReadFile(filepath.Join(configDir, "services", svcName, hook)); err == nil {
+			return string(data)
+		}
+		if data, err := os.ReadFile(filepath.Join(configDir, hook)); err == nil {
+			return string(data)
+		}
 	}
 	return hook
 }

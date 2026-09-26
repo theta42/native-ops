@@ -28,6 +28,11 @@ type fixture struct {
 
 func setup(t *testing.T, ttl time.Duration, statusErr error) *fixture {
 	t.Helper()
+	return setupWith(t, ttl, statusErr, nil)
+}
+
+func setupWith(t *testing.T, ttl time.Duration, statusErr error, plan PlanFunc) *fixture {
+	t.Helper()
 	dir := t.TempDir()
 	tokens, err := OpenTokenStore(filepath.Join(dir, "tokens.json"))
 	if err != nil {
@@ -41,7 +46,7 @@ func setup(t *testing.T, ttl time.Duration, statusErr error) *fixture {
 	}
 	t.Cleanup(func() { audit.Close() })
 	calls := &atomic.Int32{}
-	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", StatusTTL: ttl,
+	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", StatusTTL: ttl, Plan: plan,
 		Status: func(context.Context) (*status.Snapshot, error) {
 			calls.Add(1)
 			if statusErr != nil {

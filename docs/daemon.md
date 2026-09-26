@@ -19,6 +19,7 @@ a person sets up by hand.
 | `GET /healthz` | none | liveness (`{"ok":true,"version":...}`), no state |
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images and warnings for the host |
+| `POST /v1/plan` | deployer | what `apply` would change for the configuration you upload (never changes the host) |
 | `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
@@ -38,8 +39,8 @@ can create privileged containers), so it is deliberately small:
 - Tokens are `nops_` plus 64 hex characters. Only the SHA-256 is stored, in a `0600` file inside a
   `0700` state directory; a world-readable token file is refused at startup. The secret is shown
   once, at creation, and compared in constant time.
-- Roles: `viewer` < `deployer` < `admin`. Nothing needs more than `viewer` yet; the gate is tested
-  so the write endpoints that follow inherit it.
+- Roles: `viewer` < `deployer` < `admin`. Reading needs `viewer`; sending a configuration to be
+  planned needs `deployer`. The gate is tested so the write endpoints that follow inherit it.
 - Every request is appended to `audit.log` (JSON lines): time, token name, method, path, status,
   remote address, duration. Never the query string, never a credential.
 - The UI is served with a strict Content-Security-Policy (`default-src 'none'`, no inline script or
@@ -52,6 +53,43 @@ can create privileged containers), so it is deliberately small:
   the page names a file the binary does not serve.
 - It listens on loopback (or the Incus bridge address) and must sit behind TLS, e.g. the Caddy
   edge. Do not expose the port directly.
+
+## Planning from CI
+
+A pipeline sends the tree it checked out; the daemon needs no git access and holds no
+credentials for your repository. The answer is what `native-ops plan` prints, plus a hash of it:
+
+```bash
+tar -czf - -C . fleet.yml services templates \
+  | curl -fsS -X POST "$NATIVE_OPS_URL/v1/plan?sha=$COMMIT&service=gitea" \
+      -H "Authorization: Bearer $NATIVE_OPS_TOKEN" -H "Content-Type: application/gzip" \
+      --data-binary @- -o plan.json
+jq -r .text plan.json            # the plan, ready to read (or post to the pull request)
+jq -e '.exit != 1' plan.json     # fail the job only when apply would fail
+```
+
+`exit` follows `native-ops plan`: `0` nothing to change, `2` changes pending, `1` blocked. `hash`
+identifies exactly what the plan would do (the same changes give the same hash), so a later
+apply can be tied to the plan somebody reviewed. `sha` and `service` are optional and only
+recorded in the audit log.
+
+The upload is untrusted, and is handled that way:
+
+- It must be a gzip-compressed tar of regular files and directories. A symlink, hard link,
+  device, an absolute name or one that climbs out with `..` is refused, not skipped; nothing can
+  be written outside the private temporary directory it is unpacked into, which is removed
+  afterwards. Permission bits in the archive are ignored.
+- At most 32 MiB uploaded, 128 MiB unpacked (counted as bytes actually written) and 5000
+  entries, and at most 4 plans at a time (`429` beyond that).
+- A manifest path (`env_file`, a hook file) that leaves the configuration directory is an error,
+  so a pull request cannot make the plan read a file elsewhere on the host.
+- The plan runs behind the same read-only executor as the CLI: the uploaded tree can be
+  planned against the host but nothing in it can change the host. Environment values never
+  appear in the answer, only key names.
+- A configuration the daemon cannot use is `400` with the reason (`bad_config`, `bad_archive`);
+  a host it cannot read is a generic `502`.
+- The audit log records who planned, the commit, the service, the outcome and the hash (never
+  the archive, and never a query string).
 
 ## Tokens and bootstrapping
 
@@ -83,6 +121,7 @@ with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the
 
 ## Roadmap
 
-`plan` (a dry-run of `apply`), `apply` at a git ref, instance update/migrate/backup as audited
-jobs with per-host locking, and OIDC sign-in for the UI. The API is versioned (`/v1`) so a
-separate fleet manager can depend on it.
+`apply` of an uploaded tree as an audited job with per-host locking, which must present the
+`hash` of the plan that was reviewed and refuses to run if the host or the manifests have changed
+since; instance update/migrate/backup as jobs; and OIDC sign-in for the UI. The API is versioned
+(`/v1`) so a separate fleet manager can depend on it.

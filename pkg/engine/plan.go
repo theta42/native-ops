@@ -2,12 +2,17 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/incus"
+	"github.com/theta42/native-ops/pkg/remote"
 )
 
 // Kinds of change a plan reports.
@@ -370,4 +375,53 @@ func (f *FleetPlan) Render() string {
 	c := f.Counts()
 	fmt.Fprintf(&sb, "\nPlan: %d to create, %d to update, %d unchanged, %d blocked.\n", c[ActionCreate], c[ActionUpdate], c[ActionNone], c[ActionBlocked])
 	return sb.String()
+}
+
+// ErrBadConfig marks a plan that failed because the configuration is unusable (missing
+// fleet.yml, a manifest that does not parse), as opposed to the host being unreadable.
+var ErrBadConfig = errors.New("invalid configuration")
+
+// PlanFleet plans every service in a config directory (only one when service is set) against
+// the host behind exec, which it wraps in remote.ReadOnly, so the host cannot change.
+func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service string) (*FleetPlan, error) {
+	if _, err := config.LoadFleetConfig(configDir); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
+	}
+	services, err := config.LoadServices(configDir, service)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
+	}
+	d := NewDeployer(remote.ReadOnly(exec))
+	fp := &FleetPlan{Services: []*ServicePlan{}}
+	for _, svc := range services {
+		p, err := d.PlanService(ctx, svc, configDir)
+		if err != nil {
+			return nil, fmt.Errorf("plan service %s: %w", svc.Name, err)
+		}
+		fp.Services = append(fp.Services, p)
+	}
+	return fp, nil
+}
+
+// ExitStatus is the status `native-ops plan` exits with: 1 when apply would fail on some
+// service, 2 when changes are pending, 0 when there is nothing to do.
+func (f *FleetPlan) ExitStatus() int {
+	switch {
+	case f.Blocked():
+		return 1
+	case f.Pending():
+		return 2
+	}
+	return 0
+}
+
+// Hash identifies what a plan would do: the same changes give the same hash, whatever order the
+// services were planned in. An apply that is given the hash of a plan somebody reviewed can
+// refuse to run if the host or the manifests have changed since.
+func (f *FleetPlan) Hash() string {
+	svcs := append([]*ServicePlan(nil), f.Services...)
+	sort.SliceStable(svcs, func(i, j int) bool { return svcs[i].Service < svcs[j].Service })
+	b, _ := json.Marshal(svcs)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }

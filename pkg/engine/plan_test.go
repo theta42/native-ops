@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -397,5 +399,43 @@ func TestFleetPlanSummaryAndExitSemantics(t *testing.T) {
 	}
 	if !(&FleetPlan{Services: []*ServicePlan{{Service: "x", Action: ActionBlocked}}}).Blocked() {
 		t.Fatal("a blocked service blocks the plan")
+	}
+}
+
+func TestAHookThatNamesAFileOutsideTheConfigDirectoryIsNeverRead(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(filepath.Dir(dir), "outside-secret.sh")
+	os.WriteFile(outside, []byte("echo SHOULD-NOT-RUN"), 0o644)
+	defer os.Remove(outside)
+	os.MkdirAll(filepath.Join(dir, "services", "web"), 0o755)
+	os.WriteFile(filepath.Join(dir, "services", "web", "init.sh"), []byte("echo inside"), 0o644)
+
+	if got := hookScript(dir, "web", "init.sh"); got != "echo inside" {
+		t.Fatalf("a hook inside the directory is read: %q", got)
+	}
+	for _, escape := range []string{"../outside-secret.sh", "../../outside-secret.sh", outside} {
+		if got := hookScript(dir, "web", escape); got != escape {
+			t.Errorf("%q escapes the config directory and must be the script text itself, not the file it names: got %q", escape, got)
+		}
+	}
+}
+
+func TestPlanHashIdentifiesWhatWouldHappen(t *testing.T) {
+	a := &ServicePlan{Service: "a", Action: ActionCreate, Changes: []Change{{Kind: ChangeCreateInstance, Detail: "launch a"}}}
+	b := &ServicePlan{Service: "b", Action: ActionNone}
+	f1 := &FleetPlan{Services: []*ServicePlan{a, b}}
+	f2 := &FleetPlan{Services: []*ServicePlan{b, a}}
+	if f1.Hash() != f2.Hash() || len(f1.Hash()) != 64 {
+		t.Fatalf("the order services were planned in must not matter: %s %s", f1.Hash(), f2.Hash())
+	}
+	changed := &FleetPlan{Services: []*ServicePlan{{Service: "a", Action: ActionCreate, Changes: []Change{{Kind: ChangeCreateInstance, Detail: "launch a from another image"}}}, b}}
+	if changed.Hash() == f1.Hash() {
+		t.Fatal("a different change must give a different hash")
+	}
+	if (&FleetPlan{Services: []*ServicePlan{}}).Hash() == f1.Hash() {
+		t.Fatal("an empty plan is not this plan")
+	}
+	if f1.ExitStatus() != 2 || (&FleetPlan{}).ExitStatus() != 0 || (&FleetPlan{Services: []*ServicePlan{{Service: "x", Action: ActionBlocked}}}).ExitStatus() != 1 {
+		t.Fatal("exit status: pending is 2, empty is 0, blocked is 1")
 	}
 }
