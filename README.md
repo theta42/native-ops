@@ -81,7 +81,7 @@ Commands:
   instance update  Immutable container update for an instance
   instance resize  Live CPU/memory cgroup resizing
   instance destroy Delete an instance and its Caddy route
-  instance migrate Move instance and volume across Incus remotes
+  instance migrate Move an instance and its volumes across Incus remotes (--finalize removes the source)
   dns sync         Sync DNS records using configured provider or python plugin
   version          Print version information
 ```
@@ -143,14 +143,47 @@ visibly instead of leaving the instance down. Image aliases (`app:v1.4.0`) are r
 to a fingerprint; an alias that isn't present locally is an error rather than being
 pulled from a public registry.
 
-#### 6. Cross-Host Workload Migration
+#### 6. Cross-Host Workload Migration (safe for CI)
+`--source` and `--target` are Incus remotes (`incus remote list`) configured where
+`native-ops` runs. The two hosts must be able to reach each other (the copy is pushed
+host-to-host), e.g. over a WireGuard link between providers.
 ```bash
+# 1. move it: the source is stopped, never deleted
 native-ops instance migrate \
-  --source node-01 \
-  --target pve-worker-01 \
-  --name rest-bistro \
-  --volume rest-bistro-data
+  --source node-01 --target pve-worker-01 --name rest-bistro \
+  --health-path /health --health-port 8787
+
+# 2. repoint DNS / edge routing at the target, watch it, then delete the source
+native-ops instance migrate \
+  --source node-01 --target pve-worker-01 --name rest-bistro \
+  --health-path /health --health-port 8787 --finalize
 ```
+The volumes to move are read from the instance's own disk devices (`--volume` is only a
+typo guard), and an instance that mounts a host path is refused because a copy would leave
+that data behind. Order of operations:
+
+1. **Preflight (read-only):** both remotes reachable, and nothing on the target that would be
+   overwritten. An existing copy on the target is an error unless `--resume` is given, and a
+   *running* one is always refused.
+2. **Snapshot** the source volumes (`pre-migrate-*`); a failed snapshot aborts with nothing
+   changed (`--no-snapshot` is an explicit opt-out).
+3. **Warm copy** while the source keeps serving, so downtime only covers what changed since.
+   Snapshots are not copied (`--volume-only`, `--instance-only`).
+4. **Stop the source and verify it is stopped** — a running database is never copied.
+5. **Final incremental copy, start the target,** and (with `--health-path`) check it from
+   *inside* the container, so it works whichever host or network the container is on.
+
+If any step after the stop fails, the target is stopped and the **source is started again**,
+and the command exits non-zero. `migrate` never deletes anything. `--finalize` deletes the
+stopped source instance only after re-checking that the source is stopped, the target is
+running and healthy, and the target holds every data volume; the source's data volumes are
+kept unless `--purge-source-volumes` is given.
+
+**Rolling back** after cutover: run the migration the other way with `--resume`
+(`--source pve-worker-01 --target node-01 --resume`); the target's changes are copied back
+incrementally, so writes made after the cutover are not lost.
+
+Moving DNS / edge routing between the two steps is not automated yet.
 
 ---
 

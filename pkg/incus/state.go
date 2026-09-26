@@ -95,14 +95,7 @@ func (s *InstanceState) Volumes() []VolumeRef {
 
 // CaptureInstanceState reads the live configuration of a container.
 func (c *Client) CaptureInstanceState(ctx context.Context, name string) (*InstanceState, error) {
-	if !ValidName(name) {
-		return nil, fmt.Errorf("invalid instance name %q", name)
-	}
-	out, err := c.exec.Run(ctx, "incus config show "+ShQuote(name))
-	if err != nil {
-		return nil, fmt.Errorf("read config of %s: %w", name, err)
-	}
-	return ParseInstanceState(name, out)
+	return c.CaptureInstanceStateAt(ctx, "", name)
 }
 
 func isMissingFile(err error) bool {

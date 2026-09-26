@@ -348,27 +348,6 @@ func (c *Client) SnapshotVolume(ctx context.Context, pool, volumeName, snapshotN
 	return c.CreateVolumeSnapshot(ctx, pool, volumeName, snapshotName)
 }
 
-// MigrateInstance copies/moves a container and volume across Incus hosts.
-func (c *Client) MigrateInstance(ctx context.Context, srcRemote, targetRemote, name string, volumeName string) error {
-	// Copy storage volume first
-	if volumeName != "" {
-		volCmd := fmt.Sprintf("incus storage volume copy %s:default/%s %s:default/%s --refresh",
-			srcRemote, volumeName, targetRemote, volumeName)
-		if _, err := c.exec.Run(ctx, volCmd); err != nil {
-			return fmt.Errorf("migrate volume %s: %w", volumeName, err)
-		}
-	}
-
-	// Copy instance
-	instCmd := fmt.Sprintf("incus copy %s:%s %s:%s --mode=push --refresh",
-		srcRemote, name, targetRemote, name)
-	if _, err := c.exec.Run(ctx, instCmd); err != nil {
-		return fmt.Errorf("migrate instance %s: %w", name, err)
-	}
-
-	return nil
-}
-
 // HealthGate probes the container until it returns HTTP 200 or times out.
 func (c *Client) HealthGate(ctx context.Context, ip string, hc config.HealthCheckConfig) error {
 	if hc.Path == "" {

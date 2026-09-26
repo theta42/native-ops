@@ -87,7 +87,7 @@ Core Commands:
   instance update  Immutable container update for an instance
   instance resize  Live CPU/memory cgroup resizing
   instance destroy Delete an instance and its Caddy route
-  instance migrate Move instance and volume across Incus remotes
+  instance migrate Move an instance and its volumes across Incus remotes (--finalize removes the source)
   backup init      Create the destination bucket if it does not exist
   backup create    Back up one custom volume to S3-compatible object storage
   backup all       Back up every (allowlisted) custom volume
@@ -347,23 +347,50 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 		src := flags.String("source", "", "Source Incus remote")
 		dst := flags.String("target", "", "Target Incus remote")
 		name := flags.String("name", "", "Instance name")
-		vol := flags.String("volume", "", "Storage volume name")
+		vol := flags.String("volume", "", "Optional: a storage volume name to cross-check against the instance's attached volumes")
+		healthPath := flags.String("health-path", "", "HTTP path probed from inside the migrated container (e.g. /health); recommended")
+		healthPort := flags.Int("health-port", 80, "Health check port inside the container")
+		healthTimeout := flags.Int("health-timeout", 60, "Health check timeout in seconds")
+		resume := flags.Bool("resume", false, "Allow an existing stopped copy on the target (interrupted run, or rollback by swapping --source/--target)")
+		noSnapshot := flags.Bool("no-snapshot", false, "Skip the pre-migrate snapshot of the source volumes")
+		stopTimeout := flags.Int("stop-timeout", 30, "Seconds to wait for the source to stop cleanly")
+		finalize := flags.Bool("finalize", false, "Delete the stopped source instance once the target is verified")
+		purge := flags.Bool("purge-source-volumes", false, "With --finalize: also delete the source's data volumes")
 		_ = flags.Parse(args[1:])
 
 		if *src == "" || *dst == "" || *name == "" {
 			log.Fatal("Error: --source, --target, and --name are required")
 		}
 
+		var hc config.HealthCheckConfig
+		if *healthPath != "" {
+			hc = config.HealthCheckConfig{Path: *healthPath, Port: *healthPort, Timeout: *healthTimeout}
+		}
+
 		mig := engine.NewMigrationManager(exec)
+		if *finalize {
+			if err := mig.Finalize(ctx, engine.FinalizeParams{
+				SourceRemote: *src, TargetRemote: *dst, InstanceName: *name,
+				HealthCheck: hc, PurgeSourceVolumes: *purge,
+			}); err != nil {
+				log.Fatalf("Finalize failed: %v", err)
+			}
+			fmt.Printf("Instance %s removed from %s (now running on %s).\n", *name, *src, *dst)
+			return
+		}
 		if err := mig.Migrate(ctx, engine.MigrationParams{
 			SourceRemote: *src,
 			TargetRemote: *dst,
 			InstanceName: *name,
 			VolumeName:   *vol,
+			HealthCheck:  hc,
+			Resume:       *resume,
+			SkipSnapshot: *noSnapshot,
+			StopTimeout:  *stopTimeout,
 		}); err != nil {
 			log.Fatalf("Migration failed: %v", err)
 		}
-		fmt.Printf("Instance %s migrated from %s to %s\n", *name, *src, *dst)
+		fmt.Printf("Instance %s is running on %s; %s on %s is stopped and intact. Repoint DNS/edge, then run with --finalize.\n", *name, *dst, *name, *src)
 	}
 }
 
