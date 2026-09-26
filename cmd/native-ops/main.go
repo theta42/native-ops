@@ -288,6 +288,7 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 		healthPort := flags.Int("health-port", 0, "Port for --health-path")
 		healthTimeout := flags.Int("health-timeout", 60, "Seconds to wait for the health check")
 		noSnapshot := flags.Bool("no-snapshot", false, "Skip the pre-update volume snapshot (not recommended)")
+		force := flags.Bool("force", false, "Replace the instance even if it already runs the requested image")
 		_ = flags.Parse(args[1:])
 
 		if *name == "" || *image == "" {
@@ -297,7 +298,7 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 			log.Fatal("Error: --health-port is required with --health-path")
 		}
 
-		opts := engine.UpdateOptions{Service: *service, SkipSnapshot: *noSnapshot}
+		opts := engine.UpdateOptions{Service: *service, SkipSnapshot: *noSnapshot, Force: *force}
 		if *healthPath != "" {
 			opts.HealthCheck = config.HealthCheckConfig{Path: *healthPath, Port: *healthPort, Timeout: *healthTimeout}
 		}

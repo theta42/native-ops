@@ -50,6 +50,15 @@ func (s *scriptExec) index(sub string) int {
 	}
 	return -1
 }
+func (s *scriptExec) idx(sub string) []int {
+	var out []int
+	for i, c := range s.cmds {
+		if strings.Contains(c, sub) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
 func (s *scriptExec) count(sub string) int {
 	n := 0
 	for _, c := range s.cmds {
@@ -107,7 +116,7 @@ func TestUpdateHappyPathCarriesConfigAndSnapshotsFirst(t *testing.T) {
 		t.Fatalf("want snapshot < delete < launch, got %d %d %d\n%v", snap, del, launch, ex.cmds)
 	}
 	l := ex.cmds[launch]
-	for _, want := range []string{newFP, "--profile base", "--profile service", "--config limits.cpu=2", "--config limits.memory=1GB"} {
+	for _, want := range []string{newFP, "--profile 'base'", "--profile 'service'", "--config 'limits.cpu=2'", "--config 'limits.memory=1GB'"} {
 		if !strings.Contains(l, want) {
 			t.Errorf("launch missing %q: %s", want, l)
 		}
@@ -125,7 +134,7 @@ func TestUpdateHappyPathCarriesConfigAndSnapshotsFirst(t *testing.T) {
 	if push < dev || !strings.Contains(ex.cmds[push], base64.StdEncoding.EncodeToString([]byte(envTxt))) {
 		t.Fatalf("env file must be restored byte-for-byte after the device: %v", ex.cmds)
 	}
-	if ex.index("systemctl restart platform") < push {
+	if ex.index("systemctl restart 'platform'") < push {
 		t.Errorf("service must restart after the env file is restored")
 	}
 }
@@ -251,5 +260,89 @@ func TestUpdateFallsBackToDeviceOverride(t *testing.T) {
 	}
 	if ex.index("incus config device override 'rest-x' 'data'") < 0 {
 		t.Fatalf("a device provided by a profile must be overridden, not re-added: %v", ex.cmds)
+	}
+}
+
+// mutatingUpdateCmds are the commands that change an instance or its data.
+func mutating(ex *scriptExec) int {
+	n := 0
+	for _, p := range []string{"incus launch", "incus delete", "incus stop", "incus file push", "incus storage volume snapshot", "incus config device", "incus exec"} {
+		n += ex.count(p)
+	}
+	return n
+}
+
+func TestUpdateToTheImageItAlreadyRunsIsANoOp(t *testing.T) {
+	// The alias resolves to newFP and the container's base image is newFP.
+	yaml := strings.Replace(configYAML(newFP), "  limits.cpu: \"2\"\n", "  limits.cpu: \"2\"\n  user.native-ops.image: app:v2\n", 1)
+	rules := []rule{
+		{match: "incus image alias list", out: `[{"name":"app:v2","target":"` + newFP + `"}]`},
+		{match: "incus config show", out: yaml},
+		{match: "incus file pull", out: envTxt},
+		{match: "incus list", out: runningJSON},
+	}
+	ex := &scriptExec{rules: rules}
+	healthy := func(context.Context, string, config.HealthCheckConfig) error { return nil }
+	if err := newMgr(ex, healthy).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{Service: "platform", HealthCheck: config.HealthCheckConfig{Path: "/health", Port: 8787}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := mutating(ex) + ex.count("incus config set"); n != 0 {
+		t.Fatalf("an instance already at the requested image must not be touched: %v", ex.cmds)
+	}
+}
+
+func TestUpdateNoOpRecordsTheReferenceOnceAndForceStillReplaces(t *testing.T) {
+	// Running newFP but launched before references were recorded: adopt it, do not replace.
+	ex := &scriptExec{rules: baseRules(newFP)}
+	if err := newMgr(ex, nil).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if ex.count("incus config set 'rest-x' 'user.native-ops.image=app:v2'") != 1 || ex.count("incus delete") != 0 || ex.count("incus launch") != 0 {
+		t.Fatalf("want exactly one metadata write and no replacement: %v", ex.cmds)
+	}
+
+	ex = &scriptExec{rules: baseRules(newFP)}
+	if err := newMgr(ex, nil).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if ex.count("incus launch") != 1 {
+		t.Fatalf("Force must replace even when already current: %v", ex.cmds)
+	}
+}
+
+func TestUpdateNoOpWithUnhealthyInstanceFailsInsteadOfReplacing(t *testing.T) {
+	ex := &scriptExec{rules: baseRules(newFP)}
+	gate := func(context.Context, string, config.HealthCheckConfig) error { return errors.New("503") }
+	err := newMgr(ex, gate).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{HealthCheck: config.HealthCheckConfig{Path: "/health", Port: 8787}})
+	if err == nil || !strings.Contains(err.Error(), "not healthy, not replacing") {
+		t.Fatalf("got %v", err)
+	}
+	if ex.count("incus delete") != 0 || ex.count("incus launch") != 0 {
+		t.Fatalf("a current-but-unhealthy instance must be reported, not replaced: %v", ex.cmds)
+	}
+}
+
+func TestUpdateRecordsTheNewReferenceOnTheReplacementAndKeepsTheOldOneOnRollback(t *testing.T) {
+	ex := &scriptExec{rules: baseRules(oldFP)}
+	if err := newMgr(ex, nil).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if l := ex.cmds[ex.index("incus launch")]; !strings.Contains(l, "--config 'user.native-ops.image=app:v2'") {
+		t.Fatalf("the replacement must record the reference it was deployed from: %s", l)
+	}
+
+	yaml := strings.Replace(configYAML(oldFP), "  limits.cpu: \"2\"\n", "  limits.cpu: \"2\"\n  user.native-ops.image: app:v1\n", 1)
+	rules := append([]rule{{match: "incus config show", out: yaml}}, baseRules(oldFP)...)
+	ex = &scriptExec{rules: rules}
+	gate := func(_ context.Context, _ string, _ config.HealthCheckConfig) error {
+		if ex.count("incus launch") == 1 { // first launch is the new image
+			return errors.New("503")
+		}
+		return nil
+	}
+	_ = newMgr(ex, gate).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{HealthCheck: config.HealthCheckConfig{Path: "/h", Port: 1}})
+	launches := pick(ex.cmds, ex.idx("incus launch"))
+	if len(launches) != 2 || !strings.Contains(launches[1], "user.native-ops.image=app:v1") || strings.Contains(launches[1], "app:v2") {
+		t.Fatalf("a rollback must restore the previous recorded reference: %v", launches)
 	}
 }

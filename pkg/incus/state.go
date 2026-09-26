@@ -120,7 +120,7 @@ func (c *Client) PullFile(ctx context.Context, container, path string) (content 
 // PushFile writes content to a path inside a container with the given octal mode, byte for byte.
 func (c *Client) PushFile(ctx context.Context, container, path, content, mode string) error {
 	b64 := base64.StdEncoding.EncodeToString([]byte(content))
-	cmd := fmt.Sprintf("printf %%s %s | base64 -d | incus file push --create-dirs --mode %s - %s",
+	cmd := fmt.Sprintf("printf %%s %s | base64 -d | incus file push --create-dirs --uid 0 --gid 0 --mode %s - %s",
 		ShQuote(b64), ShQuote(mode), ShQuote(container+path))
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("write %s in %s: %w", path, container, err)
@@ -158,36 +158,53 @@ func (c *Client) SetDevice(ctx context.Context, container, device string, props 
 	return nil
 }
 
+// GlobalIPv4s returns every global IPv4 address of a container, sorted. It
+// makes one query and has no side effects (unlike GetContainerIP).
+func (c *Client) GlobalIPv4s(ctx context.Context, name string) ([]string, error) {
+	if !ValidName(name) {
+		return nil, fmt.Errorf("invalid instance name %q", name)
+	}
+	out, err := c.exec.Run(ctx, "incus list "+ShQuote(name)+" --format json")
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", name, err)
+	}
+	var list []struct {
+		Name  string `json:"name"`
+		State *struct {
+			Network map[string]struct {
+				Addresses []struct{ Family, Address, Scope string } `json:"addresses"`
+			} `json:"network"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return nil, fmt.Errorf("parse list of %s: %w", name, err)
+	}
+	var ips []string
+	for _, inst := range list {
+		if inst.Name != name || inst.State == nil {
+			continue
+		}
+		for net, info := range inst.State.Network {
+			if net == "lo" {
+				continue
+			}
+			for _, a := range info.Addresses {
+				if a.Family == "inet" && a.Scope == "global" && a.Address != "" {
+					ips = append(ips, a.Address)
+				}
+			}
+		}
+	}
+	sort.Strings(ips)
+	return ips, nil
+}
+
 // ContainerIPv4 polls until the container has a global IPv4 address. It has no side effects.
 func (c *Client) ContainerIPv4(ctx context.Context, name string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if out, err := c.exec.Run(ctx, "incus list "+ShQuote(name)+" --format json"); err == nil {
-			var list []struct {
-				Name  string `json:"name"`
-				State *struct {
-					Network map[string]struct {
-						Addresses []struct{ Family, Address, Scope string } `json:"addresses"`
-					} `json:"network"`
-				} `json:"state"`
-			}
-			if json.Unmarshal([]byte(out), &list) == nil {
-				for _, inst := range list {
-					if inst.Name != name || inst.State == nil {
-						continue
-					}
-					for net, info := range inst.State.Network {
-						if net == "lo" {
-							continue
-						}
-						for _, a := range info.Addresses {
-							if a.Family == "inet" && a.Scope == "global" && a.Address != "" {
-								return a.Address, nil
-							}
-						}
-					}
-				}
-			}
+		if ips, err := c.GlobalIPv4s(ctx, name); err == nil && len(ips) > 0 {
+			return ips[0], nil
 		}
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("no IPv4 address for %s within %s", name, timeout)

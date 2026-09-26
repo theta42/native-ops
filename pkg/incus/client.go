@@ -2,9 +2,9 @@ package incus
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -144,44 +144,63 @@ func (c *Client) GetContainerIP(ctx context.Context, name string) (string, error
 	return "", fmt.Errorf("no global IPv4 address assigned to container %s within 30s. Diagnostic:\n%s", name, info)
 }
 
-// ContainerExists checks if an instance exists.
-func (c *Client) ContainerExists(ctx context.Context, name string) bool {
-	cmd := fmt.Sprintf("incus list %s --format json", name)
-	out, err := c.exec.Run(ctx, cmd)
+// InstanceExists reports whether an instance exists on the default remote. An
+// unreachable or failing incus is an error, not "absent", so a caller can
+// never mistake a transient failure for a missing instance.
+func (c *Client) InstanceExists(ctx context.Context, name string) (bool, error) {
+	if !ValidName(name) {
+		return false, fmt.Errorf("invalid instance name %q", name)
+	}
+	out, err := c.exec.Run(ctx, "incus list "+ShQuote(name)+" --format json")
 	if err != nil {
-		return false
+		return false, fmt.Errorf("list instances: %w", err)
 	}
 	var instances []struct {
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal([]byte(out), &instances); err == nil {
-		for _, inst := range instances {
-			if inst.Name == name {
-				return true
-			}
+	if err := json.Unmarshal([]byte(out), &instances); err != nil {
+		return false, fmt.Errorf("parse instance list: %w", err)
+	}
+	for _, inst := range instances {
+		if inst.Name == name {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+// ContainerExists checks if an instance exists (false on any error; prefer InstanceExists).
+func (c *Client) ContainerExists(ctx context.Context, name string) bool {
+	ok, err := c.InstanceExists(ctx, name)
+	return ok && err == nil
+}
+
+// NetworkSetIfChanged returns a shell command that sets one Incus network key
+// only when its current value differs, so repeated runs do not re-apply it.
+func NetworkSetIfChanged(network, key, want string) string {
+	return fmt.Sprintf(`[ "$(incus network get %s %s 2>/dev/null)" = %s ] || incus network set %s %s || true`,
+		ShQuote(network), ShQuote(key), ShQuote(want), ShQuote(network), ShQuote(key+"="+want))
 }
 
 // EnsureProfile ensures a named profile exists, creating and configuring standard profiles if needed.
 func (c *Client) EnsureProfile(ctx context.Context, name string) error {
+	if !ValidName(name) {
+		return fmt.Errorf("invalid profile name %q", name)
+	}
 	// Ensure default storage and root disk device are active
 	_, _ = c.exec.Run(ctx, "incus storage list | grep -q default || incus storage create default dir || true")
 	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true")
 	_, _ = c.exec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 || true")
-	_, _ = c.exec.Run(ctx, "incus network set incusbr0 ipv4.address 10.0.100.1/24 || true")
-	_, _ = c.exec.Run(ctx, "incus network set incusbr0 ipv4.nat true || true")
-	_, _ = c.exec.Run(ctx, "incus network set incusbr0 ipv6.address none || true")
+	_, _ = c.exec.Run(ctx, NetworkSetIfChanged("incusbr0", "ipv4.address", "10.0.100.1/24"))
+	_, _ = c.exec.Run(ctx, NetworkSetIfChanged("incusbr0", "ipv4.nat", "true"))
+	_, _ = c.exec.Run(ctx, NetworkSetIfChanged("incusbr0", "ipv6.address", "none"))
 	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true")
 
-	checkCmd := fmt.Sprintf("incus profile show %s", name)
-	if _, err := c.exec.Run(ctx, checkCmd); err == nil {
+	if _, err := c.exec.Run(ctx, "incus profile show "+ShQuote(name)); err == nil {
 		return nil
 	}
 
-	createCmd := fmt.Sprintf("incus profile create %s", name)
-	if _, err := c.exec.Run(ctx, createCmd); err != nil {
+	if _, err := c.exec.Run(ctx, "incus profile create "+ShQuote(name)); err != nil {
 		return fmt.Errorf("create profile %s: %w", name, err)
 	}
 
@@ -195,7 +214,13 @@ func (c *Client) EnsureProfile(ctx context.Context, name string) error {
 }
 
 // LaunchContainer creates and starts an instance from an image with profiles and config overrides.
+// Every argument is shell-quoted and config keys are emitted in sorted order,
+// so the command is safe for arbitrary values (e.g. multi-word user.* config
+// replayed from another instance) and identical for identical input.
 func (c *Client) LaunchContainer(ctx context.Context, image string, name string, profiles []string, limits map[string]string) error {
+	if !ValidName(name) {
+		return fmt.Errorf("invalid instance name %q", name)
+	}
 	// Normalize image for Incus: if not prefixed with images:, docker:, or local remote, prefix with docker:
 	if !strings.HasPrefix(image, "images:") && !strings.HasPrefix(image, "docker:") && !strings.HasPrefix(image, "local:") && len(image) != 64 {
 		image = "docker:" + image
@@ -208,12 +233,13 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 	// Ensure all required profiles exist
 	for _, p := range profiles {
 		if p != "default" {
-			_ = c.EnsureProfile(ctx, p)
+			if err := c.EnsureProfile(ctx, p); err != nil {
+				return err
+			}
 		}
 	}
 
-	var args []string
-	args = append(args, "incus", "launch", image, name)
+	args := []string{"incus", "launch", ShQuote(image), ShQuote(name)}
 
 	// In Incus, ensure "default" profile is always included for root disk device and bridge NIC
 	hasDefault := false
@@ -226,19 +252,22 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 	if !hasDefault {
 		args = append(args, "--profile", "default")
 	}
-
 	for _, p := range profiles {
 		if p != "default" {
-			args = append(args, "--profile", p)
+			args = append(args, "--profile", ShQuote(p))
 		}
 	}
 
-	for k, v := range limits {
-		args = append(args, "--config", fmt.Sprintf("%s=%s", k, v))
+	keys := make([]string, 0, len(limits))
+	for k := range limits {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "--config", ShQuote(k+"="+limits[k]))
 	}
 
-	cmd := strings.Join(args, " ")
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
+	if _, err := c.exec.Run(ctx, strings.Join(args, " ")); err != nil {
 		return fmt.Errorf("launch container %s: %w", name, err)
 	}
 	return nil
@@ -265,53 +294,75 @@ func (c *Client) EnsureVolume(ctx context.Context, pool, volumeName string) erro
 	if pool == "" {
 		pool = "default"
 	}
-	checkCmd := fmt.Sprintf("incus storage volume show %s %s", pool, volumeName)
-	if _, err := c.exec.Run(ctx, checkCmd); err == nil {
+	if !ValidName(pool) || !ValidName(volumeName) {
+		return fmt.Errorf("invalid pool/volume name %q/%q", pool, volumeName)
+	}
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume show %s %s", ShQuote(pool), ShQuote(volumeName))); err == nil {
 		return nil // already exists
 	}
-
-	createCmd := fmt.Sprintf("incus storage volume create %s %s", pool, volumeName)
-	if _, err := c.exec.Run(ctx, createCmd); err != nil {
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume create %s %s", ShQuote(pool), ShQuote(volumeName))); err != nil {
 		return fmt.Errorf("create storage volume %s on pool %s: %w", volumeName, pool, err)
 	}
 	return nil
 }
 
-// AttachVolume attaches a storage volume.
+// volumeDeviceName is the device name used for a volume mounted at mountPath.
+func volumeDeviceName(mountPath string) string {
+	name := strings.ReplaceAll(strings.TrimPrefix(mountPath, "/"), "/", "-")
+	if name == "" {
+		return "data-vol"
+	}
+	return name
+}
+
+// AttachVolume attaches a storage volume. It fails if a device of that name
+// already exists; use EnsureVolumeAttached for an idempotent attach.
 func (c *Client) AttachVolume(ctx context.Context, containerName, pool, volumeName, mountPath string, shifted bool) error {
 	if pool == "" {
 		pool = "default"
 	}
-
-	deviceName := strings.ReplaceAll(strings.TrimPrefix(mountPath, "/"), "/", "-")
-	if deviceName == "" {
-		deviceName = "data-vol"
+	if !ValidName(containerName) || !ValidName(pool) || !ValidName(volumeName) {
+		return fmt.Errorf("invalid container/pool/volume name %q/%q/%q", containerName, pool, volumeName)
 	}
-
-	cmd := fmt.Sprintf("incus config device add %s %s disk pool=%s source=%s path=%s",
-		containerName, deviceName, pool, volumeName, mountPath)
-
+	cmd := fmt.Sprintf("incus config device add %s %s disk %s %s %s",
+		ShQuote(containerName), ShQuote(volumeDeviceName(mountPath)),
+		ShQuote("pool="+pool), ShQuote("source="+volumeName), ShQuote("path="+mountPath))
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("attach volume %s to %s at %s: %w", volumeName, containerName, mountPath, err)
 	}
 	return nil
 }
 
-// WriteEnvironmentFile writes key-value configuration into /etc/default/<service> safely.
-func (c *Client) WriteEnvironmentFile(ctx context.Context, containerName, serviceName string, env map[string]string) error {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("# Managed by native-ops for %s\n", serviceName))
-	for k, v := range env {
-		sb.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+// EnsureVolumeAttached attaches the volume unless it is already attached at
+// that path. A device of the same name that points somewhere else is an
+// error, never silently replaced.
+func (c *Client) EnsureVolumeAttached(ctx context.Context, containerName, pool, volumeName, mountPath string, shifted bool) error {
+	if pool == "" {
+		pool = "default"
 	}
+	st, err := c.CaptureInstanceState(ctx, containerName)
+	if err != nil {
+		return err
+	}
+	for _, d := range st.Devices {
+		if d["type"] == "disk" && d["pool"] == pool && d["source"] == volumeName && d["path"] == mountPath {
+			return nil
+		}
+	}
+	if d, clash := st.Devices[volumeDeviceName(mountPath)]; clash {
+		return fmt.Errorf("device %q on %s already exists (source=%s path=%s) and does not match volume %s at %s",
+			volumeDeviceName(mountPath), containerName, d["source"], d["path"], volumeName, mountPath)
+	}
+	return c.AttachVolume(ctx, containerName, pool, volumeName, mountPath, shifted)
+}
 
-	envContent := sb.String()
-	b64 := base64.StdEncoding.EncodeToString([]byte(envContent))
-
-	cmd := fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- sh -c 'mkdir -p /etc/default && cat > /etc/default/%s && chmod 600 /etc/default/%s'",
-		b64, containerName, serviceName, serviceName)
-
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
+// WriteEnvironmentFile writes key-value configuration into /etc/default/<service>
+// (mode 0600, keys sorted so identical input gives identical bytes).
+func (c *Client) WriteEnvironmentFile(ctx context.Context, containerName, serviceName string, env map[string]string) error {
+	if !ValidName(containerName) || !ValidName(serviceName) {
+		return fmt.Errorf("invalid container/service name %q/%q", containerName, serviceName)
+	}
+	if err := c.PushFile(ctx, containerName, "/etc/default/"+serviceName, RenderEnv(serviceName, env), "0600"); err != nil {
 		return fmt.Errorf("write /etc/default/%s in %s: %w", serviceName, containerName, err)
 	}
 	return nil
@@ -319,19 +370,29 @@ func (c *Client) WriteEnvironmentFile(ctx context.Context, containerName, servic
 
 // RestartService triggers a systemd service restart inside the container.
 func (c *Client) RestartService(ctx context.Context, containerName, serviceName string) error {
-	cmd := fmt.Sprintf("incus exec %s -- systemctl restart %s", containerName, serviceName)
+	if !ValidName(containerName) || !ValidName(serviceName) {
+		return fmt.Errorf("invalid container/service name %q/%q", containerName, serviceName)
+	}
+	cmd := fmt.Sprintf("incus exec %s -- systemctl restart %s", ShQuote(containerName), ShQuote(serviceName))
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("restart service %s in container %s: %w", serviceName, containerName, err)
 	}
 	return nil
 }
 
-// ResizeLimits applies live CPU/memory cgroup limits to a running container without restart.
+// ResizeLimits applies live config keys (CPU/memory cgroup limits) to a running container without restart.
 func (c *Client) ResizeLimits(ctx context.Context, containerName string, limits map[string]string) error {
-	for k, v := range limits {
-		cmd := fmt.Sprintf("incus config set %s %s %s", containerName, k, v)
-		if _, err := c.exec.Run(ctx, cmd); err != nil {
-			return fmt.Errorf("set %s=%s on %s: %w", k, v, containerName, err)
+	if !ValidName(containerName) {
+		return fmt.Errorf("invalid container name %q", containerName)
+	}
+	keys := make([]string, 0, len(limits))
+	for k := range limits {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if _, err := c.exec.Run(ctx, fmt.Sprintf("incus config set %s %s", ShQuote(containerName), ShQuote(k+"="+limits[k]))); err != nil {
+			return fmt.Errorf("set %s=%s on %s: %w", k, limits[k], containerName, err)
 		}
 	}
 	return nil

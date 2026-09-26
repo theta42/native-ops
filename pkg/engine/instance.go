@@ -150,6 +150,24 @@ type UpdateOptions struct {
 	// SkipSnapshot opts out of the pre-update volume snapshot. By default a
 	// snapshot is required, and a failed snapshot aborts the update untouched.
 	SkipSnapshot bool
+	// Force replaces the instance even when it already runs the requested image.
+	Force bool
+	// BeforeStart, when set, runs on the replacement after its volumes and
+	// environment file are in place and before its service is (re)started.
+	BeforeStart func(ctx context.Context, name string) error
+}
+
+// isFingerprint reports whether ref is a bare 64-hex image fingerprint.
+func isFingerprint(ref string) bool {
+	if len(ref) != 64 {
+		return false
+	}
+	for _, c := range ref {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Update replaces an instance's container with a new image. Only the image
@@ -161,6 +179,10 @@ type UpdateOptions struct {
 // is relaunched with the same configuration, so a bad release does not leave
 // the instance down. Errors are always returned (never swallowed), so a CI
 // job running this fails visibly.
+//
+// It is idempotent: an instance that already runs the requested image (same
+// fingerprint, or for a non-local reference the same recorded reference) is
+// left alone, so a CI re-run does not restart anything. Force overrides that.
 func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef string, opts UpdateOptions) error {
 	if !incus.ValidName(name) {
 		return fmt.Errorf("invalid instance name %q", name)
@@ -183,6 +205,30 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 	if err != nil {
 		return err
 	}
+
+	// Already there? Then there is nothing to replace.
+	if !opts.Force {
+		current := (isFingerprint(target) && st.BaseImage == target) ||
+			(!isFingerprint(target) && st.Config[incus.ImageKey] == newImageRef)
+		if current {
+			log.Printf("==> [Instance] %s already runs %s; nothing to do\n", name, newImageRef)
+			if st.Config[incus.ImageKey] != newImageRef {
+				if err := m.incus.SetInstanceConfig(ctx, name, incus.ImageKey, newImageRef); err != nil {
+					return err
+				}
+			}
+			if opts.HealthCheck.Path != "" {
+				ip, err := m.incus.ContainerIPv4(ctx, name, 30*time.Second)
+				if err != nil {
+					return fmt.Errorf("%s already runs %s but is not reachable, not replacing it: %w", name, newImageRef, err)
+				}
+				if err := m.healthGate(ctx, ip, opts.HealthCheck); err != nil {
+					return fmt.Errorf("%s already runs %s but is not healthy, not replacing it (use --force to replace anyway): %w", name, newImageRef, err)
+				}
+			}
+			return nil
+		}
+	}
 	envPath := "/etc/default/" + service
 	env, hadEnv, err := m.incus.PullFile(ctx, name, envPath)
 	if err != nil {
@@ -200,11 +246,11 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		}
 	}
 
-	replace := func(image string) error {
+	replace := func(image string, cfg map[string]string) error {
 		if err := m.incus.StopAndDeleteContainer(ctx, name); err != nil {
 			return err
 		}
-		if err := m.incus.LaunchContainer(ctx, image, name, st.Profiles, st.Config); err != nil {
+		if err := m.incus.LaunchContainer(ctx, image, name, st.Profiles, cfg); err != nil {
 			return err
 		}
 		for _, dn := range st.DeviceNames() {
@@ -214,6 +260,11 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		}
 		if hadEnv {
 			if err := m.incus.PushFile(ctx, name, envPath, env, "0600"); err != nil {
+				return err
+			}
+		}
+		if opts.BeforeStart != nil {
+			if err := opts.BeforeStart(ctx, name); err != nil {
 				return err
 			}
 		}
@@ -231,7 +282,12 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 	}
 
 	// 3. Replace, and roll back to the previous image if the new one is not healthy.
-	updateErr := replace(target)
+	forward := make(map[string]string, len(st.Config)+1)
+	for k, v := range st.Config {
+		forward[k] = v
+	}
+	forward[incus.ImageKey] = newImageRef // the rollback keeps the old recorded reference
+	updateErr := replace(target, forward)
 	if updateErr == nil {
 		log.Printf("==> [Instance] Updated %s to %s\n", name, newImageRef)
 		return nil
@@ -240,7 +296,7 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		return fmt.Errorf("update failed and the previous image is unknown, so no automatic rollback was possible (volume snapshots are named pre-update-*): %w", updateErr)
 	}
 	log.Printf("    Update failed (%v); rolling back to the previous image %s...\n", updateErr, st.BaseImage)
-	if rbErr := replace(st.BaseImage); rbErr != nil {
+	if rbErr := replace(st.BaseImage, st.Config); rbErr != nil {
 		return fmt.Errorf("update failed: %v; rollback ALSO failed (volume snapshots are named pre-update-*): %w", updateErr, rbErr)
 	}
 	return fmt.Errorf("update to %s failed and %s was rolled back to its previous image: %w", newImageRef, name, updateErr)
