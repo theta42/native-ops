@@ -278,6 +278,11 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 					return fmt.Errorf("%s already runs %s but is not healthy, not replacing it (use --force to replace anyway): %w", name, newImageRef, err)
 				}
 			}
+			// Nothing to replace, but the container's address may have changed since the
+			// route was published (a host reboot, an earlier interrupted update): fix that.
+			if err := m.repointRoute(ctx, name); err != nil {
+				return fmt.Errorf("%s already runs %s, but its Caddy route could not be pointed at it: %w", name, newImageRef, err)
+			}
 			return nil
 		}
 	}

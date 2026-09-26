@@ -3,6 +3,7 @@ package incus
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -203,5 +204,61 @@ func TestGetContainerIPExplainsAMissingLeaseInsteadOfWorkingAroundIt(t *testing.
 		if strings.Contains(cmd, "ip addr") || strings.Contains(cmd, "resolv.conf") || strings.Contains(cmd, "ip route") {
 			t.Fatalf("no in-container networking hacks: %s", cmd)
 		}
+	}
+}
+
+// Found on a real host: right after `incus launch` systemd is not up yet, so an immediate
+// `systemctl restart` failed with "Failed to connect to system scope bus". The update failed
+// on it, and so did its rollback.
+func TestRestartServiceWaitsForSystemdInAFreshContainer(t *testing.T) {
+	old := systemdPoll
+	systemdPoll = time.Millisecond
+	defer func() { systemdPoll = old }()
+	attempts := 0
+	ex := &fnExec{fn: func(cmd string) (string, error) {
+		if strings.Contains(cmd, "is-system-running") {
+			if attempts++; attempts < 4 {
+				return "", fmt.Errorf("command failed: %s (stderr: Failed to connect to system scope bus via local transport: No such file or directory): exit status 1", cmd)
+			}
+			return "starting\n", fmt.Errorf("exit status 1") // up, still booting: is-system-running exits non-zero
+		}
+		return "", nil
+	}}
+	if err := NewClient(ex).RestartService(context.Background(), "web", "svc"); err != nil {
+		t.Fatal(err)
+	}
+	restart := -1
+	for i, c := range ex.cmds {
+		if strings.Contains(c, "systemctl restart 'svc'") {
+			restart = i
+		}
+	}
+	if attempts != 4 || restart != 4 {
+		t.Fatalf("the restart must come only after systemd answers (attempts=%d, restart at %d): %v", attempts, restart, ex.cmds)
+	}
+}
+
+func TestWaitSystemdGivesUpAndFailsFastWithoutSystemctl(t *testing.T) {
+	oldW, oldP := systemdWait, systemdPoll
+	systemdWait, systemdPoll = 30*time.Millisecond, time.Millisecond
+	defer func() { systemdWait, systemdPoll = oldW, oldP }()
+
+	ex := &fnExec{fn: func(cmd string) (string, error) {
+		return "", fmt.Errorf("command failed: %s (stderr: Failed to connect to system scope bus): exit status 1", cmd)
+	}}
+	err := NewClient(ex).RestartService(context.Background(), "web", "svc")
+	if err == nil || !strings.Contains(err.Error(), "did not come up") {
+		t.Fatalf("got %v", err)
+	}
+	for _, c := range ex.cmds {
+		if strings.Contains(c, "systemctl restart") {
+			t.Fatal("must not try to restart a service while systemd is not answering")
+		}
+	}
+
+	ex = &fnExec{fn: func(cmd string) (string, error) { return "", fmt.Errorf("Error: Command not found: exit status 127") }}
+	systemdWait = time.Hour
+	if err := NewClient(ex).RestartService(context.Background(), "web", "svc"); err == nil || !strings.Contains(err.Error(), "no systemctl") || len(ex.cmds) != 1 {
+		t.Fatalf("a container without systemctl must fail at once, not after the timeout: %v (%d attempts)", err, len(ex.cmds))
 	}
 }

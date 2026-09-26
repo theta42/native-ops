@@ -723,3 +723,26 @@ func TestUpdateOfAnInstanceWithoutARouteDoesNotTouchTheEdge(t *testing.T) {
 		}
 	}
 }
+
+func TestNoOpUpdateHealsARouteThatWentStale(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["gitea:latest"] = fpA
+	d := newTestDeployer(sim)
+	ctx := context.Background()
+	svc := giteaSvc()
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	// The container's address changes underneath the published route (e.g. after a host reboot).
+	sim.ctrs["gitea"].ip = "10.0.100.222"
+	sim.reset()
+	if err := d.inst.Update(ctx, "gitea", "gitea:latest", UpdateOptions{Service: "gitea", HealthCheck: svc.HealthCheck}); err != nil {
+		t.Fatal(err)
+	}
+	if sim.count("incus launch") != 0 || sim.count("incus delete") != 0 {
+		t.Fatalf("already current: nothing may be replaced: %v", sim.mutations())
+	}
+	if !strings.Contains(siteOf(sim, "gitea"), "reverse_proxy 10.0.100.222:3000") {
+		t.Fatalf("the stale route must be repointed even when there is nothing to update:\n%s", siteOf(sim, "gitea"))
+	}
+}

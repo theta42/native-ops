@@ -322,10 +322,52 @@ func (c *Client) WriteEnvironmentFile(ctx context.Context, containerName, servic
 	return nil
 }
 
-// RestartService triggers a systemd service restart inside the container.
+// systemdWait and systemdPoll bound how long RestartService waits for systemd
+// to come up in a freshly started container (variables so tests can shorten them).
+var (
+	systemdWait = 60 * time.Second
+	systemdPoll = time.Second
+)
+
+// WaitSystemd waits until systemd inside the container is answering. `incus
+// launch` returns as soon as the container has started, but PID 1 needs a moment
+// before `systemctl` works: until then it fails with "Failed to connect to system
+// scope bus". A container still booting ("starting") is fine for a restart; only
+// "not up at all" is retried, and a container with no systemctl fails at once.
+func (c *Client) WaitSystemd(ctx context.Context, container string) error {
+	deadline := time.Now().Add(systemdWait)
+	cmd := "incus exec " + ShQuote(container) + " -- systemctl is-system-running"
+	for {
+		out, err := c.exec.Run(ctx, cmd)
+		if err == nil {
+			return nil
+		}
+		switch strings.TrimSpace(out) {
+		case "running", "degraded", "starting", "initializing":
+			return nil // systemd is up (is-system-running exits non-zero for anything but "running")
+		}
+		if strings.Contains(err.Error(), "ommand not found") {
+			return fmt.Errorf("%s has no systemctl: %w", container, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("systemd in %s did not come up within %s: %w", container, systemdWait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(systemdPoll):
+		}
+	}
+}
+
+// RestartService triggers a systemd service restart inside the container,
+// first waiting for systemd itself to be up (see WaitSystemd).
 func (c *Client) RestartService(ctx context.Context, containerName, serviceName string) error {
 	if !ValidName(containerName) || !ValidName(serviceName) {
 		return fmt.Errorf("invalid container/service name %q/%q", containerName, serviceName)
+	}
+	if err := c.WaitSystemd(ctx, containerName); err != nil {
+		return fmt.Errorf("restart service %s in container %s: %w", serviceName, containerName, err)
 	}
 	cmd := fmt.Sprintf("incus exec %s -- systemctl restart %s", ShQuote(containerName), ShQuote(serviceName))
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
