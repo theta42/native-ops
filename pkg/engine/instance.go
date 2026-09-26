@@ -42,8 +42,16 @@ type LaunchParams struct {
 	Limits       map[string]string
 }
 
-// Launch provisions a new instance from a template blueprint.
+// Launch provisions an instance from a template blueprint. It is safe to
+// re-run: an instance that an earlier run of this template already created
+// (recorded in user.native-ops.template) is resumed and converged instead of
+// failing on "already exists", so a launch interrupted by a failed health gate
+// or a lost connection can simply be run again. An instance of that name that
+// did not come from this template is never adopted or touched.
 func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, error) {
+	if !incus.ValidName(p.Name) {
+		return "", fmt.Errorf("invalid instance name %q", p.Name)
+	}
 	log.Printf("==> [Instance] Launching dynamic instance: %s (slug=%s)\n", p.Name, p.Slug)
 
 	// 1. Resolve image
@@ -62,13 +70,34 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		limits[k] = v
 	}
 
-	// 3. Launch container
+	// 3. Launch the container, or resume the one an earlier run created.
 	profiles := p.Template.Profiles
 	if len(profiles) == 0 {
 		profiles = []string{"base", "service"}
 	}
-	if err := m.incus.LaunchContainer(ctx, imageRef, p.Name, profiles, limits); err != nil {
-		return "", fmt.Errorf("launch container %s: %w", p.Name, err)
+	exists, err := m.incus.InstanceExists(ctx, p.Name)
+	if err != nil {
+		return "", err
+	}
+	if exists {
+		st, err := m.incus.CaptureInstanceState(ctx, p.Name)
+		if err != nil {
+			return "", err
+		}
+		if st.Config[incus.TemplateKey] != p.Template.Name || p.Template.Name == "" {
+			return "", fmt.Errorf("instance %s already exists and was not launched from template %q; refusing to adopt it (use `instance update` to change an existing instance)", p.Name, p.Template.Name)
+		}
+		log.Printf("    %s already exists from this template; resuming\n", p.Name)
+	} else {
+		cfg := make(map[string]string, len(limits)+2)
+		for k, v := range limits {
+			cfg[k] = v
+		}
+		cfg[incus.TemplateKey] = p.Template.Name
+		cfg[incus.ImageKey] = p.Template.Image
+		if err := m.incus.LaunchContainer(ctx, imageRef, p.Name, profiles, cfg); err != nil {
+			return "", fmt.Errorf("launch container %s: %w", p.Name, err)
+		}
 	}
 
 	// 4. Attach persistent data volume
@@ -77,12 +106,16 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		if err := m.incus.EnsureVolume(ctx, vol.Pool, actualVolName); err != nil {
 			return "", fmt.Errorf("ensure volume %s: %w", actualVolName, err)
 		}
-		if err := m.incus.AttachVolume(ctx, p.Name, vol.Pool, actualVolName, vol.Path, vol.Shifted); err != nil {
+		pool := vol.Pool
+		if pool == "" {
+			pool = "default"
+		}
+		if err := m.incus.EnsureVolumeAttached(ctx, p.Name, pool, actualVolName, vol.Path, vol.Shifted); err != nil {
 			return "", fmt.Errorf("attach volume %s: %w", actualVolName, err)
 		}
 	}
 
-	// 5. Build and write env
+	// 5. Build and converge env (declared keys are set, other keys are preserved)
 	env := make(map[string]string)
 	for k, v := range p.Template.EnvTemplate {
 		env[k] = strings.ReplaceAll(v, "{slug}", p.Slug)
@@ -98,25 +131,34 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		if serviceName == "" {
 			serviceName = "platform"
 		}
-		if err := m.incus.WriteEnvironmentFile(ctx, p.Name, serviceName, env); err != nil {
+		changed, err := ensureEnv(ctx, m.incus, p.Name, serviceName, env)
+		if err != nil {
 			return "", fmt.Errorf("write env file: %w", err)
 		}
-		_ = m.incus.RestartService(ctx, p.Name, serviceName)
+		if changed {
+			if err := m.incus.RestartService(ctx, p.Name, serviceName); err != nil {
+				log.Printf("    WARNING: %v\n", err)
+			}
+		}
 	}
 
-	// 6. Health gate
-	ip, err := m.incus.GetContainerIP(ctx, p.Name)
+	// 6. Health gate. A resumed instance is inspected without touching its network.
+	var ip string
+	if exists {
+		ip, err = m.incus.ContainerIPv4(ctx, p.Name, 30*time.Second)
+	} else {
+		ip, err = m.incus.GetContainerIP(ctx, p.Name)
+	}
 	if err != nil {
 		return "", fmt.Errorf("get container IP: %w", err)
 	}
-
 	if p.Template.HealthCheck.Path != "" {
-		if err := m.incus.HealthGate(ctx, ip, p.Template.HealthCheck); err != nil {
+		if err := m.healthGate(ctx, ip, p.Template.HealthCheck); err != nil {
 			return "", fmt.Errorf("instance health gate failed: %w", err)
 		}
 	}
 
-	// 7. Publish Caddy Route
+	// 7. Publish Caddy Route (a no-op when the published route is already right)
 	domain := p.Domain
 	if domain == "" && p.Template.RoutingPattern != "" {
 		domain = strings.ReplaceAll(p.Template.RoutingPattern, "{slug}", p.Slug)
@@ -130,12 +172,22 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 			Domain:       domain,
 			UpstreamPort: port,
 		}
-		if err := m.caddy.PublishSite(ctx, p.Name, routing, ip); err != nil {
+		ips, err := m.incus.GlobalIPv4s(ctx, p.Name)
+		if err != nil {
+			return "", err
+		}
+		candidates := []string{ip}
+		for _, other := range ips {
+			if other != ip {
+				candidates = append(candidates, other)
+			}
+		}
+		if err := m.caddy.PublishSiteFor(ctx, p.Name, routing, candidates); err != nil {
 			return "", fmt.Errorf("publish caddy site: %w", err)
 		}
 	}
 
-	log.Printf("==> [Instance] Successfully launched instance %s at %s\n", p.Name, ip)
+	log.Printf("==> [Instance] Instance %s is up at %s\n", p.Name, ip)
 	return ip, nil
 }
 
@@ -307,16 +359,26 @@ func (m *InstanceManager) Resize(ctx context.Context, name string, limits map[st
 	return m.incus.ResizeLimits(ctx, name, limits)
 }
 
-// Destroy tears down an instance, removes its Caddy route, and optionally purges its data volume.
+// Destroy tears down an instance, removes its Caddy route, and optionally
+// purges its data volume. Destroying something that is already gone succeeds.
 func (m *InstanceManager) Destroy(ctx context.Context, name string, purgeVolume bool) error {
+	if !incus.ValidName(name) {
+		return fmt.Errorf("invalid instance name %q", name)
+	}
 	log.Printf("==> [Instance] Destroying instance: %s\n", name)
-	_ = m.caddy.RemoveSite(ctx, name)
+	if err := m.caddy.RemoveSite(ctx, name); err != nil {
+		log.Printf("    WARNING: could not remove the Caddy route for %s: %v\n", name, err)
+	}
 	if err := m.incus.StopAndDeleteContainer(ctx, name); err != nil {
 		return fmt.Errorf("delete container: %w", err)
 	}
 	if purgeVolume {
 		volName := name + "-data"
-		_, _ = m.exec.Run(ctx, fmt.Sprintf("incus storage volume delete default %s", volName))
+		if _, err := m.exec.Run(ctx, fmt.Sprintf("incus storage volume show default %s", incus.ShQuote(volName))); err == nil {
+			if _, err := m.exec.Run(ctx, fmt.Sprintf("incus storage volume delete default %s", incus.ShQuote(volName))); err != nil {
+				return fmt.Errorf("purge volume %s: %w", volName, err)
+			}
+		}
 	}
 	return nil
 }
