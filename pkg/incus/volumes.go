@@ -12,7 +12,7 @@ func (c *Client) CreateVolumeSnapshot(ctx context.Context, pool, volume, snapsho
 	if pool == "" {
 		pool = "default"
 	}
-	_, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume snapshot create %s %s %s", pool, volume, snapshot))
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume snapshot create %s %s %s", ShQuote(pool), ShQuote(volume), ShQuote(snapshot)))
 	if err != nil {
 		return fmt.Errorf("snapshot %s/%s@%s: %w", pool, volume, snapshot, err)
 	}

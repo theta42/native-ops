@@ -81,7 +81,7 @@ Commands:
   instance update  Immutable container update for an instance
   instance resize  Live CPU/memory cgroup resizing
   instance destroy Delete an instance and its Caddy route
-  instance migrate Move instance and volume across Incus remotes
+  instance migrate Move an instance and its volumes across Incus remotes (--finalize removes the source)
   dns sync         Sync DNS records using configured provider or python plugin
   version          Print version information
 ```
@@ -91,12 +91,18 @@ Commands:
 #### 1. Provision a Cloud Host (DigitalOcean)
 ```bash
 export DO_API_TOKEN="dop_v1_..."
+export SSH_PRIVATE_KEY="$(cat ~/.ssh/id_ed25519)"   # or FLEET_SSH_KEY, or have ~/.ssh/id_ed25519
 native-ops host create \
   --provider digitalocean \
   --name node-01 \
   --size s-4vcpu-8gb \
   --region nyc1
 ```
+The public half of that key is registered with your DigitalOcean account and authorized on
+the new host, so `ssh root@<ip>` works. This is required: a droplet created with no key comes up
+with a random, already-expired root password and cannot be logged in to at all. `host create`
+therefore **refuses to run without a configured key** (it will not invent a throwaway one that
+is lost when the command exits), and stops before creating anything if the key can't be registered.
 
 #### 2. Provision a Proxmox VE KVM Host
 ```bash
@@ -123,14 +129,79 @@ native-ops instance launch \
   --domain bistro.example.com
 ```
 
-#### 5. Cross-Host Workload Migration
+#### 5. Immutable Instance Update (safe for CI)
 ```bash
-native-ops instance migrate \
-  --source node-01 \
-  --target pve-worker-01 \
+native-ops instance update \
   --name rest-bistro \
-  --volume rest-bistro-data
+  --image "app-platform:v1.4.0" \
+  --service platform \
+  --health-path /health --health-port 8787
 ```
+Only the image changes. Before anything is deleted, `native-ops` reads the running
+container's profiles, local config (`limits.*`, ...), devices (data volumes) and
+`/etc/default/<service>` environment file, then snapshots every attached custom
+volume — **a failed snapshot aborts the update with nothing changed** (`--no-snapshot`
+is an explicit opt-out). The replacement is launched from the new image, gets the same
+configuration and the env file back byte-for-byte, and — when `--health-path` is given —
+must pass its health check. If it does not, the previous image is relaunched with the
+same configuration and the command exits non-zero, so a bad release fails the CI job
+visibly instead of leaving the instance down. Image aliases (`app:v1.4.0`) are resolved
+to a fingerprint; an alias that isn't present locally is an error rather than being
+pulled from a public registry.
+
+A replaced container gets a new DHCP address, so if the instance has a published Caddy route
+(`/etc/caddy/sites/<name>.caddy` on the edge), `update` points it at the new address before
+reporting success — on a rollback too — rewriting only the upstream address and validating the
+Caddy config before the reload. An instance with no route is not touched at the edge, and if
+the route can't be repointed the command fails saying so.
+
+**Addressing.** Containers get their address from the bridge's DHCP. native-ops no longer pushes
+a hash-derived static address, a default route or a rewritten `resolv.conf` into containers
+(that left them with two addresses, could collide between services, was lost on restart and
+hardcoded the subnet). A container that gets no address is reported with a hint to check that
+DHCP is allowed on the bridge in the host firewall (the `reconcile` bootstrap does this).
+
+#### 6. Cross-Host Workload Migration (safe for CI)
+`--source` and `--target` are Incus remotes (`incus remote list`) configured where
+`native-ops` runs. The two hosts must be able to reach each other (the copy is pushed
+host-to-host), e.g. over a WireGuard link between providers.
+```bash
+# 1. move it: the source is stopped, never deleted
+native-ops instance migrate \
+  --source node-01 --target pve-worker-01 --name rest-bistro \
+  --health-path /health --health-port 8787
+
+# 2. repoint DNS / edge routing at the target, watch it, then delete the source
+native-ops instance migrate \
+  --source node-01 --target pve-worker-01 --name rest-bistro \
+  --health-path /health --health-port 8787 --finalize
+```
+The volumes to move are read from the instance's own disk devices (`--volume` is only a
+typo guard), and an instance that mounts a host path is refused because a copy would leave
+that data behind. Order of operations:
+
+1. **Preflight (read-only):** both remotes reachable, and nothing on the target that would be
+   overwritten. An existing copy on the target is an error unless `--resume` is given, and a
+   *running* one is always refused.
+2. **Snapshot** the source volumes (`pre-migrate-*`); a failed snapshot aborts with nothing
+   changed (`--no-snapshot` is an explicit opt-out).
+3. **Warm copy** while the source keeps serving, so downtime only covers what changed since.
+   Snapshots are not copied (`--volume-only`, `--instance-only`).
+4. **Stop the source and verify it is stopped** — a running database is never copied.
+5. **Final incremental copy, start the target,** and (with `--health-path`) check it from
+   *inside* the container, so it works whichever host or network the container is on.
+
+If any step after the stop fails, the target is stopped and the **source is started again**,
+and the command exits non-zero. `migrate` never deletes anything. `--finalize` deletes the
+stopped source instance only after re-checking that the source is stopped, the target is
+running and healthy, and the target holds every data volume; the source's data volumes are
+kept unless `--purge-source-volumes` is given.
+
+**Rolling back** after cutover: run the migration the other way with `--resume`
+(`--source pve-worker-01 --target node-01 --resume`); the target's changes are copied back
+incrementally, so writes made after the cutover are not lost.
+
+Moving DNS / edge routing between the two steps is not automated yet.
 
 ---
 
@@ -200,6 +271,45 @@ healthcheck:
   port: 8787
 routing_pattern: "{slug}.example.com"
 ```
+
+---
+
+## Re-running is safe (idempotency)
+
+Every command is meant to be run again by CI: a second run against an unchanged
+fleet changes nothing, and a run that was interrupted can simply be repeated.
+
+| Command | Running it again |
+|---|---|
+| `apply` | Converges each service. A service that already matches its manifest is **left alone** (no restart, snapshot, or Caddy reload). Only what drifted is fixed: changed `limits` and a missing volume are applied live, changed `env` values are merged and the service restarted, a moved image is replaced through the safe update path (below). |
+| `instance launch` | Resumes its own half-finished launch (the instance carries `user.native-ops.template`); a complete instance is a no-op; an instance of that name from a different origin is refused, never adopted. |
+| `instance update` | No-op when the instance already runs the requested image (`--force` overrides). |
+| `instance migrate` | Resumable with `--resume`; `--finalize` succeeds as a no-op once the source is gone. |
+| `instance destroy`, DNS sync, edge publish/remove | No-ops when there is nothing to change. |
+
+What "converge" means in detail:
+
+- **Image change detection.** A local image alias is compared by fingerprint, so
+  re-pointing `app:latest` triggers a replace. An OCI reference (`postgres:16`) is
+  compared by the reference string recorded on the instance (`user.native-ops.image`), so
+  **pin your tags**: `postgres:16` is not re-pulled, `postgres:17` replaces. An existing
+  container with no recorded reference is *adopted* (recorded, not restarted).
+- **Environment.** Keys declared in the manifest are set; keys that are *not* declared are
+  preserved, because another system (e.g. a fleet manager) may have written runtime secrets
+  into the file. The file is only rewritten (and the service restarted) when a declared value
+  differs, and its keys are always written in sorted order.
+- **Hooks** (`pre_deploy`, `container_init`, `post_deploy`) run only when a service is
+  actually (re)deployed, not on every apply. Profile drift is reported, not changed.
+- **DNS** sync only creates and updates records, matched by type, name *and* value, so
+  multi-value sets (MX, TXT, round-robin A) work; it never deletes a record it wasn't told about.
+- **Caddy edge.** An existing Caddyfile is never overwritten (one that doesn't `import
+  /etc/caddy/sites/*.caddy` is an error, because published sites would never be served). A
+  missing one is created with an ACME contact only if `NATIVE_OPS_ACME_EMAIL` is set. A site
+  file with identical content is not rewritten and Caddy isn't reloaded; a new one is validated
+  first and rolled back if Caddy rejects it; a failed reload is an error.
+- **Hosts.** `reconcile` finds a host by name at any status (a droplet still provisioning is
+  waited for, not duplicated) and **never destroys or rebuilds a host on its own**: if a host
+  exists but SSH fails, it stops and tells you why.
 
 ---
 

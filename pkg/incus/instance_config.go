@@ -28,7 +28,10 @@ func (c *Client) ListInstances(ctx context.Context) ([]InstanceInfo, error) {
 
 // SetInstanceConfig sets one instance config key (e.g. user.preview.expires).
 func (c *Client) SetInstanceConfig(ctx context.Context, name, key, value string) error {
-	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus config set %s %s %q", name, key, value)); err != nil {
+	if !ValidName(name) {
+		return fmt.Errorf("invalid instance name %q", name)
+	}
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus config set %s %s", ShQuote(name), ShQuote(key+"="+value))); err != nil {
 		return fmt.Errorf("set config %s %s: %w", name, key, err)
 	}
 	return nil

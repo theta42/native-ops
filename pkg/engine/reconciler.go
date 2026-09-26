@@ -129,7 +129,12 @@ func GenerateSSHKeypair() ([]byte, string, error) {
 	return privPEM, pubKeyStr, nil
 }
 
-func getSSHCredentials() ([]byte, string) {
+// LoadSSHCredentials returns the operator's SSH private key and its public
+// half: $SSH_PRIVATE_KEY, $FLEET_SSH_KEY, or ~/.ssh/id_ed25519 / id_rsa. If none
+// is configured a throwaway ed25519 pair is generated and generated is true; its
+// private half exists only in this process, so a host that only trusts it can
+// never be logged in to again by anyone.
+func LoadSSHCredentials() (priv []byte, pub string, generated bool) {
 	var privKeyPEM []byte
 	if keyEnv := os.Getenv("SSH_PRIVATE_KEY"); keyEnv != "" {
 		privKeyPEM = []byte(keyEnv)
@@ -150,23 +155,21 @@ func getSSHCredentials() ([]byte, string) {
 		}
 	}
 
-	var pubKeyStr string
 	if len(privKeyPEM) > 0 {
 		signer, err := ssh.ParsePrivateKey(privKeyPEM)
 		if err == nil {
-			pubKeyStr = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
-			return privKeyPEM, pubKeyStr
+			return privKeyPEM, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))), false
 		}
 	}
 
-	// Auto-generate fresh Ed25519 keypair if none configured
+	// Auto-generate a fresh Ed25519 keypair if none configured
 	privPEM, pubStr, err := GenerateSSHKeypair()
 	if err == nil {
-		log.Printf("==> [GitOps] No existing SSH key found. Automatically generated fresh Ed25519 keypair for fleet.\n")
-		return privPEM, pubStr
+		log.Printf("==> [GitOps] No usable SSH key found. Generated a throwaway Ed25519 keypair for this run only.\n")
+		return privPEM, pubStr, true
 	}
 
-	return nil, ""
+	return nil, "", false
 }
 
 func waitForSSH(ctx context.Context, host string, port int, timeout time.Duration) error {
@@ -198,7 +201,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("load fleet config: %w", err)
 	}
 
-	privKeyPEM, pubKeyStr := getSSHCredentials()
+	privKeyPEM, pubKeyStr, generatedKey := LoadSSHCredentials()
 	var primaryHostIP string
 	var hostSSHUser string = "root"
 	var hostSSHPort int = 22
@@ -225,20 +228,29 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("digitalocean provider init: %w", err)
 			}
-			var existingHostID string
 			hosts, err := do.ListHosts(ctx)
-			if err == nil {
-				for _, h := range hosts {
-					if h.Name == hostName && h.Status == "active" {
-						primaryHostIP = h.PublicIP
-						existingHostID = h.ID
-						log.Printf("    Host %s already active at IP %s\n", hostName, primaryHostIP)
-						break
-					}
+			if err != nil {
+				return fmt.Errorf("list hosts: %w", err)
+			}
+			existing, action, err := classifyHost(hosts, hostName)
+			if err != nil {
+				return err
+			}
+			switch action {
+			case hostUse:
+				primaryHostIP = existing.PublicIP
+				log.Printf("    Host %s already active at IP %s\n", hostName, primaryHostIP)
+			case hostWait:
+				log.Printf("    Host %s (id %s) is still provisioning; waiting for it instead of creating another\n", hostName, existing.ID)
+				h, err := waitHostActive(ctx, do, existing.ID, 5*time.Minute, 5*time.Second)
+				if err != nil {
+					return err
 				}
+				primaryHostIP = h.PublicIP
 			}
 
-			// If host exists, verify SSH authentication and command execution
+			// A host that exists must be reachable with our credentials. If it is not,
+			// stop and say so: reconcile never destroys or rebuilds a host on its own.
 			if primaryHostIP != "" && len(privKeyPEM) > 0 {
 				testExec, testErr := remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
 				if testErr == nil {
@@ -248,29 +260,23 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					testExec.Close()
 				}
 				if testErr != nil {
-					log.Printf("    Host %s (%s) exists but SSH verification failed (%v). Re-provisioning with registered SSH key...\n", hostName, primaryHostIP, testErr)
-					_ = r.hostMgr.DestroyHost(ctx, hostCfg.Provider, existingHostID)
-					primaryHostIP = ""
+					return fmt.Errorf("host %s (%s) exists but SSH verification failed: %v. Not destroying or re-provisioning it automatically (it may hold data): fix the SSH key or user, or remove the host yourself if you want it rebuilt", hostName, primaryHostIP, testErr)
 				}
 			}
 
-			// If not found (or destroyed due to stale auth), provision new host
+			// Not found: provision it
 			if primaryHostIP == "" {
-				log.Printf("    Host %s not active. Provisioning with cloud-init...\n", hostName)
-				var sshKeyFingerprints []string
-				if pubKeyStr != "" {
-					fp, err := do.EnsureSSHKey(ctx, hostName+"-key", pubKeyStr)
-					if err == nil && fp != "" {
-						sshKeyFingerprints = append(sshKeyFingerprints, fp)
-					}
-				}
+				log.Printf("    Host %s not found. Provisioning with cloud-init...\n", hostName)
 				spec := config.HostSpec{
-					Name:        hostName,
-					Provider:    "digitalocean",
-					Size:        fleet.Providers.DigitalOcean.DefaultSize,
-					Region:      fleet.Providers.DigitalOcean.Region,
-					UserData:    GenerateCloudInitUserData(pubKeyStr),
-					SSHKeyNames: sshKeyFingerprints,
+					Name:     hostName,
+					Provider: "digitalocean",
+					Size:     fleet.Providers.DigitalOcean.DefaultSize,
+					Region:   fleet.Providers.DigitalOcean.Region,
+				}
+				// A throwaway key is acceptable here: this run uses it to SSH in. But a failure to
+				// register the key must stop the run BEFORE a droplet nobody can log in to is created.
+				if err := r.hostMgr.PrepareAccess(ctx, &spec, pubKeyStr, generatedKey, true); err != nil {
+					return fmt.Errorf("provision host %s: %w", hostName, err)
 				}
 				newHost, err := r.hostMgr.CreateHost(ctx, spec)
 				if err != nil {
@@ -281,14 +287,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 	}
 
-	// 2. Sync DNS
+	// 2. Sync DNS. A failure is remembered and returned at the end: services can
+	// still be deployed, but the run must not report success with stale DNS.
+	var dnsErr error
 	if primaryHostIP != "" && fleet.Domain != "" {
 		log.Printf("==> [GitOps] Syncing DNS records for %s -> %s\n", fleet.Domain, primaryHostIP)
-		records := []provider.DNSRecord{
-			{Type: "A", Name: "@", Value: primaryHostIP},
-			{Type: "A", Name: "*", Value: primaryHostIP},
-		}
-
 		var dnsProv provider.DNSProvider
 		if fleet.DNSProvider == "digitalocean" || fleet.DNSProvider == "do" {
 			do, err := digitalocean.New("")
@@ -303,9 +306,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}
 			dnsProv = p
 		}
-
-		if err := dnsProv.SyncRecords(ctx, fleet.Domain, records); err != nil {
-			log.Printf("    Warning: DNS sync had issue: %v\n", err)
+		if dnsErr = syncDNS(ctx, dnsProv, fleet.Domain, primaryHostIP); dnsErr != nil {
+			log.Printf("    DNS sync failed: %v (continuing with services; the run will fail at the end)\n", dnsErr)
 		} else {
 			log.Printf("    DNS synchronized successfully.\n")
 		}
@@ -340,27 +342,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 		// Pre-flight host initialization
 		log.Printf("==> [GitOps] Verifying host runtime on %s...\n", primaryHostIP)
-		_, _ = sshExec.Run(ctx, "chage -I -1 -m 0 -M 99999 -E -1 root || true")
-		_, _ = sshExec.Run(ctx, "passwd -d root || true")
-		_, _ = sshExec.Run(ctx, "which cloud-init >/dev/null 2>&1 && cloud-init status --wait || true")
-		_, _ = sshExec.Run(ctx, "which incus >/dev/null 2>&1 || (apt-get update && apt-get install -y incus)")
-		_, _ = sshExec.Run(ctx, "incus profile show default >/dev/null 2>&1 || incus admin init --auto")
-		_, _ = sshExec.Run(ctx, "incus storage list | grep -q default || incus storage create default dir || true")
-		_, _ = sshExec.Run(ctx, "incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true")
-		_, _ = sshExec.Run(ctx, "sysctl -w net.ipv4.ip_forward=1 || true")
-		_, _ = sshExec.Run(ctx, "iptables -t nat -C POSTROUTING -s 10.0.100.0/24 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.0.100.0/24 -j MASQUERADE || true")
-		_, _ = sshExec.Run(ctx, "iptables -I FORWARD -i incusbr0 -j ACCEPT 2>/dev/null || true")
-		_, _ = sshExec.Run(ctx, "iptables -I FORWARD -o incusbr0 -j ACCEPT 2>/dev/null || true")
-		_, _ = sshExec.Run(ctx, "iptables -I INPUT -i incusbr0 -j ACCEPT 2>/dev/null || true")
-		_, _ = sshExec.Run(ctx, "which ufw >/dev/null 2>&1 && (ufw allow in on incusbr0; ufw route allow in on incusbr0; ufw route allow out on incusbr0) || true")
-		_, _ = sshExec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 || true")
-		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv4.address 10.0.100.1/24 || true")
-		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv4.nat true || true")
-		_, _ = sshExec.Run(ctx, "incus network set incusbr0 ipv6.address none || true")
-		_, _ = sshExec.Run(ctx, "incus network set incusbr0 dns.mode managed || true")
-		_, _ = sshExec.Run(ctx, "incus network set incusbr0 raw.dnsmasq 'server=1.1.1.1' || true")
-		_, _ = sshExec.Run(ctx, "incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true")
-		_, _ = sshExec.Run(ctx, "incus remote list | grep -q ' docker ' || incus remote add docker https://docker.io --protocol=oci --public || true")
+		for _, cmd := range hostBootstrapCommands() {
+			_, _ = sshExec.Run(ctx, cmd)
+		}
 
 		diag, _ := sshExec.Run(ctx, "echo '--- NETWORK ---'; incus network show incusbr0; echo '--- DEFAULT PROFILE ---'; incus profile show default; echo '--- STORAGE ---'; incus storage list")
 		log.Printf("==> [GitOps] Host runtime diagnostics:\n%s\n", diag)
@@ -412,6 +396,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		log.Printf("==> [GitOps] Edge container diagnostics:\n%s\n", diagEdge)
 	}
 
+	if dnsErr != nil {
+		return fmt.Errorf("services reconciled, but DNS sync failed: %w", dnsErr)
+	}
 	log.Printf("==> [GitOps] Full fleet reconciliation completed successfully!\n")
 	return nil
 }

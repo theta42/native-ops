@@ -74,6 +74,60 @@ runcmd:
 	return sb.String()
 }
 
+// sshKeyRegistrar is the part of a provider that can register a public key with the account.
+type sshKeyRegistrar interface {
+	EnsureSSHKey(ctx context.Context, name, pubKey string) (string, error)
+}
+
+// prepareAccess gives a new host a way in: the operator's public key is
+// registered with the provider, attached to the host, and authorized by the
+// cloud-init. Without it a DigitalOcean droplet comes up with a random,
+// already-expired root password and cannot be logged in to at all. Any failure
+// returns an error before anything is created, and spec is only modified on success.
+// A throwaway (generated) key is refused unless allowGenerated: a host that
+// trusts only a key nobody holds is unreachable for good.
+func prepareAccess(ctx context.Context, reg sshKeyRegistrar, spec *config.HostSpec, pubKey string, generated, allowGenerated bool) error {
+	if strings.TrimSpace(pubKey) == "" {
+		return fmt.Errorf("no SSH public key available for the new host")
+	}
+	if generated && !allowGenerated {
+		return fmt.Errorf("no SSH key is configured, so the host would be created trusting a throwaway key that is discarded when this command exits and could never be logged in to: set SSH_PRIVATE_KEY (or FLEET_SSH_KEY) to the private key you will use, or put one at ~/.ssh/id_ed25519")
+	}
+	fp, err := reg.EnsureSSHKey(ctx, spec.Name+"-key", pubKey)
+	if err != nil {
+		return fmt.Errorf("register the SSH key with the provider (a host created without one cannot be logged in to): %w", err)
+	}
+	if fp == "" {
+		return fmt.Errorf("the provider returned no fingerprint for the SSH key; not creating a host nobody can log in to")
+	}
+	keys := spec.SSHKeyNames
+	found := false
+	for _, k := range keys {
+		found = found || k == fp
+	}
+	if !found {
+		keys = append(append([]string{}, keys...), fp)
+	}
+	spec.SSHKeyNames = keys
+	if spec.UserData == "" {
+		spec.UserData = GenerateCloudInitUserData(pubKey)
+	}
+	return nil
+}
+
+// PrepareAccess makes a host spec reachable before it is created (see
+// prepareAccess). It only acts for DigitalOcean; other providers are left as they are.
+func (h *HostManager) PrepareAccess(ctx context.Context, spec *config.HostSpec, pubKey string, generated, allowGenerated bool) error {
+	switch spec.Provider {
+	case "digitalocean", "do":
+		if h.doClient == nil {
+			return fmt.Errorf("DigitalOcean provider not initialized (set DO_API_TOKEN)")
+		}
+		return prepareAccess(ctx, h.doClient, spec, pubKey, generated, allowGenerated)
+	}
+	return nil
+}
+
 func (h *HostManager) CreateHost(ctx context.Context, spec config.HostSpec) (*provider.Host, error) {
 	log.Printf("==> [Host] Provisioning %s host: %s (size=%s)\n", spec.Provider, spec.Name, spec.Size)
 

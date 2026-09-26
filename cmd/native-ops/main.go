@@ -87,7 +87,7 @@ Core Commands:
   instance update  Immutable container update for an instance
   instance resize  Live CPU/memory cgroup resizing
   instance destroy Delete an instance and its Caddy route
-  instance migrate Move instance and volume across Incus remotes
+  instance migrate Move an instance and its volumes across Incus remotes (--finalize removes the source)
   backup init      Create the destination bucket if it does not exist
   backup create    Back up one custom volume to S3-compatible object storage
   backup all       Back up every (allowlisted) custom volume
@@ -167,11 +167,19 @@ func handleHostCommand(ctx context.Context, args []string) {
 			Region:   *region,
 		}
 
+		// Register the operator's SSH key first, so the host can be logged in to. A key
+		// generated on the fly is refused: it would be lost when this command exits.
+		_, pub, generated := engine.LoadSSHCredentials()
+		if err := hm.PrepareAccess(ctx, &spec, pub, generated, false); err != nil {
+			log.Fatalf("Host creation failed: %v", err)
+		}
+
 		host, err := hm.CreateHost(ctx, spec)
 		if err != nil {
 			log.Fatalf("Host creation failed: %v", err)
 		}
 		fmt.Printf("Created host %s (%s) at IP: %s\n", host.Name, host.ID, host.PublicIP)
+		fmt.Printf("Log in with the private key whose public half was registered: ssh root@%s\n", host.PublicIP)
 
 	case "destroy":
 		providerName := flags.String("provider", "digitalocean", "Provider (digitalocean, proxmox)")
@@ -282,15 +290,27 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 
 	case "update":
 		name := flags.String("name", "", "Instance container name")
-		image := flags.String("image", "", "New image ref or fingerprint")
-		service := flags.String("service", "platform", "Service name inside container")
+		image := flags.String("image", "", "New image alias or fingerprint (e.g. my-app:v2)")
+		service := flags.String("service", "platform", "systemd unit whose /etc/default/<service> env file is carried over")
+		healthPath := flags.String("health-path", "", "HTTP path to gate the update on (enables automatic rollback)")
+		healthPort := flags.Int("health-port", 0, "Port for --health-path")
+		healthTimeout := flags.Int("health-timeout", 60, "Seconds to wait for the health check")
+		noSnapshot := flags.Bool("no-snapshot", false, "Skip the pre-update volume snapshot (not recommended)")
+		force := flags.Bool("force", false, "Replace the instance even if it already runs the requested image")
 		_ = flags.Parse(args[1:])
 
 		if *name == "" || *image == "" {
 			log.Fatal("Error: --name and --image are required")
 		}
+		if *healthPath != "" && *healthPort <= 0 {
+			log.Fatal("Error: --health-port is required with --health-path")
+		}
 
-		if err := mgr.Update(ctx, *name, *image, *service); err != nil {
+		opts := engine.UpdateOptions{Service: *service, SkipSnapshot: *noSnapshot, Force: *force}
+		if *healthPath != "" {
+			opts.HealthCheck = config.HealthCheckConfig{Path: *healthPath, Port: *healthPort, Timeout: *healthTimeout}
+		}
+		if err := mgr.Update(ctx, *name, *image, opts); err != nil {
 			log.Fatalf("Update failed: %v", err)
 		}
 		fmt.Printf("Instance %s updated to %s\n", *name, *image)
@@ -336,23 +356,50 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 		src := flags.String("source", "", "Source Incus remote")
 		dst := flags.String("target", "", "Target Incus remote")
 		name := flags.String("name", "", "Instance name")
-		vol := flags.String("volume", "", "Storage volume name")
+		vol := flags.String("volume", "", "Optional: a storage volume name to cross-check against the instance's attached volumes")
+		healthPath := flags.String("health-path", "", "HTTP path probed from inside the migrated container (e.g. /health); recommended")
+		healthPort := flags.Int("health-port", 80, "Health check port inside the container")
+		healthTimeout := flags.Int("health-timeout", 60, "Health check timeout in seconds")
+		resume := flags.Bool("resume", false, "Allow an existing stopped copy on the target (interrupted run, or rollback by swapping --source/--target)")
+		noSnapshot := flags.Bool("no-snapshot", false, "Skip the pre-migrate snapshot of the source volumes")
+		stopTimeout := flags.Int("stop-timeout", 30, "Seconds to wait for the source to stop cleanly")
+		finalize := flags.Bool("finalize", false, "Delete the stopped source instance once the target is verified")
+		purge := flags.Bool("purge-source-volumes", false, "With --finalize: also delete the source's data volumes")
 		_ = flags.Parse(args[1:])
 
 		if *src == "" || *dst == "" || *name == "" {
 			log.Fatal("Error: --source, --target, and --name are required")
 		}
 
+		var hc config.HealthCheckConfig
+		if *healthPath != "" {
+			hc = config.HealthCheckConfig{Path: *healthPath, Port: *healthPort, Timeout: *healthTimeout}
+		}
+
 		mig := engine.NewMigrationManager(exec)
+		if *finalize {
+			if err := mig.Finalize(ctx, engine.FinalizeParams{
+				SourceRemote: *src, TargetRemote: *dst, InstanceName: *name,
+				HealthCheck: hc, PurgeSourceVolumes: *purge,
+			}); err != nil {
+				log.Fatalf("Finalize failed: %v", err)
+			}
+			fmt.Printf("Instance %s removed from %s (now running on %s).\n", *name, *src, *dst)
+			return
+		}
 		if err := mig.Migrate(ctx, engine.MigrationParams{
 			SourceRemote: *src,
 			TargetRemote: *dst,
 			InstanceName: *name,
 			VolumeName:   *vol,
+			HealthCheck:  hc,
+			Resume:       *resume,
+			SkipSnapshot: *noSnapshot,
+			StopTimeout:  *stopTimeout,
 		}); err != nil {
 			log.Fatalf("Migration failed: %v", err)
 		}
-		fmt.Printf("Instance %s migrated from %s to %s\n", *name, *src, *dst)
+		fmt.Printf("Instance %s is running on %s; %s on %s is stopped and intact. Repoint DNS/edge, then run with --finalize.\n", *name, *dst, *name, *src)
 	}
 }
 
