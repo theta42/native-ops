@@ -89,7 +89,7 @@ func TestPublishSiteCreatesTheBaseCaddyfileWithoutAHardcodedEmail(t *testing.T) 
 		t.Fatal(err)
 	}
 	cf := sim.files["/etc/caddy/Caddyfile"]
-	if strings.Contains(cf, "email") || strings.Contains(cf, "wmantly") || !strings.Contains(cf, "import /etc/caddy/sites/*.caddy") {
+	if strings.Contains(cf, "email") || strings.Contains(cf, "@") || !strings.Contains(cf, "import /etc/caddy/sites/*.caddy") {
 		t.Fatalf("unexpected base Caddyfile:\n%s", cf)
 	}
 	if !strings.Contains(sim.files["/etc/caddy/sites/gitea.caddy"], "reverse_proxy 10.0.100.21:3000") || sim.reloads != 1 {
