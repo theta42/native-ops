@@ -152,6 +152,22 @@ func (m *MigrationManager) Migrate(ctx context.Context, p MigrationParams) error
 		}
 	}
 
+	// The copy keeps the instance's profile list; a profile that is missing on the
+	// target would only fail the copy later, after the volume has been transferred.
+	have, err := m.incus.ProfileNames(ctx, dst)
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for _, pr := range st.Profiles {
+		if !have[pr] {
+			missing = append(missing, pr)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s uses profile(s) %s, which do not exist on %s; create them there first (nothing was changed)", name, strings.Join(missing, ", "), dst)
+	}
+
 	dstInstExists := false
 	if s, exists := dstInst[name]; exists {
 		if !p.Resume {

@@ -97,6 +97,28 @@ func (c *Client) CustomVolumes(ctx context.Context, remote, pool string) (map[st
 	return res, nil
 }
 
+// ProfileNames returns the names of the profiles that exist on a remote.
+func (c *Client) ProfileNames(ctx context.Context, remote string) (map[string]bool, error) {
+	if err := checkRemote(remote); err != nil {
+		return nil, err
+	}
+	out, err := c.exec.Run(ctx, "incus profile list "+ShQuote(remote+":")+" --format json")
+	if err != nil {
+		return nil, fmt.Errorf("list profiles on %s: %w", remote, err)
+	}
+	var list []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return nil, fmt.Errorf("parse profile list of %s: %w", remote, err)
+	}
+	res := make(map[string]bool, len(list))
+	for _, pr := range list {
+		res[pr.Name] = true
+	}
+	return res, nil
+}
+
 // SnapshotVolumeAt snapshots a custom volume on a named remote.
 func (c *Client) SnapshotVolumeAt(ctx context.Context, remote, pool, volume, snapshot string) error {
 	if err := checkRemote(remote); err != nil {
@@ -182,7 +204,10 @@ func (c *Client) CopyVolume(ctx context.Context, srcRemote, dstRemote, pool, vol
 // CopyInstance copies an instance (config and root filesystem, no snapshots)
 // between remotes in push mode: the source host pushes to the target directly,
 // so the two hosts must be able to reach each other (e.g. over WireGuard).
-// The copy is created stopped. refresh makes it incremental onto an existing copy.
+// The copy is created stopped. --stateless matters: copying a RUNNING container
+// otherwise makes Incus attempt a live (CRIU) migration, which fails on ordinary
+// containers; here the warm pass is a plain file copy and the source is stopped
+// before the final pass. refresh makes it incremental onto an existing copy.
 func (c *Client) CopyInstance(ctx context.Context, srcRemote, dstRemote, name string, refresh bool) error {
 	if err := checkRemote(srcRemote); err != nil {
 		return err
@@ -190,7 +215,7 @@ func (c *Client) CopyInstance(ctx context.Context, srcRemote, dstRemote, name st
 	if err := checkRemote(dstRemote); err != nil {
 		return err
 	}
-	cmd := fmt.Sprintf("incus copy %s %s --mode=push --instance-only",
+	cmd := fmt.Sprintf("incus copy %s %s --mode=push --instance-only --stateless",
 		ShQuote(Ref(srcRemote, name)), ShQuote(Ref(dstRemote, name)))
 	if refresh {
 		cmd += " --refresh"
@@ -203,9 +228,15 @@ func (c *Client) CopyInstance(ctx context.Context, srcRemote, dstRemote, name st
 
 // probeScript runs inside the container: curl or wget, whichever exists, and
 // a distinct message + exit 127 when neither does, so that is never retried.
+//
+// The message is assembled by printf on purpose: executors put the command line
+// into their error text, so a literal message in the script would make every
+// failed probe look like "no client" and skip the retries.
+const noClientMessage = "no curl or wget in the container"
+
 const probeScript = `if command -v curl >/dev/null 2>&1; then curl -fsS -o /dev/null --max-time 3 "$1"; ` +
 	`elif command -v wget >/dev/null 2>&1; then wget -q -O /dev/null -T 3 "$1"; ` +
-	`else echo "no curl or wget in the container" >&2; exit 127; fi`
+	`else printf 'no curl or %s in the container\n' wget >&2; exit 127; fi`
 
 // ProbeHTTPInContainer makes one HTTP request to 127.0.0.1 from inside the
 // container, so it works no matter which host or network the container is on.
@@ -244,7 +275,7 @@ func (c *Client) WaitHTTPInContainer(ctx context.Context, remote, name string, h
 		if err == nil {
 			return nil
 		}
-		if strings.Contains(err.Error(), "no curl or wget") {
+		if strings.Contains(err.Error(), noClientMessage) {
 			return fmt.Errorf("cannot health check %s: %w", Ref(remote, name), err)
 		}
 		if time.Now().After(deadline) {

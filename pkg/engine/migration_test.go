@@ -39,9 +39,10 @@ type migSim struct {
 	cmds    []string
 	snaps   []string
 
-	configYAML      string                 // overrides the source `config show` output
-	hook            func(cmd string) error // called first; a non-nil error fails the command
-	stopErrButStops bool                   // `incus stop` reports an error but the instance did stop
+	profiles        map[string]map[string]bool // remote -> profile names (defaults to default/base/service everywhere)
+	configYAML      string                     // overrides the source `config show` output
+	hook            func(cmd string) error     // called first; a non-nil error fails the command
+	stopErrButStops bool                       // `incus stop` reports an error but the instance did stop
 }
 
 var _ remote.Executor = (*migSim)(nil)
@@ -86,6 +87,21 @@ func (s *migSim) Run(_ context.Context, cmd string) (string, error) {
 		rows := []row{{"rest-x-data", "image"}} // must be ignored: not a custom volume
 		for v := range s.volumes[r] {
 			rows = append(rows, row{v, "custom"})
+		}
+		b, _ := json.Marshal(rows)
+		return string(b), nil
+	case strings.HasPrefix(cmd, "incus profile list "):
+		r := strings.TrimSuffix(q[0], ":")
+		names := map[string]bool{"default": true, "base": true, "service": true}
+		if s.profiles != nil && s.profiles[r] != nil {
+			names = s.profiles[r]
+		}
+		type row struct {
+			Name string `json:"name"`
+		}
+		var rows []row
+		for n := range names {
+			rows = append(rows, row{n})
 		}
 		b, _ := json.Marshal(rows)
 		return string(b), nil
@@ -207,8 +223,8 @@ func TestMigrateHappyPathWarmCopyThenStopThenFinalSync(t *testing.T) {
 		if strings.HasPrefix(c, "incus storage volume copy") && !strings.Contains(c, "--volume-only") {
 			t.Errorf("volume copies must leave snapshots behind: %s", c)
 		}
-		if strings.HasPrefix(c, "incus copy") && (!strings.Contains(c, "--instance-only") || !strings.Contains(c, "--mode=push")) {
-			t.Errorf("instance copies must be push-mode and skip snapshots: %s", c)
+		if strings.HasPrefix(c, "incus copy") && (!strings.Contains(c, "--instance-only") || !strings.Contains(c, "--mode=push") || !strings.Contains(c, "--stateless")) {
+			t.Errorf("instance copies must be push-mode, stateless (no CRIU on a running source) and skip snapshots: %s", c)
 		}
 	}
 	if len(*probes) != 1 || (*probes)[0] != (probeCall{"dst", "rest-x"}) {
@@ -637,5 +653,18 @@ func TestFinalizeStillRefusesWhenTheInstanceIsNowhereRunning(t *testing.T) {
 	err := mm.Finalize(context.Background(), finalizeParams())
 	if err == nil || !strings.Contains(err.Error(), "nothing safe to finalize") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestMigrateRefusesBeforeAnyChangeWhenTheTargetLacksAProfile(t *testing.T) {
+	sim := newSim()
+	sim.profiles = map[string]map[string]bool{"dst": {"default": true}} // like a freshly bootstrapped host
+	mm, _ := newMigMgr(sim, nil)
+	err := mm.Migrate(context.Background(), baseParams())
+	if err == nil || !strings.Contains(err.Error(), "profile(s) base, service") || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("got %v", err)
+	}
+	if sim.mutating() != 0 {
+		t.Fatalf("no snapshot, copy or stop may happen before the profile check passes: %v", sim.cmds)
 	}
 }

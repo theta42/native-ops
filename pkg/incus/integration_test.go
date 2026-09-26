@@ -50,7 +50,7 @@ func TestIntegrationCLIFormsExist(t *testing.T) {
 		{"incus storage volume copy", []string{"--volume-only", "--refresh"}},
 		{"incus storage volume list", []string{"--format"}},
 		{"incus storage volume delete", nil},
-		{"incus copy", []string{"--instance-only", "--mode", "--refresh"}},
+		{"incus copy", []string{"--instance-only", "--mode", "--refresh", "--stateless"}},
 		{"incus file push", []string{"--create-dirs", "--uid", "--gid", "--mode"}},
 		{"incus file pull", nil},
 		{"incus config set", nil},

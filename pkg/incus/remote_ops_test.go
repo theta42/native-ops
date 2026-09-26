@@ -3,6 +3,7 @@ package incus
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -95,8 +96,8 @@ func TestCopyFlags(t *testing.T) {
 	want := []string{
 		"incus storage volume copy 'src:default/v' 'dst:default/v' --volume-only",
 		"incus storage volume copy 'src:default/v' 'dst:default/v' --volume-only --refresh",
-		"incus copy 'src:web' 'dst:web' --mode=push --instance-only",
-		"incus copy 'src:web' 'dst:web' --mode=push --instance-only --refresh",
+		"incus copy 'src:web' 'dst:web' --mode=push --instance-only --stateless",
+		"incus copy 'src:web' 'dst:web' --mode=push --instance-only --stateless --refresh",
 	}
 	for i, w := range want {
 		if ex.cmds[i] != w {
@@ -141,3 +142,36 @@ func TestWaitIsANoOpWithoutAPathAndSucceedsOnFirstOK(t *testing.T) {
 		t.Fatalf("got %v %v", err, ex.cmds)
 	}
 }
+
+// Regression, found on a real host: executors include the command line in their error text, and the probe
+// script used to contain the "no curl or wget" message literally, so every failed probe was mistaken for a
+// missing client and never retried (a service that needs a few seconds to start was rolled back instantly).
+func TestWaitRetriesARealFailureEvenThoughTheErrorQuotesTheProbeScript(t *testing.T) {
+	ex := &fnExec{fn: func(cmd string) (string, error) {
+		return "", fmt.Errorf("command failed: %s (stderr: curl: (7) Failed to connect to 127.0.0.1 port 8787): exit status 7", cmd)
+	}}
+	c := NewClient(ex)
+	err := c.WaitHTTPInContainer(context.Background(), "dst", "rest-x", config.HealthCheckConfig{Path: "/health", Port: 8787, Timeout: 1, Interval: 1})
+	if err == nil || !strings.Contains(err.Error(), "health check failed") || strings.Contains(err.Error(), "cannot health check") {
+		t.Fatalf("a connection failure is a health failure, not a missing client: %v", err)
+	}
+	if len(ex.cmds) < 2 {
+		t.Fatalf("the probe must be retried until the timeout, ran %d time(s)", len(ex.cmds))
+	}
+	if strings.Contains(probeScript, noClientMessage) {
+		t.Fatal("the message must not appear literally in the script")
+	}
+}
+
+type fnExec struct {
+	fn   func(string) (string, error)
+	cmds []string
+}
+
+func (f *fnExec) Run(_ context.Context, cmd string) (string, error) {
+	f.cmds = append(f.cmds, cmd)
+	return f.fn(cmd)
+}
+func (f *fnExec) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
+func (f *fnExec) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
+func (f *fnExec) Close() error                                                    { return nil }
