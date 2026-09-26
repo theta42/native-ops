@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -105,7 +107,7 @@ func TestHealthzAndTheUIAreOpenButNothingElseIs(t *testing.T) {
 	if strings.Contains(body, "web") || strings.Contains(body, "instances") {
 		t.Fatal("healthz must not leak any state")
 	}
-	for _, p := range []string{"/", "/index.html", "/app.js", "/style.css"} {
+	for _, p := range []string{"/", "/index.html", "/static/js/app.js", "/static/css/styles.css", "/static/favicon.svg", "/static-modules/fontawesome-free/webfonts/fa-solid-900.woff2"} {
 		res, _ := f.do(t, "GET", p, "")
 		if res.StatusCode != 200 {
 			t.Errorf("%s = %d", p, res.StatusCode)
@@ -113,6 +115,10 @@ func TestHealthzAndTheUIAreOpenButNothingElseIs(t *testing.T) {
 		csp := res.Header.Get("Content-Security-Policy")
 		if !strings.Contains(csp, "default-src 'none'") || strings.Contains(csp, "unsafe-inline") || res.Header.Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("%s needs a strict CSP and nosniff, got %q", p, csp)
+		}
+		// default-src 'none' blocks fonts too: without this every icon renders as an empty box.
+		if !strings.Contains(csp, "font-src 'self'") {
+			t.Errorf("%s: the CSP must allow the vendored icon font, got %q", p, csp)
 		}
 	}
 	if res, _ := f.do(t, "GET", "/etc/passwd", ""); res.StatusCode != 404 {
@@ -192,7 +198,7 @@ func TestEveryRequestIsAudited(t *testing.T) {
 }
 
 func TestTheUIInsertsDataAsTextNeverHTML(t *testing.T) {
-	js, err := uiFS.ReadFile("ui/app.js")
+	js, err := uiFS.ReadFile("ui/static/js/app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,8 +208,66 @@ func TestTheUIInsertsDataAsTextNeverHTML(t *testing.T) {
 		}
 	}
 	html, _ := uiFS.ReadFile("ui/index.html")
-	if strings.Contains(string(html), "<script>") || strings.Contains(string(html), "onclick=") {
-		t.Error("no inline script: the CSP forbids it")
+	for _, tag := range scriptTag.FindAllString(string(html), -1) {
+		if !strings.Contains(tag, " src=") {
+			t.Errorf("%s is an inline script: the CSP forbids it", tag)
+		}
+	}
+	if strings.Contains(string(html), "onclick=") {
+		t.Error("no inline event handlers: the CSP forbids them")
+	}
+	if strings.Contains(string(html), "<style") || strings.Contains(string(html), " style=") || strings.Contains(string(js), `"style"`) {
+		t.Error("no inline style: the CSP forbids it, and the page would render unstyled")
+	}
+}
+
+var scriptTag = regexp.MustCompile(`<script[^>]*>`)
+
+// The page is only as good as the files it names: every asset index.html loads, and every
+// url() the vendored stylesheets load in turn, must be served by this binary (the CSP
+// allows nothing else) with a type the browser will accept under nosniff.
+func TestEveryAssetThePageNeedsIsServedWithTheRightType(t *testing.T) {
+	f := setup(t, time.Minute, nil)
+	_, page := f.do(t, "GET", "/", "")
+	refs := regexp.MustCompile(`(?:href|src)="(/static[^"]*)"`).FindAllStringSubmatch(page, -1)
+	if len(refs) < 6 {
+		t.Fatalf("expected the page to load its css, js and images, found %v", refs)
+	}
+	want := map[string]string{".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml", ".woff2": "font/woff2"}
+	seen := map[string]bool{}
+	var check func(p string)
+	check = func(p string) {
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		res, body := f.do(t, "GET", p, "")
+		if res.StatusCode != 200 || len(body) == 0 {
+			t.Errorf("%s = %d (%d bytes): the page needs it", p, res.StatusCode, len(body))
+			return
+		}
+		if w, ok := want[path.Ext(p)]; ok && !strings.HasPrefix(res.Header.Get("Content-Type"), w) {
+			t.Errorf("%s served as %q, want %s", p, res.Header.Get("Content-Type"), w)
+		}
+		if path.Ext(p) == ".css" {
+			for _, m := range regexp.MustCompile(`url\(([^)]+)\)`).FindAllStringSubmatch(body, -1) {
+				u := strings.Trim(m[1], `"'`)
+				if strings.HasPrefix(u, "data:") || strings.HasPrefix(u, "#") {
+					continue
+				}
+				if strings.Contains(u, "://") {
+					t.Errorf("%s loads %s from another origin; the CSP would block it", p, u)
+					continue
+				}
+				check(path.Join(path.Dir(p), strings.SplitN(u, "?", 2)[0]))
+			}
+		}
+	}
+	for _, m := range refs {
+		check(m[1])
+	}
+	if !seen["/static-modules/fontawesome-free/webfonts/fa-solid-900.woff2"] {
+		t.Error("the icon font is not reachable from the stylesheets, every icon would be a blank box")
 	}
 }
 

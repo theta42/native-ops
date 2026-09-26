@@ -19,7 +19,7 @@ a person sets up by hand.
 | `GET /healthz` | none | liveness (`{"ok":true,"version":...}`), no state |
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images and warnings for the host |
-| `GET /` | none | the UI. It holds no data; it asks for a token and calls `/v1/status` |
+| `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
 for instance config (OCI containers keep their secrets in `environment.*`); values are never read
@@ -42,8 +42,14 @@ can create privileged containers), so it is deliberately small:
   so the write endpoints that follow inherit it.
 - Every request is appended to `audit.log` (JSON lines): time, token name, method, path, status,
   remote address, duration. Never the query string, never a credential.
-- The UI is served with a strict Content-Security-Policy (`default-src 'none'`, no inline script)
-  and inserts all data as text, never as HTML.
+- The UI is served with a strict Content-Security-Policy (`default-src 'none'`, no inline script or
+  style) and inserts all data as text, never as HTML.
+- The UI uses the same shell as the other theta-suite apps (proxy, jump-host, sso-manager): Bootstrap 5.3
+  and Font Awesome Free, vendored under `pkg/server/ui/static-modules/` with their licenses and served
+  from the binary, since the CSP allows `'self'` only. Nothing is fetched from a CDN, so it works on a
+  host with no outbound access. To update them, copy the new `dist` files over the old ones (strip the
+  `sourceMappingURL` comments, the maps are not shipped) and run `go test ./pkg/server`: the tests fail if
+  the page names a file the binary does not serve.
 - It listens on loopback (or the Incus bridge address) and must sit behind TLS, e.g. the Caddy
   edge. Do not expose the port directly.
 

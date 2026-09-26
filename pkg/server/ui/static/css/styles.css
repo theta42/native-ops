@@ -1,0 +1,39 @@
+/* The shell rules below are the theta-suite ones (proxy/nodejs/public/css/styles.css)
+   so the daemon UI and the OPSAVOR fleet-manager UI read as one family. Bootstrap
+   supplies everything else. No inline styles anywhere: the CSP forbids them. */
+nav.navbar{
+	padding-left: 1em;
+	padding-right: 1em;
+}
+
+/* Only the active top-nav link is bold + underlined; the username is plain. */
+.top-nav a.active{
+	font-weight: bold;
+	text-decoration: underline;
+}
+
+body {
+	display: flex;
+	flex-direction: column;
+	min-height: 100vh;
+}
+
+#spa-shell {
+	margin-top: 4.5rem;
+	padding-bottom: 1em;
+	flex-grow: 1;
+}
+
+.card-title{
+	font-weight: bold;
+}
+
+.card-icon{
+	width: 1.5rem;
+}
+
+/* Table cells hold names, image references and IPs: keep each on one line and
+   let .table-responsive scroll rather than wrapping a container name in two. */
+.table td, .table th{
+	white-space: nowrap;
+}
