@@ -1,13 +1,17 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/theta42/native-ops/pkg/config"
@@ -438,4 +442,200 @@ func TestPlanHashIdentifiesWhatWouldHappen(t *testing.T) {
 	if f1.ExitStatus() != 2 || (&FleetPlan{}).ExitStatus() != 0 || (&FleetPlan{Services: []*ServicePlan{{Service: "x", Action: ActionBlocked}}}).ExitStatus() != 1 {
 		t.Fatal("exit status: pending is 2, empty is 0, blocked is 1")
 	}
+}
+
+func bindPlan(t *testing.T, sim *hostSim, svc *config.ServiceConfig, dir string, key string) *FleetPlan {
+	t.Helper()
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "services", svc.Name), 0o755)
+	os.WriteFile(filepath.Join(root, "fleet.yml"), []byte("name: f\n"), 0o644)
+	if key == "" {
+		key = "-"
+	}
+	// The plan is made through PlanService directly so the manifest under test is used as given.
+	d := NewDeployer(remote.ReadOnly(sim))
+	if key != "-" {
+		WithBindKey([]byte(key))(d)
+	}
+	p, err := d.PlanService(context.Background(), svc, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &FleetPlan{Services: []*ServicePlan{p}}
+}
+
+// The plan prints key names, not values, so two different secrets give the same plan text. The
+// hash a gate compares must still tell them apart, or "apply what was reviewed" is a promise about
+// the key names only.
+func TestTheHashCoversValuesAndHooksThePlanDoesNotPrint(t *testing.T) {
+	sim, _, svc := deployedGitea(t)
+	dir := t.TempDir()
+	svc.Env["GITEA_PORT"] = "3001" // live has 3000: the plan says "change GITEA_PORT"
+
+	a := bindPlan(t, sim, svc, dir, "k1")
+	svc.Env["GITEA_PORT"] = "3002" // a different value; the same plan text
+	b := bindPlan(t, sim, svc, dir, "k1")
+	if a.Render() != b.Render() {
+		t.Fatalf("test setup: the two plans should read the same:\n%s\n%s", a.Render(), b.Render())
+	}
+	if a.Hash() == b.Hash() {
+		t.Fatal("a changed environment value with the same key names must change the hash")
+	}
+	if a.Hash() != bindPlan(t, sim, giteaWith(svc, "3001"), dir, "k1").Hash() {
+		t.Fatal("the same manifest must give the same hash")
+	}
+	if a.Hash() == bindPlan(t, sim, giteaWith(svc, "3001"), dir, "another key").Hash() {
+		t.Fatal("the hash is keyed: another key gives another hash, so it says nothing about a value without the key")
+	}
+
+	// A hook body is not in the plan either.
+	h1 := giteaWith(svc, "3001")
+	h1.Hooks.PostDeploy = "echo one"
+	h2 := giteaWith(svc, "3001")
+	h2.Hooks.PostDeploy = "echo two"
+	if bindPlan(t, sim, h1, dir, "k1").Hash() == bindPlan(t, sim, h2, dir, "k1").Hash() {
+		t.Fatal("a changed hook body must change the hash")
+	}
+	// ...and a file-based hook counts by its contents.
+	os.MkdirAll(filepath.Join(dir, "services", "gitea"), 0o755)
+	h3 := giteaWith(svc, "3001")
+	h3.Hooks.PostDeploy = "post.sh"
+	os.WriteFile(filepath.Join(dir, "services", "gitea", "post.sh"), []byte("echo A"), 0o644)
+	x := bindPlan(t, sim, h3, dir, "k1").Hash()
+	os.WriteFile(filepath.Join(dir, "services", "gitea", "post.sh"), []byte("echo B"), 0o644)
+	if x == bindPlan(t, sim, h3, dir, "k1").Hash() {
+		t.Fatal("the contents of a hook file count, not just its name")
+	}
+
+	// Values that come from an env_file are bound too: the manifest names the file, not its contents.
+	f1 := giteaWith(svc, "3000")
+	f1.EnvFile = "gitea.env"
+	os.WriteFile(filepath.Join(dir, "gitea.env"), []byte("FROM_FILE=one\n"), 0o644)
+	y := bindPlan(t, sim, f1, dir, "k1").Hash()
+	os.WriteFile(filepath.Join(dir, "gitea.env"), []byte("FROM_FILE=two\n"), 0o644)
+	if y == bindPlan(t, sim, f1, dir, "k1").Hash() {
+		t.Fatal("a changed value in an env_file must change the hash")
+	}
+
+	// Without a key the plan is what it says, which is what the CLI wants.
+	if bindPlan(t, sim, giteaWith(svc, "3001"), dir, "").Hash() != bindPlan(t, sim, giteaWith(svc, "3002"), dir, "").Hash() {
+		t.Fatal("without a key only what the plan prints is covered")
+	}
+}
+
+func giteaWith(base *config.ServiceConfig, port string) *config.ServiceConfig {
+	c := *base
+	c.Env = map[string]string{}
+	for k, v := range base.Env {
+		c.Env[k] = v
+	}
+	c.Env["GITEA_PORT"] = port
+	return &c
+}
+
+func TestApplyPlanAppliesOnlyWhatThePlanSaysAndLogsToItsOwnLogger(t *testing.T) {
+	sim, d, svc := deployedGitea(t)
+	other := &config.ServiceConfig{Name: "db", Image: "postgres:16", Limits: map[string]string{"limits.cpu": "1"}}
+	if err := d.DeployService(context.Background(), other, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	write := func(s *config.ServiceConfig, yml string) {
+		os.MkdirAll(filepath.Join(dir, "services", s.Name), 0o755)
+		os.WriteFile(filepath.Join(dir, "services", s.Name, "service.yml"), []byte(yml), 0o644)
+	}
+	// gitea drifted (a limit), db did not.
+	write(svc, "name: gitea\nimage: gitea:latest\nvolumes:\n  - {name: gitea-data, path: /var/lib/gitea, pool: default, shifted: true}\nlimits: {limits.cpu: \"4\", limits.memory: 2GB}\nenv: {GITEA_PORT: \"3000\", GITEA_HOST: git.example.com}\nrouting: {domain: git.example.com, upstream_port: 3000}\n")
+	write(other, "name: db\nimage: postgres:16\nlimits: {limits.cpu: \"1\"}\n")
+	os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte("name: f\n"), 0o644)
+	sim.reset()
+
+	fp, err := PlanFleet(context.Background(), sim, dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp.Services[0].Action != ActionUpdate && fp.Services[1].Action != ActionUpdate {
+		t.Fatalf("test setup: expected a pending change: %s", fp.Render())
+	}
+
+	var mu sync.Mutex
+	var lines []string
+	var global bytes.Buffer
+	log.SetOutput(&global)
+	defer log.SetOutput(os.Stderr)
+	ad := newTestDeployer(sim)
+	ad.SetLogger(func(format string, a ...any) {
+		mu.Lock()
+		lines = append(lines, fmt.Sprintf(format, a...))
+		mu.Unlock()
+	})
+	sim.reset()
+	if err := ad.ApplyPlan(context.Background(), dir, fp); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range sim.cmds {
+		if strings.Contains(c, "'db'") || strings.Contains(c, "postgres") {
+			t.Fatalf("db was not in the plan's changes and must not even be looked at: %s", c)
+		}
+	}
+	if sim.ctrs["gitea"].config["limits.cpu"] != "4" {
+		t.Fatalf("what the plan said was not applied: %v", sim.ctrs["gitea"].config)
+	}
+	if strings.TrimSpace(global.String()) != "" {
+		t.Fatalf("progress belongs to the job's logger, not the process log: %q", global.String())
+	}
+	if len(lines) == 0 || !strings.Contains(strings.Join(lines, "\n"), "gitea") {
+		t.Fatalf("the job's logger got nothing: %v", lines)
+	}
+	if p2, _ := PlanFleet(context.Background(), sim, dir, ""); p2.Pending() {
+		t.Fatalf("after apply the plan must be empty:\n%s", p2.Render())
+	}
+
+	// A replacement goes through the instance manager, which reports progress too.
+	sim.aliases["gitea:latest"] = fpB
+	fp2, _ := PlanFleet(context.Background(), sim, dir, "")
+	if err := ad.ApplyPlan(context.Background(), dir, fp2); err != nil {
+		t.Fatal(err)
+	}
+	if sim.ctrs["gitea"].config["volatile.base_image"] != fpB {
+		t.Fatalf("test setup: the image should have been replaced")
+	}
+	if strings.TrimSpace(global.String()) != "" {
+		t.Fatalf("the update path must report to the job's logger too: %q", global.String())
+	}
+}
+
+func TestApplyPlanRefusesABlockedPlanAndStopsAtTheFirstFailure(t *testing.T) {
+	sim, _, svc := deployedGitea(t)
+	blocked := &FleetPlan{Services: []*ServicePlan{{Service: "gitea", Action: ActionBlocked, Blockers: []string{"x"}}}}
+	if err := newTestDeployer(sim).ApplyPlan(context.Background(), t.TempDir(), blocked); err == nil || len(sim.mutations()) != 0 {
+		t.Fatalf("a blocked plan applies nothing: %v %v", err, sim.mutations())
+	}
+
+	dir := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		os.MkdirAll(filepath.Join(dir, "services", name), 0o755)
+		os.WriteFile(filepath.Join(dir, "services", name, "service.yml"), []byte("name: "+name+"\nimage: gitea:latest\nlimits: {limits.cpu: \"1\"}\n"), 0o644)
+	}
+	os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte("name: f\n"), 0o644)
+	sim.reset()
+	fp, err := PlanFleet(context.Background(), sim, dir, "")
+	if err != nil || len(fp.Services) != 2 {
+		t.Fatalf("%v %v", fp, err)
+	}
+	sim.fail = func(cmd string) error {
+		if strings.HasPrefix(cmd, "incus launch") && strings.Contains(cmd, "'a'") {
+			return errors.New("launch failed")
+		}
+		return nil
+	}
+	sim.reset()
+	err = newTestDeployer(sim).ApplyPlan(context.Background(), dir, fp)
+	if err == nil || !strings.Contains(err.Error(), "apply a") {
+		t.Fatalf("the first failure is reported with its service: %v", err)
+	}
+	if sim.ctrs["b"] != nil {
+		t.Fatal("services after the failure must be left alone")
+	}
+	_ = svc
 }
