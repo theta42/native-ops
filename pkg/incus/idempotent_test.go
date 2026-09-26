@@ -85,7 +85,7 @@ func TestLaunchContainerQuotesEveryArgumentAndSortsConfig(t *testing.T) {
 			launch = cmd
 		}
 	}
-	want := `incus launch '` + strings.Repeat("a", 64) + `' 'rest-x' --profile 'base' --config 'limits.cpu=2' --config 'user.note=it'\''s a "test" $(id)' --config 'user.z=last'`
+	want := `incus launch '` + strings.Repeat("a", 64) + `' 'rest-x' --profile 'default' --profile 'base' --config 'limits.cpu=2' --config 'user.note=it'\''s a "test" $(id)' --config 'user.z=last'`
 	if launch != want {
 		t.Fatalf("\n got %s\nwant %s", launch, want)
 	}
@@ -138,5 +138,38 @@ func TestGlobalIPv4sIsSingleShotAndSorted(t *testing.T) {
 	}
 	if len(ex.cmds) != 1 {
 		t.Fatalf("reading addresses must not change the container: %v", ex.cmds)
+	}
+}
+
+// Regression, found on a real host: a profile list that already named "default"
+// (as the live state of every instance does) launched WITHOUT the default
+// profile, so the replacement had no root disk and the update could not relaunch anything.
+func TestLaunchContainerAlwaysIncludesTheDefaultProfileInTheRightPlace(t *testing.T) {
+	launch := func(profiles []string) string {
+		ex := &stubExec{}
+		if err := NewClient(ex).LaunchContainer(context.Background(), strings.Repeat("a", 64), "web", profiles, nil); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range ex.cmds {
+			if strings.HasPrefix(c, "incus launch") {
+				return c
+			}
+		}
+		t.Fatal("no launch command")
+		return ""
+	}
+	img := `incus launch '` + strings.Repeat("a", 64) + `' 'web'`
+	for name, tc := range map[string]struct {
+		profiles []string
+		want     string
+	}{
+		"manifest without default":      {[]string{"base", "service"}, img + " --profile 'default' --profile 'base' --profile 'service'"},
+		"live state that lists default": {[]string{"default", "base", "service"}, img + " --profile 'default' --profile 'base' --profile 'service'"},
+		"default listed last is kept":   {[]string{"base", "default"}, img + " --profile 'base' --profile 'default'"},
+		"no profiles at all":            {nil, img + " --profile 'default'"},
+	} {
+		if got := launch(tc.profiles); got != tc.want {
+			t.Errorf("%s:\n got %s\nwant %s", name, got, tc.want)
+		}
 	}
 }

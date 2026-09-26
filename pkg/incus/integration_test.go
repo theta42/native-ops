@@ -12,11 +12,12 @@ package incus
 //	go test -tags integration -count=1 -v -run TestIntegration ./pkg/incus
 //
 // They create, and always remove, only instances and volumes named nops-it-*.
-// The first run downloads images:alpine/3.20 (a few MB).
+// The first run downloads an Alpine image (a few MB); set NOPS_IT_IMAGE to use another.
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -81,6 +82,10 @@ func TestIntegrationCLIFormsExist(t *testing.T) {
 func TestIntegrationClientHelpers(t *testing.T) {
 	c, ex := requireIncus(t)
 	ctx := context.Background()
+	image := os.Getenv("NOPS_IT_IMAGE")
+	if image == "" {
+		image = "images:alpine/3.22"
+	}
 	name := fmt.Sprintf("nops-it-%d", time.Now().Unix())
 	vol := name + "-data"
 	sh := func(cmd string) string {
@@ -98,8 +103,8 @@ func TestIntegrationClientHelpers(t *testing.T) {
 
 	// Launch with awkward config values: quoting must survive the shell and the YAML round trip.
 	tricky := `it's a "test" $(id) & more`
-	if err := c.LaunchContainer(ctx, "images:alpine/3.20", name, []string{"default"}, map[string]string{
-		ImageKey: "images:alpine/3.20", "user.note": tricky, "limits.memory": "256MB",
+	if err := c.LaunchContainer(ctx, image, name, []string{"default"}, map[string]string{
+		ImageKey: image, "user.note": tricky, "limits.memory": "256MB",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +124,7 @@ func TestIntegrationClientHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(state.BaseImage) != 64 || state.Config["user.note"] != tricky || state.Config[ImageKey] != "images:alpine/3.20" {
+	if len(state.BaseImage) != 64 || state.Config["user.note"] != tricky || state.Config[ImageKey] != image {
 		t.Fatalf("captured state does not match what was launched: base=%q config=%v", state.BaseImage, state.Config)
 	}
 
@@ -188,14 +193,15 @@ func TestIntegrationClientHelpers(t *testing.T) {
 	sh(NetworkSetIfChanged("incusbr0", "user.nops-it", "x"))
 	_, _ = ex.Run(ctx, "incus network unset incusbr0 user.nops-it")
 
-	// Probe from inside the container: 200 passes, 404 fails, a missing client is reported.
-	sh("incus exec " + ShQuote(name) + " -- sh -c 'mkdir -p /www && echo ok > /www/health && busybox httpd -p 8787 -h /www </dev/null >/dev/null 2>&1'")
-	time.Sleep(time.Second)
+	// Probe from inside the container: a listening server passes, a closed port fails.
+	// (Alpine's core busybox has no httpd applet, so serve one fixed response with nc.)
+	sh("incus exec " + ShQuote(name) + " -- sh -c '(while true; do printf \"HTTP/1.1 200 OK\\r\\nContent-Length: 3\\r\\nConnection: close\\r\\n\\r\\nok\\n\" | nc -l -p 8787; done) </dev/null >/dev/null 2>&1 &'")
+	time.Sleep(2 * time.Second)
 	if err := c.ProbeHTTPInContainer(ctx, "local", name, 8787, "/health"); err != nil {
 		t.Fatalf("probe of a healthy endpoint: %v", err)
 	}
-	if err := c.ProbeHTTPInContainer(ctx, "local", name, 8787, "/nope"); err == nil {
-		t.Fatal("a 404 must fail the probe")
+	if err := c.ProbeHTTPInContainer(ctx, "local", name, 8788, "/health"); err == nil {
+		t.Fatal("a closed port must fail the probe")
 	}
 	if err := c.WaitHTTPInContainer(ctx, "local", name, config.HealthCheckConfig{Path: "/health", Port: 8787, Timeout: 10}); err != nil {
 		t.Fatal(err)

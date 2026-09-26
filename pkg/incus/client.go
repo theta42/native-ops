@@ -241,7 +241,10 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 
 	args := []string{"incus", "launch", ShQuote(image), ShQuote(name)}
 
-	// In Incus, ensure "default" profile is always included for root disk device and bridge NIC
+	// Any --profile replaces Incus's implicit default profile, and the default
+	// profile carries the root disk and the NIC. So it must always be named
+	// explicitly: first when the caller did not list it, otherwise where the
+	// caller put it (later profiles override earlier ones, so order matters).
 	hasDefault := false
 	for _, p := range profiles {
 		if p == "default" {
@@ -249,13 +252,13 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 			break
 		}
 	}
+	ordered := make([]string, 0, len(profiles)+1)
 	if !hasDefault {
-		args = append(args, "--profile", "default")
+		ordered = append(ordered, "default")
 	}
-	for _, p := range profiles {
-		if p != "default" {
-			args = append(args, "--profile", ShQuote(p))
-		}
+	ordered = append(ordered, profiles...)
+	for _, p := range ordered {
+		args = append(args, "--profile", ShQuote(p))
 	}
 
 	keys := make([]string, 0, len(limits))
