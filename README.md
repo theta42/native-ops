@@ -313,6 +313,20 @@ What "converge" means in detail:
 
 ---
 
+## Remote daemon and status
+
+`native-ops status` (`--json` for machines) prints a read-only view of a host: instances, data
+volumes with their snapshot freshness, images, and anything an operator should look at (a stopped
+instance, a data mount that is a host path rather than a volume, a volume with no recent snapshot).
+It reports config key *names* only, never values.
+
+`native-ops serve` runs the same view, and what follows, as an authenticated API and web UI
+**on the host itself**, so a fleet can be driven from CI with an API token and nothing is installed
+locally. It is installed by IaC/CI, and the CLI keeps working without it. See
+[docs/daemon.md](docs/daemon.md).
+
+---
+
 ## Backup & Restore (S3-compatible)
 
 Custom storage volumes can be backed up off-host to any S3-compatible object

@@ -61,6 +61,15 @@ func main() {
 	case "dns":
 		handleDNSCommand(ctx, os.Args[2:])
 
+	case "status":
+		handleStatusCommand(ctx, os.Args[2:])
+
+	case "serve":
+		handleServeCommand(ctx, os.Args[2:])
+
+	case "token":
+		handleTokenCommand(os.Args[2:])
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", subcommand)
 		printUsage()
@@ -77,6 +86,11 @@ Usage:
 GitOps Commands:
   validate         Validate manifests and show dry-run plan (used in PRs)
   reconcile        End-to-end GitOps cluster reconciliation (Level 0 + DNS + Level 1)
+
+Remote daemon (runs on the host it manages; deployed by IaC, driven by CI over HTTPS):
+  status           Read-only view of the host's instances, volumes and images (--json)
+  serve            Run the authenticated API + UI daemon (needs a state dir; see README)
+  token create     Create an API token (also: token list, token revoke)
 
 Core Commands:
   host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)

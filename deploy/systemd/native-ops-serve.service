@@ -1,0 +1,42 @@
+# native-ops daemon. Runs ON the host it manages, as an unprivileged user in the
+# incus-admin group. Installed and updated by IaC/CI, not by hand (docs/daemon.md).
+[Unit]
+Description=native-ops daemon (API + UI)
+Documentation=https://github.com/theta42/native-ops/blob/main/docs/daemon.md
+After=network-online.target incus.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=native-ops
+Group=native-ops
+SupplementaryGroups=incus-admin
+# Listen on loopback, or on the Incus bridge address so the edge container can proxy to it.
+# TLS is terminated by the edge; never expose this port directly.
+ExecStart=/usr/local/bin/native-ops serve --addr 127.0.0.1:8686 --state-dir /var/lib/native-ops
+# Provisioned by IaC/CI (an org secret written to this root-owned 0600 file):
+#   NATIVE_OPS_BOOTSTRAP_TOKEN=nops_<at least 32 characters>
+EnvironmentFile=-/etc/native-ops/serve.env
+Environment=HOME=/var/lib/native-ops
+StateDirectory=native-ops
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=3
+
+# Hardening. The daemon needs the Incus socket and its own state directory, nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
