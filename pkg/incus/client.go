@@ -298,16 +298,53 @@ func (c *Client) EnsureVolumeAttached(ctx context.Context, containerName, pool, 
 	if err != nil {
 		return err
 	}
-	for _, d := range st.Devices {
-		if d["type"] == "disk" && d["pool"] == pool && d["source"] == volumeName && d["path"] == mountPath {
-			return nil
-		}
+	attached, clash := st.VolumeAttachment(pool, volumeName, mountPath)
+	if attached {
+		return nil
 	}
-	if d, clash := st.Devices[volumeDeviceName(mountPath)]; clash {
-		return fmt.Errorf("device %q on %s already exists (source=%s path=%s) and does not match volume %s at %s",
-			volumeDeviceName(mountPath), containerName, d["source"], d["path"], volumeName, mountPath)
+	if clash != nil {
+		return VolumeClashError(containerName, volumeName, mountPath, clash)
 	}
 	return c.AttachVolume(ctx, containerName, pool, volumeName, mountPath, shifted)
+}
+
+// VolumeAttachment reports whether the volume is already attached at mountPath. When it is
+// not, clash is the existing device that holds the name this attachment would use (nil when
+// the name is free), which is what makes attaching an error rather than an addition.
+func (s *InstanceState) VolumeAttachment(pool, volumeName, mountPath string) (attached bool, clash map[string]string) {
+	for _, d := range s.Devices {
+		if d["type"] == "disk" && d["pool"] == pool && d["source"] == volumeName && d["path"] == mountPath {
+			return true, nil
+		}
+	}
+	if d, taken := s.Devices[volumeDeviceName(mountPath)]; taken {
+		return false, d
+	}
+	return false, nil
+}
+
+// VolumeClashError is the error for a device that already has the name an attachment needs.
+func VolumeClashError(containerName, volumeName, mountPath string, clash map[string]string) error {
+	return fmt.Errorf("device %q on %s already exists (source=%s path=%s) and does not match volume %s at %s",
+		volumeDeviceName(mountPath), containerName, clash["source"], clash["path"], volumeName, mountPath)
+}
+
+// VolumeExists reports whether a custom storage volume exists. Only "not found" means absent;
+// any other failure is an error, so a transient problem is never read as "needs creating".
+func (c *Client) VolumeExists(ctx context.Context, pool, volumeName string) (bool, error) {
+	if pool == "" {
+		pool = "default"
+	}
+	if !ValidName(pool) || !ValidName(volumeName) {
+		return false, fmt.Errorf("invalid pool/volume name %q/%q", pool, volumeName)
+	}
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume show %s %s", ShQuote(pool), ShQuote(volumeName))); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return false, nil
+		}
+		return false, fmt.Errorf("look up volume %s on pool %s: %w", volumeName, pool, err)
+	}
+	return true, nil
 }
 
 // WriteEnvironmentFile writes key-value configuration into /etc/default/<service>

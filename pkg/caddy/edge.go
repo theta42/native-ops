@@ -48,6 +48,9 @@ func NewEdgeManager(exec remote.Executor, edgeContainer string) *EdgeManager {
 	}
 }
 
+// Container is the name of the edge instance the routes live in.
+func (e *EdgeManager) Container() string { return e.edgeContainer }
+
 // RenderSiteBlock generates a Caddy site block.
 func RenderSiteBlock(domain, upstreamIP string, upstreamPort int, tls string, extra []string) string {
 	var sb strings.Builder
@@ -203,18 +206,17 @@ func (e *EdgeManager) RepointUpstream(ctx context.Context, siteName string, addr
 	return true, nil
 }
 
-// PublishSiteFor is PublishSite for an upstream that may have several
-// addresses. If the currently published upstream is still one of them it is
-// kept, so re-running never flaps between equivalent addresses.
-func (e *EdgeManager) PublishSiteFor(ctx context.Context, siteName string, routing config.RoutingConfig, candidateIPs []string) error {
+// chooseUpstream picks the address to publish. If the currently published upstream is still
+// one of the candidates it is kept, so re-running never flaps between equivalent addresses.
+func (e *EdgeManager) chooseUpstream(ctx context.Context, siteName string, candidateIPs []string) (string, error) {
 	if len(candidateIPs) == 0 {
-		return fmt.Errorf("no upstream address for %s", siteName)
+		return "", fmt.Errorf("no upstream address for %s", siteName)
 	}
 	choose := candidateIPs[0]
 	if incus.ValidName(siteName) {
 		cur, found, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
 		if err != nil {
-			return err
+			return "", err
 		}
 		if found {
 			if m := upstreamRe.FindStringSubmatch(cur); m != nil {
@@ -226,7 +228,85 @@ func (e *EdgeManager) PublishSiteFor(ctx context.Context, siteName string, routi
 			}
 		}
 	}
+	return choose, nil
+}
+
+// PublishSiteFor is PublishSite for an upstream that may have several
+// addresses. If the currently published upstream is still one of them it is
+// kept, so re-running never flaps between equivalent addresses.
+func (e *EdgeManager) PublishSiteFor(ctx context.Context, siteName string, routing config.RoutingConfig, candidateIPs []string) error {
+	choose, err := e.chooseUpstream(ctx, siteName, candidateIPs)
+	if err != nil {
+		return err
+	}
 	return e.PublishSite(ctx, siteName, routing, choose)
+}
+
+// SitePlan is what publishing a site would do, worked out without changing anything.
+type SitePlan struct {
+	// Change is "" when the published site already matches, else "create" or "update".
+	Change string
+	// CreatesBaseCaddyfile is true when the edge has no Caddyfile and publishing would write one.
+	CreatesBaseCaddyfile bool
+	// Detail says what differs, e.g. the upstream address that would change.
+	Detail string
+}
+
+// PlanSiteFor is PublishSiteFor without the writes: it reads the same files and applies the
+// same checks and the same choice of upstream, and reports what would be written. It returns
+// the error PublishSiteFor would return for a config it would refuse (an invalid name or
+// domain, or a Caddyfile that does not import the sites directory). candidateIPs may be empty
+// for an instance that does not exist yet; the plan then says the address is assigned at launch.
+func (e *EdgeManager) PlanSiteFor(ctx context.Context, siteName string, routing config.RoutingConfig, candidateIPs []string) (SitePlan, error) {
+	var plan SitePlan
+	if !incus.ValidName(siteName) {
+		return plan, fmt.Errorf("invalid site name %q", siteName)
+	}
+	if !domainRe.MatchString(routing.Domain) {
+		return plan, fmt.Errorf("invalid domain %q", routing.Domain)
+	}
+	if routing.UpstreamPort < 1 || routing.UpstreamPort > 65535 {
+		return plan, fmt.Errorf("invalid upstream port %d", routing.UpstreamPort)
+	}
+	base, foundBase, err := e.incus.PullFile(ctx, e.edgeContainer, caddyfilePath)
+	if err != nil {
+		return plan, err
+	}
+	switch {
+	case foundBase && !strings.Contains(base, "import "+sitesDir):
+		return plan, fmt.Errorf("%s in %s does not import %s/*.caddy, so published sites would never be served; add that import line (native-ops never overwrites an existing Caddyfile)", caddyfilePath, e.edgeContainer, sitesDir)
+	case !foundBase:
+		if e.Email != "" && !emailRe.MatchString(e.Email) {
+			return plan, fmt.Errorf("invalid ACME email %q", e.Email)
+		}
+		plan.CreatesBaseCaddyfile = true
+	}
+
+	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
+	if err != nil {
+		return plan, err
+	}
+	if len(candidateIPs) == 0 {
+		if hadPrev {
+			plan.Change, plan.Detail = "update", "the existing route is rewritten to the new address when the instance is launched"
+		} else {
+			plan.Change, plan.Detail = "create", "the address is assigned when the instance is launched"
+		}
+		return plan, nil
+	}
+	choose, err := e.chooseUpstream(ctx, siteName, candidateIPs)
+	if err != nil {
+		return plan, err
+	}
+	desired := RenderSiteBlock(routing.Domain, choose, routing.UpstreamPort, routing.TLS, routing.ExtraDirectives)
+	switch {
+	case hadPrev && prev == desired:
+	case hadPrev:
+		plan.Change, plan.Detail = "update", "the site file for "+routing.Domain+" differs from the manifest"
+	default:
+		plan.Change, plan.Detail = "create", "there is no site file for "+routing.Domain
+	}
+	return plan, nil
 }
 
 // RemoveSite deletes a site file and reloads Caddy. Removing a site that is not

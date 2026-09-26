@@ -85,6 +85,44 @@ func serviceEnv(svc *config.ServiceConfig, configDir string) map[string]string {
 	return env
 }
 
+// envState is how the live /etc/default/<service> compares with the declared environment.
+type envState struct {
+	Found   bool              // the file exists
+	Merged  map[string]string // what the file should contain: live keys kept, declared keys set
+	Differs bool              // a declared key is missing or has another value
+	Added   []string          // declared keys the file lacks (names only)
+	Changed []string          // declared keys whose value differs (names only)
+	Kept    int               // live keys the manifest does not declare; these are preserved
+}
+
+// readEnvState reads the live environment file and works out what converging it would do. It
+// never writes, and is shared by ensureEnv (which acts on it) and the plan (which reports it).
+func readEnvState(ctx context.Context, ic *incus.Client, container, service string, declared map[string]string) (*envState, error) {
+	live, found, err := ic.PullFile(ctx, container, "/etc/default/"+service)
+	if err != nil {
+		return nil, err
+	}
+	liveEnv := map[string]string{}
+	if found {
+		liveEnv = incus.ParseEnv(live)
+	}
+	merged, differs := incus.MergeEnv(liveEnv, declared)
+	st := &envState{Found: found, Merged: merged, Differs: differs}
+	for _, k := range sortedKeys(declared) {
+		if cur, ok := liveEnv[k]; !ok {
+			st.Added = append(st.Added, k)
+		} else if cur != declared[k] {
+			st.Changed = append(st.Changed, k)
+		}
+	}
+	for k := range liveEnv {
+		if _, ok := declared[k]; !ok {
+			st.Kept++
+		}
+	}
+	return st, nil
+}
+
 // ensureEnv converges /etc/default/<service> to the declared environment:
 // declared keys are set, keys that are not declared are preserved (they may be
 // runtime secrets pushed by another system), and the file is only written when
@@ -94,19 +132,14 @@ func ensureEnv(ctx context.Context, ic *incus.Client, container, service string,
 	if len(declared) == 0 {
 		return false, nil
 	}
-	live, found, err := ic.PullFile(ctx, container, "/etc/default/"+service)
+	st, err := readEnvState(ctx, ic, container, service, declared)
 	if err != nil {
 		return false, err
 	}
-	liveEnv := map[string]string{}
-	if found {
-		liveEnv = incus.ParseEnv(live)
-	}
-	merged, differs := incus.MergeEnv(liveEnv, declared)
-	if found && !differs {
+	if st.Found && !st.Differs {
 		return false, nil
 	}
-	if err := ic.WriteEnvironmentFile(ctx, container, service, merged); err != nil {
+	if err := ic.WriteEnvironmentFile(ctx, container, service, st.Merged); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -339,6 +372,49 @@ func sameProfiles(live, declared []string) bool {
 	return norm(live) == norm(declared)
 }
 
+// imageVerdict is what a running instance's image means for the manifest.
+type imageVerdict int
+
+const (
+	imageCurrent imageVerdict = iota // runs what the manifest names
+	imageReplace                     // the manifest names a different image
+	imageAdopt                       // launched before references were recorded: record it, change nothing else
+	imageUnknown                     // launched from an image that cannot be identified: leave it alone
+)
+
+// imageDecision compares the image a service is declared with to the one its instance runs.
+// A local alias is compared by fingerprint (fp is set); an OCI reference by the reference
+// recorded on the instance, because a tag cannot be resolved without pulling it.
+func imageDecision(st *incus.InstanceState, fp, deployRef string) imageVerdict {
+	if fp != "" {
+		switch {
+		case st.BaseImage == "":
+			return imageUnknown
+		case st.BaseImage != fp:
+			return imageReplace
+		}
+		return imageCurrent
+	}
+	switch recorded := st.Config[incus.ImageKey]; {
+	case recorded == "":
+		return imageAdopt
+	case recorded != deployRef:
+		return imageReplace
+	}
+	return imageCurrent
+}
+
+// limitsDrift returns the declared limits whose live value differs.
+func limitsDrift(st *incus.InstanceState, limits map[string]string) map[string]string {
+	drift := map[string]string{}
+	for _, k := range sortedKeys(limits) {
+		if st.Config[k] != limits[k] {
+			drift[k] = limits[k]
+		}
+	}
+	return drift
+}
+
 func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, configDir, deployRef, fp string) error {
 	st, err := d.incus.CaptureInstanceState(ctx, svc.Name)
 	if err != nil {
@@ -347,23 +423,16 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 
 	// Which image is wanted, and is that what runs?
 	replace := false
-	if fp != "" {
-		switch {
-		case st.BaseImage == "":
-			log.Printf("    WARNING: the image %s was launched from is unknown; not replacing %s\n", svc.Image, svc.Name)
-		case st.BaseImage != fp:
-			replace = true
+	switch imageDecision(st, fp, deployRef) {
+	case imageUnknown:
+		log.Printf("    WARNING: the image %s was launched from is unknown; not replacing %s\n", svc.Image, svc.Name)
+	case imageAdopt:
+		// Launched before references were recorded: adopt what runs as the desired state.
+		if err := d.incus.SetInstanceConfig(ctx, svc.Name, incus.ImageKey, deployRef); err != nil {
+			return err
 		}
-	} else {
-		switch recorded := st.Config[incus.ImageKey]; {
-		case recorded == "":
-			// Launched before references were recorded: adopt what runs as the desired state.
-			if err := d.incus.SetInstanceConfig(ctx, svc.Name, incus.ImageKey, deployRef); err != nil {
-				return err
-			}
-		case recorded != deployRef:
-			replace = true
-		}
+	case imageReplace:
+		replace = true
 	}
 
 	declaredEnv := serviceEnv(svc, configDir)
@@ -395,12 +464,7 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 		}
 	} else {
 		// Limits apply live, no restart.
-		drift := map[string]string{}
-		for _, k := range sortedKeys(svc.Limits) {
-			if st.Config[k] != svc.Limits[k] {
-				drift[k] = svc.Limits[k]
-			}
-		}
+		drift := limitsDrift(st, svc.Limits)
 		if len(drift) > 0 {
 			log.Printf("    Applying changed limits to %s: %v\n", svc.Name, drift)
 			if err := d.incus.ResizeLimits(ctx, svc.Name, drift); err != nil {
