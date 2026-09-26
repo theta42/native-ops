@@ -337,20 +337,15 @@ func (c *Client) ResizeLimits(ctx context.Context, containerName string, limits 
 	return nil
 }
 
-// SnapshotVolume creates a snapshot of a storage volume.
+// SnapshotVolume creates a snapshot of a storage volume, generating a
+// timestamped name when none is given. It uses the `snapshot create` form of
+// the Incus CLI (the bare `snapshot <pool> <vol> <name>` form is LXD-era and
+// is not accepted by Incus).
 func (c *Client) SnapshotVolume(ctx context.Context, pool, volumeName, snapshotName string) error {
-	if pool == "" {
-		pool = "default"
-	}
 	if snapshotName == "" {
 		snapshotName = fmt.Sprintf("snap-%s", time.Now().UTC().Format("20060102-150405"))
 	}
-
-	cmd := fmt.Sprintf("incus storage volume snapshot %s %s %s", pool, volumeName, snapshotName)
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
-		return fmt.Errorf("snapshot volume %s/%s: %w", pool, volumeName, err)
-	}
-	return nil
+	return c.CreateVolumeSnapshot(ctx, pool, volumeName, snapshotName)
 }
 
 // MigrateInstance copies/moves a container and volume across Incus hosts.

@@ -102,7 +102,7 @@ func TestUpdateHappyPathCarriesConfigAndSnapshotsFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snap, del, launch := ex.index("incus storage volume snapshot default rest-x-data pre-update-"), ex.index("incus delete"), ex.index("incus launch")
+	snap, del, launch := ex.index("incus storage volume snapshot create 'default' 'rest-x-data' 'pre-update-"), ex.index("incus delete"), ex.index("incus launch")
 	if snap < 0 || !(snap < del && del < launch) {
 		t.Fatalf("want snapshot < delete < launch, got %d %d %d\n%v", snap, del, launch, ex.cmds)
 	}
