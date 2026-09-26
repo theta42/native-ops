@@ -256,6 +256,45 @@ routing_pattern: "{slug}.example.com"
 
 ---
 
+## Re-running is safe (idempotency)
+
+Every command is meant to be run again by CI: a second run against an unchanged
+fleet changes nothing, and a run that was interrupted can simply be repeated.
+
+| Command | Running it again |
+|---|---|
+| `apply` | Converges each service. A service that already matches its manifest is **left alone** (no restart, snapshot, or Caddy reload). Only what drifted is fixed: changed `limits` and a missing volume are applied live, changed `env` values are merged and the service restarted, a moved image is replaced through the safe update path (below). |
+| `instance launch` | Resumes its own half-finished launch (the instance carries `user.native-ops.template`); a complete instance is a no-op; an instance of that name from a different origin is refused, never adopted. |
+| `instance update` | No-op when the instance already runs the requested image (`--force` overrides). |
+| `instance migrate` | Resumable with `--resume`; `--finalize` succeeds as a no-op once the source is gone. |
+| `instance destroy`, DNS sync, edge publish/remove | No-ops when there is nothing to change. |
+
+What "converge" means in detail:
+
+- **Image change detection.** A local image alias is compared by fingerprint, so
+  re-pointing `app:latest` triggers a replace. An OCI reference (`postgres:16`) is
+  compared by the reference string recorded on the instance (`user.native-ops.image`), so
+  **pin your tags**: `postgres:16` is not re-pulled, `postgres:17` replaces. An existing
+  container with no recorded reference is *adopted* (recorded, not restarted).
+- **Environment.** Keys declared in the manifest are set; keys that are *not* declared are
+  preserved, because another system (e.g. a fleet manager) may have written runtime secrets
+  into the file. The file is only rewritten (and the service restarted) when a declared value
+  differs, and its keys are always written in sorted order.
+- **Hooks** (`pre_deploy`, `container_init`, `post_deploy`) run only when a service is
+  actually (re)deployed, not on every apply. Profile drift is reported, not changed.
+- **DNS** sync only creates and updates records, matched by type, name *and* value, so
+  multi-value sets (MX, TXT, round-robin A) work; it never deletes a record it wasn't told about.
+- **Caddy edge.** An existing Caddyfile is never overwritten (one that doesn't `import
+  /etc/caddy/sites/*.caddy` is an error, because published sites would never be served). A
+  missing one is created with an ACME contact only if `NATIVE_OPS_ACME_EMAIL` is set. A site
+  file with identical content is not rewritten and Caddy isn't reloaded; a new one is validated
+  first and rolled back if Caddy rejects it; a failed reload is an error.
+- **Hosts.** `reconcile` finds a host by name at any status (a droplet still provisioning is
+  waited for, not duplicated) and **never destroys or rebuilds a host on its own**: if a host
+  exists but SSH fails, it stops and tells you why.
+
+---
+
 ## Backup & Restore (S3-compatible)
 
 Custom storage volumes can be backed up off-host to any S3-compatible object

@@ -614,3 +614,28 @@ func TestFinalizeRefusesWhenAnythingIsInDoubt(t *testing.T) {
 		}
 	})
 }
+
+func TestFinalizeIsRepeatable(t *testing.T) {
+	sim, mm, _ := migrated()
+	ctx := context.Background()
+	if err := mm.Finalize(ctx, finalizeParams()); err != nil {
+		t.Fatal(err)
+	}
+	sim.cmds = nil
+	if err := mm.Finalize(ctx, finalizeParams()); err != nil {
+		t.Fatalf("a repeated finalize must succeed as a no-op: %v", err)
+	}
+	if sim.mutating() != 0 {
+		t.Fatalf("the repeat must change nothing: %v", sim.cmds)
+	}
+}
+
+func TestFinalizeStillRefusesWhenTheInstanceIsNowhereRunning(t *testing.T) {
+	sim, mm, _ := migrated()
+	delete(sim.status["src"], "rest-x")
+	sim.status["dst"]["rest-x"] = "Stopped"
+	err := mm.Finalize(context.Background(), finalizeParams())
+	if err == nil || !strings.Contains(err.Error(), "nothing safe to finalize") {
+		t.Fatalf("got %v", err)
+	}
+}

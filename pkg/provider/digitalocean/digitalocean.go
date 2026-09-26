@@ -345,51 +345,40 @@ func (c *Client) DeleteRecord(ctx context.Context, domain string, recordID strin
 	return nil
 }
 
+// SyncRecords brings the zone to the desired state by creating and updating
+// records (never deleting). See provider.PlanDNSSync for the matching rules;
+// running it again with the same input makes no API calls beyond the listing.
 func (c *Client) SyncRecords(ctx context.Context, domain string, desired []provider.DNSRecord) error {
 	existing, err := c.ListRecords(ctx, domain)
 	if err != nil {
 		return fmt.Errorf("sync DNS records: %w", err)
 	}
 
-	// Index existing records by Type + Name
-	existingMap := make(map[string]provider.DNSRecord)
-	for _, r := range existing {
-		key := fmt.Sprintf("%s:%s", r.Type, r.Name)
-		existingMap[key] = r
-	}
-
-	for _, d := range desired {
-		key := fmt.Sprintf("%s:%s", d.Type, d.Name)
-		curr, exists := existingMap[key]
-
-		if exists {
-			if curr.Value != d.Value {
-				// Update record
-				payload := map[string]any{
-					"data": d.Value,
-				}
-				path := fmt.Sprintf("/domains/%s/records/%s", domain, curr.ID)
-				if err := c.request(ctx, http.MethodPut, path, payload, nil); err != nil {
-					return fmt.Errorf("update DNS record %s on %s: %w", d.Name, domain, err)
-				}
+	for _, ch := range provider.PlanDNSSync(existing, desired) {
+		d := ch.Record
+		payload := map[string]any{"data": d.Value}
+		if d.TTL > 0 {
+			payload["ttl"] = d.TTL
+		}
+		if d.Priority > 0 {
+			payload["priority"] = d.Priority
+		}
+		if ch.Update {
+			path := fmt.Sprintf("/domains/%s/records/%s", domain, d.ID)
+			if err := c.request(ctx, http.MethodPut, path, payload, nil); err != nil {
+				return fmt.Errorf("update DNS record %s on %s: %w", d.Name, domain, err)
 			}
-		} else {
-			// Create record
-			payload := map[string]any{
-				"type": d.Type,
-				"name": d.Name,
-				"data": d.Value,
-				"ttl":  1800,
-			}
-			if d.TTL > 0 {
-				payload["ttl"] = d.TTL
-			}
-			path := fmt.Sprintf("/domains/%s/records", domain)
-			if err := c.request(ctx, http.MethodPost, path, payload, nil); err != nil {
-				return fmt.Errorf("create DNS record %s on %s: %w", d.Name, domain, err)
-			}
+			continue
+		}
+		payload["type"] = d.Type
+		payload["name"] = d.Name
+		if _, ok := payload["ttl"]; !ok {
+			payload["ttl"] = 1800
+		}
+		path := fmt.Sprintf("/domains/%s/records", domain)
+		if err := c.request(ctx, http.MethodPost, path, payload, nil); err != nil {
+			return fmt.Errorf("create DNS record %s on %s: %w", d.Name, domain, err)
 		}
 	}
-
 	return nil
 }

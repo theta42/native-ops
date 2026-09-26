@@ -293,16 +293,21 @@ func (m *MigrationManager) Finalize(ctx context.Context, p FinalizeParams) error
 	if err != nil {
 		return err
 	}
-	s, ok := srcInst[name]
-	if !ok {
-		return fmt.Errorf("instance %s not found on %s (already finalized?)", name, src)
-	}
-	if s != "Stopped" {
-		return fmt.Errorf("%s on %s is %s; refusing to delete a live instance", name, src, s)
-	}
 	dstInst, err := m.incus.InstanceStatuses(ctx, dst)
 	if err != nil {
 		return err
+	}
+	s, ok := srcInst[name]
+	if !ok {
+		// Already gone from the source: a repeated finalize (e.g. a CI retry) succeeds.
+		if dstInst[name] == "Running" {
+			log.Printf("==> [Migration] %s is already gone from %s and running on %s; nothing to finalize.\n", name, src, dst)
+			return nil
+		}
+		return fmt.Errorf("instance %s is not on %s and is %q (not Running) on %s; there is nothing safe to finalize", name, src, dstInst[name], dst)
+	}
+	if s != "Stopped" {
+		return fmt.Errorf("%s on %s is %s; refusing to delete a live instance", name, src, s)
 	}
 	if dstInst[name] != "Running" {
 		return fmt.Errorf("%s on %s is %q, not Running; refusing to delete the source", name, dst, dstInst[name])
