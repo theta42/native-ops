@@ -1,0 +1,373 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/theta42/native-ops/pkg/config"
+	"github.com/theta42/native-ops/pkg/incus"
+)
+
+// Kinds of change a plan reports.
+const (
+	ChangeCreateInstance = "create-instance"
+	ChangeReplaceImage   = "replace-image"
+	ChangeAdoptImage     = "adopt-image"
+	ChangeCreateVolume   = "create-volume"
+	ChangeAttachVolume   = "attach-volume"
+	ChangeSetLimits      = "set-limits"
+	ChangeSetEnv         = "set-env"
+	ChangeRestart        = "restart"
+	ChangePublishRoute   = "publish-route"
+	ChangeUpdateRoute    = "update-route"
+	ChangeBaseCaddyfile  = "create-base-caddyfile"
+	ChangeRunHook        = "run-hook"
+)
+
+// Actions a service plan can have.
+const (
+	ActionNone    = "none"    // the service already matches its manifest
+	ActionCreate  = "create"  // there is no such instance yet
+	ActionUpdate  = "update"  // it exists and apply would change something
+	ActionBlocked = "blocked" // apply would fail
+)
+
+// Change is one thing `apply` would do. Detail never contains a secret: environment
+// values are never read into it, only key names.
+type Change struct {
+	Kind   string `json:"kind"`
+	Detail string `json:"detail"`
+}
+
+// ServicePlan is what `apply` would do for one service, worked out without changing anything.
+type ServicePlan struct {
+	Service string   `json:"service"`
+	Action  string   `json:"action"`
+	Changes []Change `json:"changes,omitempty"`
+	// Notes are things apply will not act on but you should know about.
+	Notes []string `json:"notes,omitempty"`
+	// Blockers are reasons apply would fail on this service.
+	Blockers []string `json:"blockers,omitempty"`
+}
+
+func (p *ServicePlan) add(kind, format string, a ...any) {
+	p.Changes = append(p.Changes, Change{Kind: kind, Detail: fmt.Sprintf(format, a...)})
+}
+func (p *ServicePlan) note(format string, a ...any) {
+	p.Notes = append(p.Notes, fmt.Sprintf(format, a...))
+}
+func (p *ServicePlan) block(format string, a ...any) {
+	p.Blockers = append(p.Blockers, fmt.Sprintf(format, a...))
+}
+
+func (p *ServicePlan) finish(exists bool) {
+	switch {
+	case len(p.Blockers) > 0:
+		p.Action = ActionBlocked
+	case !exists:
+		p.Action = ActionCreate
+	case len(p.Changes) > 0:
+		p.Action = ActionUpdate
+	default:
+		p.Action = ActionNone
+	}
+}
+
+// PlanService works out what DeployService would do for a service, without doing it. It
+// makes the same decisions as DeployService by calling the same functions (imageDecision,
+// limitsDrift, readEnvState, VolumeAttachment, PlanSiteFor), so the two cannot drift apart,
+// and it should be given a Deployer built on remote.ReadOnly, which turns any command that
+// could change the host into an error. A failure to read the host is an error; a manifest
+// that apply would refuse is a Blocker in the plan.
+func (d *Deployer) PlanService(ctx context.Context, svc *config.ServiceConfig, configDir string) (*ServicePlan, error) {
+	if !incus.ValidName(svc.Name) {
+		return nil, fmt.Errorf("invalid service name %q", svc.Name)
+	}
+	p := &ServicePlan{Service: svc.Name}
+	deployRef, fp := d.resolveServiceImage(ctx, svc.Image)
+	exists, err := d.incus.InstanceExists(ctx, svc.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		err = d.planFresh(ctx, p, svc, configDir, deployRef)
+	} else {
+		err = d.planConverge(ctx, p, svc, configDir, deployRef, fp)
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.finish(exists)
+	return p, nil
+}
+
+func hooksOf(svc *config.ServiceConfig) []string {
+	var h []string
+	if svc.Hooks.PreDeploy != "" {
+		h = append(h, "pre_deploy")
+	}
+	if svc.Hooks.ContainerInit != "" {
+		h = append(h, "container_init")
+	}
+	if svc.Hooks.PostDeploy != "" {
+		h = append(h, "post_deploy")
+	}
+	return h
+}
+
+func (d *Deployer) planFresh(ctx context.Context, p *ServicePlan, svc *config.ServiceConfig, configDir, deployRef string) error {
+	detail := fmt.Sprintf("launch %s from %s with profiles %s", svc.Name, deployRef, strings.Join(d.profilesOf(svc), ","))
+	if len(svc.Limits) > 0 {
+		detail += " and " + joinKV(svc.Limits)
+	}
+	p.add(ChangeCreateInstance, "%s", detail)
+	for _, vol := range svc.Volumes {
+		ok, err := d.incus.VolumeExists(ctx, vol.Pool, vol.Name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			p.add(ChangeCreateVolume, "%s on pool %s", vol.Name, servicePool(vol.Pool))
+			p.add(ChangeAttachVolume, "%s at %s", vol.Name, vol.Path)
+		} else {
+			p.add(ChangeAttachVolume, "the existing volume %s at %s (its data is kept)", vol.Name, vol.Path)
+		}
+	}
+	if declared := serviceEnv(svc, configDir); len(declared) > 0 {
+		p.add(ChangeSetEnv, "write /etc/default/%s with %d keys: %s", svc.Name, len(declared), strings.Join(sortedKeys(declared), ", "))
+	}
+	if err := d.planRoute(ctx, p, svc, nil, routeFresh); err != nil {
+		return err
+	}
+	for _, h := range hooksOf(svc) {
+		p.add(ChangeRunHook, "%s", h)
+	}
+	return nil
+}
+
+func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config.ServiceConfig, configDir, deployRef, fp string) error {
+	st, err := d.incus.CaptureInstanceState(ctx, svc.Name)
+	if err != nil {
+		return err
+	}
+
+	replace := false
+	switch imageDecision(st, fp, deployRef) {
+	case imageUnknown:
+		p.note("%s was launched from an image that cannot be identified, so apply will not replace it", svc.Name)
+	case imageAdopt:
+		p.add(ChangeAdoptImage, "record %s as the image %s runs (nothing restarts)", deployRef, svc.Name)
+	case imageReplace:
+		replace = true
+		running := st.Config[incus.ImageKey]
+		if fp != "" {
+			running = short(st.BaseImage)
+			p.add(ChangeReplaceImage, "%s: image %s -> %s, through the safe update path (volume snapshot first, config and env carried over, health-gated, rolled back on failure)", svc.Name, running, short(fp))
+		} else {
+			p.add(ChangeReplaceImage, "%s: image %s -> %s, through the safe update path (volume snapshot first, config and env carried over, health-gated, rolled back on failure)", svc.Name, running, deployRef)
+		}
+		for _, h := range hooksOf(svc) {
+			p.add(ChangeRunHook, "%s", h)
+		}
+	}
+
+	declared := serviceEnv(svc, configDir)
+	if !replace {
+		if drift := limitsDrift(st, svc.Limits); len(drift) > 0 {
+			var parts []string
+			for _, k := range sortedKeys(drift) {
+				parts = append(parts, fmt.Sprintf("%s: %s -> %s", k, orNone(st.Config[k]), drift[k]))
+			}
+			p.add(ChangeSetLimits, "%s", strings.Join(parts, ", "))
+		}
+		for _, vol := range svc.Volumes {
+			pool := servicePool(vol.Pool)
+			ok, err := d.incus.VolumeExists(ctx, vol.Pool, vol.Name)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				p.add(ChangeCreateVolume, "%s on pool %s", vol.Name, pool)
+			}
+			attached, clash := st.VolumeAttachment(pool, vol.Name, vol.Path)
+			switch {
+			case attached:
+			case clash != nil:
+				p.block("%v", incus.VolumeClashError(svc.Name, vol.Name, vol.Path, clash))
+			default:
+				p.add(ChangeAttachVolume, "%s at %s", vol.Name, vol.Path)
+			}
+		}
+	}
+
+	if len(declared) > 0 {
+		es, err := readEnvState(ctx, d.incus, svc.Name, svc.Name, declared)
+		if err != nil {
+			return err
+		}
+		if !es.Found || es.Differs {
+			var parts []string
+			if !es.Found {
+				parts = append(parts, "the file does not exist yet")
+			}
+			if len(es.Added) > 0 {
+				parts = append(parts, "add "+strings.Join(es.Added, ", "))
+			}
+			if len(es.Changed) > 0 {
+				parts = append(parts, "change "+strings.Join(es.Changed, ", "))
+			}
+			if es.Kept > 0 {
+				parts = append(parts, fmt.Sprintf("%d keys the manifest does not declare are kept", es.Kept))
+			}
+			p.add(ChangeSetEnv, "/etc/default/%s: %s", svc.Name, strings.Join(parts, "; "))
+			p.add(ChangeRestart, "%s restarts to pick up the environment", svc.Name)
+		}
+		for k := range st.Config {
+			if strings.HasPrefix(k, "environment.") {
+				p.note("%s takes its environment from environment.* instance config (an OCI container); apply writes /etc/default/%s, which that container does not read", svc.Name, svc.Name)
+				break
+			}
+		}
+	}
+
+	if !sameProfiles(st.Profiles, d.profilesOf(svc)) {
+		p.note("profiles of %s differ (live %v, declared %v); apply does not change profiles", svc.Name, st.Profiles, d.profilesOf(svc))
+	}
+
+	// A running instance is health-checked and routed to by address. A stopped one has none, and
+	// apply would fail waiting for it, unless it is being replaced (the replacement gets its own).
+	var ips []string
+	if svc.HealthCheck.Path != "" || (svc.Routing != nil && svc.Routing.Domain != "") {
+		ips, err = d.incus.GlobalIPv4s(ctx, svc.Name)
+		if err != nil {
+			return err
+		}
+		if len(ips) == 0 && !replace {
+			p.block("%s has no IPv4 address (is it stopped?), so apply could not health-check it or route to it", svc.Name)
+			return nil
+		}
+	}
+	mode := routeExisting
+	if replace {
+		mode = routeReplacing
+	}
+	return d.planRoute(ctx, p, svc, ips, mode)
+}
+
+type routeMode int
+
+const (
+	routeFresh     routeMode = iota // the instance does not exist yet, so it has no address
+	routeExisting                   // it runs, and ips are its addresses
+	routeReplacing                  // it is being replaced, and the route follows the new address
+)
+
+// planRoute adds the route change, if any.
+func (d *Deployer) planRoute(ctx context.Context, p *ServicePlan, svc *config.ServiceConfig, ips []string, mode routeMode) error {
+	if svc.Routing == nil || svc.Routing.Domain == "" {
+		return nil
+	}
+	if svc.Name == d.caddy.Container() && mode == routeFresh {
+		p.note("%s is the edge: it is created first, and its Caddyfile is written if it has none", svc.Name)
+		return nil
+	}
+	if svc.Name != d.caddy.Container() {
+		ok, err := d.incus.InstanceExists(ctx, d.caddy.Container())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			p.block("the edge instance %q does not exist, so the route for %s cannot be published", d.caddy.Container(), svc.Routing.Domain)
+			return nil
+		}
+	}
+	if mode == routeReplacing {
+		p.add(ChangeUpdateRoute, "%s follows the replacement's new address", svc.Routing.Domain)
+		return nil
+	}
+	sp, err := d.caddy.PlanSiteFor(ctx, svc.Name, *svc.Routing, ips)
+	if err != nil {
+		p.block("%v", err)
+		return nil
+	}
+	if sp.CreatesBaseCaddyfile {
+		p.add(ChangeBaseCaddyfile, "the edge has no Caddyfile; one that imports the sites directory is written")
+	}
+	switch sp.Change {
+	case "create":
+		p.add(ChangePublishRoute, "%s -> %s:%d (%s)", svc.Routing.Domain, svc.Name, svc.Routing.UpstreamPort, sp.Detail)
+	case "update":
+		p.add(ChangeUpdateRoute, "%s -> %s:%d (%s)", svc.Routing.Domain, svc.Name, svc.Routing.UpstreamPort, sp.Detail)
+	}
+	return nil
+}
+
+func short(fp string) string {
+	if len(fp) > 12 {
+		return fp[:12]
+	}
+	return fp
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(unset)"
+	}
+	return s
+}
+
+func joinKV(m map[string]string) string {
+	var parts []string
+	for _, k := range sortedKeys(m) {
+		parts = append(parts, k+"="+m[k])
+	}
+	return strings.Join(parts, " ")
+}
+
+// FleetPlan is the plan for every service that would be applied.
+type FleetPlan struct {
+	Services []*ServicePlan `json:"services"`
+}
+
+// Counts returns how many services fall in each action.
+func (f *FleetPlan) Counts() map[string]int {
+	c := map[string]int{}
+	for _, s := range f.Services {
+		c[s.Action]++
+	}
+	return c
+}
+
+// Pending reports whether apply would change anything.
+func (f *FleetPlan) Pending() bool {
+	c := f.Counts()
+	return c[ActionCreate]+c[ActionUpdate] > 0
+}
+
+// Blocked reports whether apply would fail on any service.
+func (f *FleetPlan) Blocked() bool { return f.Counts()[ActionBlocked] > 0 }
+
+// Render is the human-readable form.
+func (f *FleetPlan) Render() string {
+	var sb strings.Builder
+	sym := map[string]string{ActionNone: " ", ActionCreate: "+", ActionUpdate: "~", ActionBlocked: "!"}
+	svcs := append([]*ServicePlan(nil), f.Services...)
+	sort.SliceStable(svcs, func(i, j int) bool { return svcs[i].Service < svcs[j].Service })
+	for _, s := range svcs {
+		fmt.Fprintf(&sb, "%s %s (%s)\n", sym[s.Action], s.Service, s.Action)
+		for _, c := range s.Changes {
+			fmt.Fprintf(&sb, "    %-22s %s\n", c.Kind, c.Detail)
+		}
+		for _, b := range s.Blockers {
+			fmt.Fprintf(&sb, "    BLOCKED: %s\n", b)
+		}
+		for _, n := range s.Notes {
+			fmt.Fprintf(&sb, "    note: %s\n", n)
+		}
+	}
+	c := f.Counts()
+	fmt.Fprintf(&sb, "\nPlan: %d to create, %d to update, %d unchanged, %d blocked.\n", c[ActionCreate], c[ActionUpdate], c[ActionNone], c[ActionBlocked])
+	return sb.String()
+}

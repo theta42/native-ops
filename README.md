@@ -76,6 +76,7 @@ Commands:
   host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)
   host destroy     Tear down a host VM
   host list        List active hosts for a provider
+  plan             Show what apply would change, without changing anything
   apply            Declaratively apply services from native-ops-conf
   instance launch  Launch a dynamic workload from a template
   instance update  Immutable container update for an instance
@@ -310,6 +311,46 @@ What "converge" means in detail:
 - **Hosts.** `reconcile` finds a host by name at any status (a droplet still provisioning is
   waited for, not duplicated) and **never destroys or rebuilds a host on its own**: if a host
   exists but SSH fails, it stops and tells you why.
+
+## Plan before you apply
+
+```bash
+native-ops plan --config-dir .            # what would `apply` do?
+native-ops plan --config-dir . --json     # the same, for a script or a PR comment
+native-ops plan --config-dir . --service gitea
+```
+
+`plan` reads the host and your manifests and prints, per service, what `apply` would do:
+`+` create, `~` update, blank for unchanged, `!` blocked. It changes nothing, by construction:
+it runs behind an executor that only allows a short list of read-only `incus` commands and
+turns anything else into an error, so this holds for code added later too.
+
+| Exit status | Meaning |
+|---|---|
+| `0` | Nothing to change. |
+| `2` | Changes are pending (run `apply` to make them). |
+| `1` | `apply` would fail on some service (a *blocked* service, with the reason), or the host could not be read. |
+
+What it reports: a new instance and its volumes; an image that moved (replaced through the safe
+update path); a running instance that has no recorded image (adopted, no restart); limits that
+differ (old -> new); volumes to create or attach; environment **key names** to add or change
+(values are never printed, so the output is safe to keep in CI logs) and how many live keys the
+manifest does not declare (kept); a route that is missing or points elsewhere. It also lists
+things `apply` will not act on but you should know: profiles that differ, an image that cannot be
+identified, and an OCI container that takes its environment from `environment.*` config (which
+`apply` does not write).
+
+Blocked means `apply` would refuse: a device already using the name a volume needs, an edge
+Caddyfile that does not import the sites directory, no edge instance to publish a route to, or a
+stopped instance that cannot be health-checked or routed to.
+
+Use it in CI on every pull request (`native-ops plan; [ $? -ne 1 ]` fails only on blocked) and
+before adopting a running host: a plan against production is how you find out what applying
+your manifests would actually change.
+
+`plan` and `apply` share their decisions (which image is current, which limits drifted, what
+the environment file needs, whether a volume is attached, which upstream a route uses), so they
+cannot disagree; the tests run both against the same states and compare.
 
 ---
 
