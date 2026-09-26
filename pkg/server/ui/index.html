@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>native-ops</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>native-ops</h1>
+    <span id="host" class="muted"></span>
+    <span class="spacer"></span>
+    <span id="who" class="muted"></span>
+    <button id="signout" hidden>Sign out</button>
+  </header>
+
+  <main>
+    <section id="login" hidden>
+      <h2>Sign in</h2>
+      <p class="muted">Paste an API token. It is kept for this browser tab only.</p>
+      <form id="loginForm" autocomplete="off">
+        <input id="token" type="password" placeholder="nops_…" autocomplete="off" spellcheck="false" required>
+        <button type="submit">Sign in</button>
+      </form>
+      <p id="loginError" class="error"></p>
+    </section>
+
+    <section id="app" hidden>
+      <div id="warnings"></div>
+      <h2>Instances <span id="instCount" class="muted"></span></h2>
+      <div class="scroll"><table id="instances"></table></div>
+      <h2>Volumes <span id="volCount" class="muted"></span></h2>
+      <div class="scroll"><table id="volumes"></table></div>
+      <h2>Images</h2>
+      <p id="images" class="muted"></p>
+      <p id="updated" class="muted"></p>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
