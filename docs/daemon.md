@@ -175,7 +175,7 @@ native-ops token create --state-dir /var/lib/native-ops --name fleet-manager --r
 curl -X PUT "$URL/v1/instances/demo-multi" -H "Authorization: Bearer $TOKEN" -d '{
   "template": "platform", "image": "opsavor-platform:latest",
   "limits": {"limits.cpu": "1", "limits.memory": "1GB"},
-  "volumes": [{"name": "demo-multi-data", "path": "/app/.data"}],
+  "volumes": [{"name": "demo-multi-data", "path": "/app/.data", "owner": "platform"}],
   "service": "platform", "env": {"OPSAVOR_SEED": "multi", "PORT": "8787"},
   "health": {"path": "/health", "port": 8787},
   "domain": "demo-multi.opsavor.app", "route_directives": ["import strip-forged-identity"]
@@ -195,11 +195,12 @@ What stops a fleet manager, or anyone holding its token, from doing more than th
   must be a `deployer` token and needs names and images (no domains means no route may be published).
 - **A strict spec.** A request is checked against a short list of shapes before anything runs: only the
   profiles the operator allows (`--instance-profiles`, default `base,service`), only `limits.cpu` and
-  `limits.memory`, data volumes named `<instance>-...` at clean absolute paths, environment names in
-  `[A-Z_][A-Z0-9_]*` with no line breaks, a health check, a host name, and route directives that are only
-  `import <snippet>` from the operator's list (`--instance-route-imports`, default none). Unknown fields are
-  refused. There is no way to ask for a privileged container, a host path, another instance's volume, or a
-  shell.
+  `limits.memory`, data volumes named `<instance>-...` at clean absolute paths (`owner`, if given, only a
+  plausible Unix user name -- a fresh volume attaches root-owned, so a service that runs as another user
+  needs its mount point, never its contents, handed over once), environment names in `[A-Z_][A-Z0-9_]*`
+  with no line breaks, a health check, a host name, and route directives that are only `import <snippet>`
+  from the operator's list (`--instance-route-imports`, default none). Unknown fields are refused. There is
+  no way to ask for a privileged container, a host path, another instance's volume, or a shell.
 - **Only tenants.** An instance can be changed or removed here only if it was launched from a template
   (`user.native-ops.template`). gitea, plane and every other static service carry none and are refused, for
   every token, an admin's included; an instance of another template is never taken over.

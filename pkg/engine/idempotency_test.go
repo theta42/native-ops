@@ -44,6 +44,8 @@ type simCtr struct {
 	ip       string
 	restarts int
 	reloads  int
+	owners   map[string]string // path -> current owning user, "" meaning root (as a fresh mount is)
+	chowns   int               // how many times EnsurePathOwner actually changed one
 }
 
 var _ remote.Executor = (*hostSim)(nil)
@@ -56,16 +58,20 @@ func newHostSim(t *testing.T) *hostSim {
 }
 
 var (
-	simLaunchRe  = regexp.MustCompile(`^incus launch '([^']+)' '([^']+)'(.*)$`)
-	simFlagRe    = regexp.MustCompile(`--(profile|config) '([^']*)'`)
-	simListRe    = regexp.MustCompile(`^incus list '?([^' ]+)'? --format json$`)
-	simDevRe     = regexp.MustCompile(`^incus config device add '([^']+)' '([^']+)' '?(\w+)'?((?: '[^']*')*)$`)
-	simPushRe    = regexp.MustCompile(`^printf %s '([^']*)' \| base64 -d \| incus file push .* - '([^/']+)(/[^']*)'$`)
-	simPullRe    = regexp.MustCompile(`^incus file pull '([^/']+)(/[^']*)' -$`)
-	simExecRe    = regexp.MustCompile(`^incus exec '?([^' ]+)'? -- (.*)$`)
-	simHookRe    = regexp.MustCompile(`^echo '([^']*)' \| base64 -d \| (bash|incus exec '([^']+)' -- bash)$`)
-	simQuotedRe  = regexp.MustCompile(`'([^']*)'`)
-	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|device add) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$`)
+	simLaunchRe = regexp.MustCompile(`^incus launch '([^']+)' '([^']+)'(.*)$`)
+	simFlagRe   = regexp.MustCompile(`--(profile|config) '([^']*)'`)
+	simListRe   = regexp.MustCompile(`^incus list '?([^' ]+)'? --format json$`)
+	simDevRe    = regexp.MustCompile(`^incus config device add '([^']+)' '([^']+)' '?(\w+)'?((?: '[^']*')*)$`)
+	simPushRe   = regexp.MustCompile(`^printf %s '([^']*)' \| base64 -d \| incus file push .* - '([^/']+)(/[^']*)'$`)
+	simPullRe   = regexp.MustCompile(`^incus file pull '([^/']+)(/[^']*)' -$`)
+	simExecRe   = regexp.MustCompile(`^incus exec '?([^' ]+)'? -- (.*)$`)
+	simHookRe   = regexp.MustCompile(`^echo '([^']*)' \| base64 -d \| (bash|incus exec '([^']+)' -- bash)$`)
+	simQuotedRe = regexp.MustCompile(`'([^']*)'`)
+	// simStatRe/simChownRe match the two calls EnsurePathOwner makes: a plain read of the current owner,
+	// then -- only when it differs -- a chown to the one asked for.
+	simStatRe    = regexp.MustCompile(`^stat -c %U '([^']*)'$`)
+	simChownRe   = regexp.MustCompile(`^chown '([^']*)' '([^']*)'$`)
+	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|device add) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
 )
 
 func (s *hostSim) get(name string) (*simCtr, bool) { c, ok := s.ctrs[name]; return c, ok }
@@ -239,6 +245,21 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 			c.reloads++
 		case strings.HasPrefix(m[2], "rm -f '/etc/caddy"):
 			delete(c.files, strings.Trim(strings.TrimPrefix(m[2], "rm -f "), "'"))
+		case simStatRe.MatchString(m[2]):
+			path := simStatRe.FindStringSubmatch(m[2])[1]
+			owner := c.owners[path]
+			if owner == "" {
+				owner = "root" // exactly what a fresh mount is owned by
+			}
+			return owner, nil
+		case simChownRe.MatchString(m[2]):
+			cm := simChownRe.FindStringSubmatch(m[2])
+			owner, path := cm[1], cm[2]
+			if c.owners == nil {
+				c.owners = map[string]string{}
+			}
+			c.owners[path] = owner
+			c.chowns++
 		}
 	case strings.HasPrefix(cmd, "curl -s"):
 		return "200", nil
@@ -378,6 +399,62 @@ func TestApplyCorrectsDriftInPlaceWithoutReplacing(t *testing.T) {
 	}
 	if m := sim.mutations(); len(m) != 0 {
 		t.Fatalf("after converging, the next run must change nothing:\n%s", strings.Join(m, "\n"))
+	}
+}
+
+func TestApplyGivesAVolumeToItsOwnerOnAFreshDeployAndOnAConverge(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["gitea:latest"] = fpA
+	d := newTestDeployer(sim)
+	ctx := context.Background()
+	svc := giteaSvc()
+	svc.Volumes[0].Owner = "git"
+
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	c := sim.ctrs["gitea"]
+	if c.owners["/var/lib/gitea"] != "git" || c.chowns != 1 {
+		t.Fatalf("a fresh volume must be handed to its owner once: owners=%v chowns=%d", c.owners, c.chowns)
+	}
+
+	// Re-deploying finds it already right.
+	sim.reset()
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if c.chowns != 1 {
+		t.Fatalf("a volume that already belongs to its owner must not be chowned again, got %d", c.chowns)
+	}
+	if m := sim.mutations(); len(m) != 0 {
+		t.Fatalf("nothing to fix, so nothing may run: %v", m)
+	}
+
+	// A manifest that never sets an owner never asks: no new behavior for callers that don't use it.
+	sim2 := newHostSim(t)
+	sim2.aliases["gitea:latest"] = fpA
+	if err := newTestDeployer(sim2).DeployService(ctx, giteaSvc(), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if got := sim2.ctrs["gitea"].chowns; got != 0 {
+		t.Fatalf("no owner was declared, so nothing must be chowned, got %d", got)
+	}
+
+	// Converge: a volume added to an existing service also gets its owner.
+	sim3 := newHostSim(t)
+	sim3.aliases["gitea:latest"] = fpA
+	d3 := newTestDeployer(sim3)
+	base := giteaSvc()
+	if err := d3.DeployService(ctx, base, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	sim3.reset()
+	base.Volumes = append(base.Volumes, config.VolumeMount{Name: "gitea-repos", Path: "/srv/repos", Pool: "default", Shifted: true, Owner: "git"})
+	if err := d3.DeployService(ctx, base, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if got := sim3.ctrs["gitea"].owners["/srv/repos"]; got != "git" {
+		t.Fatalf("the volume added on converge must also be handed to its owner, got %q", got)
 	}
 }
 

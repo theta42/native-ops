@@ -37,6 +37,10 @@ type VolumeSpec struct {
 	Name    string `json:"name"`
 	Path    string `json:"path"`
 	Shifted *bool  `json:"shifted,omitempty"` // default true
+	// Owner, if set, is a user inside the instance (already existing there) that the mount point is
+	// handed to once attached. A fresh volume attaches root-owned regardless of what the image's own
+	// directory was owned by, so a service that runs as another user needs this to write to it.
+	Owner string `json:"owner,omitempty"`
 }
 
 // HealthSpec is the check that gates a launch and names the port the route points at.
@@ -101,6 +105,9 @@ func (s *InstanceSpec) Validate(name string, pol InstancePolicy) error {
 		}
 		if !path.IsAbs(v.Path) || path.Clean(v.Path) != v.Path || len(v.Path) > 200 || strings.Contains(v.Path, "\x00") {
 			return fmt.Errorf("volume path %q must be a clean absolute path", v.Path)
+		}
+		if v.Owner != "" && !incus.ValidUserName(v.Owner) {
+			return fmt.Errorf("volume owner %q is not a valid Unix user name", v.Owner)
 		}
 	}
 	if len(s.Env) > 64 {
@@ -168,7 +175,7 @@ func (s *InstanceSpec) TemplateConfig() *config.TemplateConfig {
 		if v.Shifted != nil {
 			shifted = *v.Shifted
 		}
-		t.Volumes = append(t.Volumes, config.VolumeMount{Name: v.Name, Path: v.Path, Pool: "default", Shifted: shifted})
+		t.Volumes = append(t.Volumes, config.VolumeMount{Name: v.Name, Path: v.Path, Pool: "default", Shifted: shifted, Owner: v.Owner})
 	}
 	if s.Health != nil {
 		t.HealthCheck = config.HealthCheckConfig{Path: s.Health.Path, Port: s.Health.Port, Timeout: s.Health.Timeout, Interval: 2}
