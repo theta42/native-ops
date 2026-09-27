@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -45,6 +47,8 @@ func main() {
 
 	case "apply":
 		handleApplyCommand(ctx, os.Args[2:])
+	case "plan":
+		handlePlanCommand(ctx, os.Args[2:])
 
 	case "instance":
 		handleInstanceCommand(ctx, os.Args[2:])
@@ -96,6 +100,7 @@ Core Commands:
   host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)
   host destroy     Tear down a host VM
   host list        List active hosts for a provider
+  plan             Show what apply would change, without changing anything
   apply            Declaratively apply services from native-ops-conf
   instance launch  Launch a dynamic workload from a template
   instance update  Immutable container update for an instance
@@ -211,6 +216,38 @@ func handleHostCommand(ctx context.Context, args []string) {
 	}
 }
 
+// loadServices reads the service manifests apply and plan work on, in the same order for both.
+func loadServices(configDir, only string) ([]*config.ServiceConfig, error) {
+	servicesDir := filepath.Join(configDir, "services")
+	entries, err := os.ReadDir(servicesDir)
+	if err != nil {
+		return nil, fmt.Errorf("read services directory %s: %w", servicesDir, err)
+	}
+	var out []*config.ServiceConfig
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		svcName := entry.Name()
+		if only != "" && only != svcName {
+			continue
+		}
+		svcFile := filepath.Join(servicesDir, svcName, "service.yml")
+		if _, err := os.Stat(svcFile); os.IsNotExist(err) {
+			continue
+		}
+		svcCfg, err := config.LoadServiceConfig(svcFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading %s: %w", svcFile, err)
+		}
+		if svcCfg.Name == "" {
+			svcCfg.Name = svcName
+		}
+		out = append(out, svcCfg)
+	}
+	return out, nil
+}
+
 func handleApplyCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("apply", flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf directory")
@@ -223,42 +260,76 @@ func handleApplyCommand(ctx context.Context, args []string) {
 	}
 	fmt.Printf("Applying infrastructure for fleet: %s (%s)\n", fleet.Name, fleet.Domain)
 
+	services, err := loadServices(*configDir, *targetService)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 	exec := remote.NewLocalExecutor()
 	deployer := engine.NewDeployer(exec)
-
-	servicesDir := filepath.Join(*configDir, "services")
-	entries, err := os.ReadDir(servicesDir)
-	if err != nil {
-		log.Fatalf("Failed to read services directory %s: %v", servicesDir, err)
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		svcName := entry.Name()
-		if *targetService != "" && *targetService != svcName {
-			continue
-		}
-
-		svcFile := filepath.Join(servicesDir, svcName, "service.yml")
-		if _, err := os.Stat(svcFile); os.IsNotExist(err) {
-			continue
-		}
-
-		svcCfg, err := config.LoadServiceConfig(svcFile)
-		if err != nil {
-			log.Fatalf("Error loading %s: %v", svcFile, err)
-		}
-		if svcCfg.Name == "" {
-			svcCfg.Name = svcName
-		}
-
+	for _, svcCfg := range services {
 		if err := deployer.DeployService(ctx, svcCfg, *configDir); err != nil {
-			log.Fatalf("Failed to deploy service %s: %v", svcName, err)
+			log.Fatalf("Failed to deploy service %s: %v", svcCfg.Name, err)
 		}
 	}
 	fmt.Println("Apply completed successfully.")
+}
+
+func handlePlanCommand(ctx context.Context, args []string) {
+	os.Exit(runPlan(ctx, args, os.Stdout, os.Stderr))
+}
+
+// runPlan shows what apply would do. It runs behind remote.ReadOnly, so it cannot change the
+// host: any command that could is refused. It returns the exit status: 0 nothing to change,
+// 2 changes pending, 1 apply would fail on some service or the host could not be read.
+func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configDir := flags.String("config-dir", ".", "Path to native-ops-conf directory")
+	targetService := flags.String("service", "", "Optional specific service to plan (e.g. gitea)")
+	asJSON := flags.Bool("json", false, "Print the plan as JSON")
+	if err := flags.Parse(args); err != nil {
+		return 1
+	}
+
+	fleet, err := config.LoadFleetConfig(*configDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "Failed to load fleet config: %v\n", err)
+		return 1
+	}
+	services, err := loadServices(*configDir, *targetService)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	deployer := engine.NewDeployer(remote.ReadOnly(remote.NewLocalExecutor()))
+	fp := &engine.FleetPlan{Services: []*engine.ServicePlan{}}
+	for _, svcCfg := range services {
+		p, err := deployer.PlanService(ctx, svcCfg, *configDir)
+		if err != nil {
+			fmt.Fprintf(stderr, "Could not plan service %s: %v\n", svcCfg.Name, err)
+			return 1
+		}
+		fp.Services = append(fp.Services, p)
+	}
+
+	if *asJSON {
+		out, _ := json.MarshalIndent(fp, "", "  ")
+		fmt.Fprintln(stdout, string(out))
+	} else {
+		who := fleet.Name
+		if fleet.Domain != "" {
+			who += " (" + fleet.Domain + ")"
+		}
+		fmt.Fprintf(stdout, "Plan for fleet: %s. Nothing has been changed.\n\n", who)
+		fmt.Fprint(stdout, fp.Render())
+	}
+	switch {
+	case fp.Blocked():
+		return 1
+	case fp.Pending():
+		return 2
+	}
+	return 0
 }
 
 func handleInstanceCommand(ctx context.Context, args []string) {
