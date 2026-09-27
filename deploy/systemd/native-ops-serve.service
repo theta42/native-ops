@@ -22,6 +22,9 @@ StateDirectory=native-ops
 StateDirectoryMode=0700
 Restart=on-failure
 RestartSec=3
+# A running apply is finished before the daemon exits (up to 5 minutes), so a stop or upgrade does
+# not leave the host part-way. Apply itself is off unless ExecStart has --enable-apply.
+TimeoutStopSec=6min
 
 # Hardening. The daemon needs the Incus socket and its own state directory, nothing else.
 NoNewPrivileges=true

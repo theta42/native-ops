@@ -2,12 +2,18 @@ package engine
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/incus"
+	"github.com/theta42/native-ops/pkg/remote"
 )
 
 // Kinds of change a plan reports.
@@ -50,6 +56,10 @@ type ServicePlan struct {
 	Notes []string `json:"notes,omitempty"`
 	// Blockers are reasons apply would fail on this service.
 	Blockers []string `json:"blockers,omitempty"`
+
+	// bind is a keyed digest of everything the manifest says that the plan does not print (see
+	// WithBindKey). It is never serialized; it only goes into FleetPlan.Hash.
+	bind string
 }
 
 func (p *ServicePlan) add(kind, format string, a ...any) {
@@ -100,7 +110,52 @@ func (d *Deployer) PlanService(ctx context.Context, svc *config.ServiceConfig, c
 		return nil, err
 	}
 	p.finish(exists)
+	p.bind = d.bindOf(svc, configDir)
 	return p, nil
+}
+
+// bindOf digests what a service's manifest says that its plan does not show: the declared
+// environment with its values, the resolved bodies of its hooks, and the rest of the manifest
+// (health check, profiles, and so on). It is keyed (HMAC), so it says nothing about a value to
+// anyone who lacks the key, and it is empty when no key was given.
+func (d *Deployer) bindOf(svc *config.ServiceConfig, configDir string) string {
+	if d.bind == nil {
+		return ""
+	}
+	b, _ := json.Marshal(struct {
+		Manifest *config.ServiceConfig
+		Env      map[string]string
+		Hooks    map[string]string
+	}{svc, serviceEnv(svc, configDir), map[string]string{
+		"pre_deploy":     hookBody(configDir, svc, svc.Hooks.PreDeploy),
+		"container_init": hookBody(configDir, svc, svc.Hooks.ContainerInit),
+		"post_deploy":    hookBody(configDir, svc, svc.Hooks.PostDeploy),
+	}})
+	return d.bind(b)
+}
+
+func hookBody(configDir string, svc *config.ServiceConfig, hook string) string {
+	if hook == "" {
+		return ""
+	}
+	return hookScript(configDir, svc.Name, hook)
+}
+
+// PlanOption changes how PlanFleet plans.
+type PlanOption func(*Deployer)
+
+// WithBindKey makes the plan's Hash cover the parts of a manifest the plan does not print
+// (environment values, hook bodies), keyed with key so the hash reveals nothing about them.
+// Without it a hash only covers what the plan says, and a changed secret or hook with the same
+// key names would give the same hash. A daemon that gates apply on a hash must use it.
+func WithBindKey(key []byte) PlanOption {
+	return func(d *Deployer) {
+		d.bind = func(data []byte) string {
+			m := hmac.New(sha256.New, key)
+			m.Write(data)
+			return hex.EncodeToString(m.Sum(nil))
+		}
+	}
 }
 
 func hooksOf(svc *config.ServiceConfig) []string {
@@ -370,4 +425,87 @@ func (f *FleetPlan) Render() string {
 	c := f.Counts()
 	fmt.Fprintf(&sb, "\nPlan: %d to create, %d to update, %d unchanged, %d blocked.\n", c[ActionCreate], c[ActionUpdate], c[ActionNone], c[ActionBlocked])
 	return sb.String()
+}
+
+// ErrBadConfig marks a plan that failed because the configuration is unusable (missing
+// fleet.yml, a manifest that does not parse), as opposed to the host being unreadable.
+var ErrBadConfig = errors.New("invalid configuration")
+
+// PlanFleet plans every service in a config directory (only one when service is set) against
+// the host behind exec, which it wraps in remote.ReadOnly, so the host cannot change.
+func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service string, opts ...PlanOption) (*FleetPlan, error) {
+	if _, err := config.LoadFleetConfig(configDir); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
+	}
+	services, err := config.LoadServices(configDir, service)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
+	}
+	d := NewDeployer(remote.ReadOnly(exec))
+	for _, o := range opts {
+		o(d)
+	}
+	fp := &FleetPlan{Services: []*ServicePlan{}}
+	for _, svc := range services {
+		p, err := d.PlanService(ctx, svc, configDir)
+		if err != nil {
+			return nil, fmt.Errorf("plan service %s: %w", svc.Name, err)
+		}
+		fp.Services = append(fp.Services, p)
+	}
+	return fp, nil
+}
+
+// ExitStatus is the status `native-ops plan` exits with: 1 when apply would fail on some
+// service, 2 when changes are pending, 0 when there is nothing to do.
+func (f *FleetPlan) ExitStatus() int {
+	switch {
+	case f.Blocked():
+		return 1
+	case f.Pending():
+		return 2
+	}
+	return 0
+}
+
+// Hash identifies what a plan would do: the same changes give the same hash, whatever order the
+// services were planned in. An apply that is given the hash of a plan somebody reviewed can
+// refuse to run if the host or the manifests have changed since.
+func (f *FleetPlan) Hash() string {
+	svcs := append([]*ServicePlan(nil), f.Services...)
+	sort.SliceStable(svcs, func(i, j int) bool { return svcs[i].Service < svcs[j].Service })
+	type hashed struct {
+		Plan *ServicePlan
+		Bind string
+	}
+	rows := make([]hashed, len(svcs))
+	for i, sp := range svcs {
+		rows[i] = hashed{sp, sp.bind}
+	}
+	b, _ := json.Marshal(rows)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// ApplyPlan applies what a plan says would change, and nothing else: each service whose action is
+// create or update is deployed, in plan order, and it stops at the first failure (services after
+// it are left alone; running the same apply again is safe and continues). A blocked plan is
+// refused before anything is touched. configDir must be the tree the plan was made from.
+func (d *Deployer) ApplyPlan(ctx context.Context, configDir string, plan *FleetPlan) error {
+	if plan.Blocked() {
+		return errors.New("the plan is blocked; nothing was applied")
+	}
+	for _, sp := range plan.Services {
+		if sp.Action != ActionCreate && sp.Action != ActionUpdate {
+			continue
+		}
+		svcs, err := config.LoadServices(configDir, sp.Service)
+		if err != nil || len(svcs) != 1 {
+			return fmt.Errorf("service %s is in the plan but its manifest could not be loaded", sp.Service)
+		}
+		if err := d.DeployService(ctx, svcs[0], configDir); err != nil {
+			return fmt.Errorf("apply %s: %w", sp.Service, err)
+		}
+	}
+	return nil
 }

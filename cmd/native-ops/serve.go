@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 
+	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/server"
 	"github.com/theta42/native-ops/pkg/status"
@@ -97,42 +100,123 @@ func handleServeCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := flags.String("addr", "127.0.0.1:8686", "Listen address (put TLS in front of it, e.g. the Caddy edge)")
 	pool := flags.String("pool", "default", "Storage pool holding the data volumes")
+	enableApply := flags.Bool("enable-apply", false, "Serve POST /v1/apply and /v1/jobs (off by default: without it the daemon can read and plan, never change)")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
-	dir := openStateDir(*stateDir)
-	tokens, err := server.OpenTokenStore(filepath.Join(dir, "tokens.json"))
-	if err != nil {
-		log.Fatalf("tokens: %v", err)
-	}
-	if bt := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"); bt != "" {
-		if err := tokens.SetBootstrap(bt); err != nil {
-			log.Fatalf("NATIVE_OPS_BOOTSTRAP_TOKEN: %v", err)
-		}
-		log.Printf("bootstrap admin token loaded from NATIVE_OPS_BOOTSTRAP_TOKEN")
-	}
-	audit, err := server.OpenAudit(filepath.Join(dir, "audit.log"))
-	if err != nil {
-		log.Fatalf("audit log: %v", err)
-	}
-	defer audit.Close()
-
-	exec := remote.NewLocalExecutor()
-	srv, err := server.New(server.Options{
-		Addr: *addr, Tokens: tokens, Audit: audit, Version: Version,
-		Status: func(ctx context.Context) (*status.Snapshot, error) { return status.Collect(ctx, exec, *pool) },
+	srv, closeFn, err := newDaemon(daemonConfig{
+		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply,
+		Exec: remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer closeFn()
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Printf("native-ops %s serving on http://%s (state: %s)", Version, *addr, dir)
+	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v)", Version, *addr, *stateDir, *enableApply)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 	log.Printf("stopped")
+}
+
+type daemonConfig struct {
+	Addr, Pool, StateDir string
+	EnableApply          bool
+	Exec                 remote.Executor
+	BootstrapToken       string
+}
+
+// newDaemon builds the server. Without EnableApply the daemon can read the host and plan an
+// uploaded tree against it, and nothing more; apply is an explicit opt-in.
+func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
+	tokens, err := server.OpenTokenStore(filepath.Join(cfg.StateDir, "tokens.json"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("tokens: %w", err)
+	}
+	if cfg.BootstrapToken != "" {
+		if err := tokens.SetBootstrap(cfg.BootstrapToken); err != nil {
+			return nil, nil, fmt.Errorf("NATIVE_OPS_BOOTSTRAP_TOKEN: %w", err)
+		}
+		log.Printf("bootstrap admin token loaded from NATIVE_OPS_BOOTSTRAP_TOKEN")
+	}
+	audit, err := server.OpenAudit(filepath.Join(cfg.StateDir, "audit.log"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("audit log: %w", err)
+	}
+	key, err := loadOrCreateKey(filepath.Join(cfg.StateDir, "plan.key"))
+	if err != nil {
+		audit.Close()
+		return nil, nil, err
+	}
+	opts := server.Options{
+		Addr: cfg.Addr, Tokens: tokens, Audit: audit, Version: Version,
+		Status: func(ctx context.Context) (*status.Snapshot, error) { return status.Collect(ctx, cfg.Exec, cfg.Pool) },
+		Plan:   planSource(cfg.Exec, key),
+	}
+	if cfg.EnableApply {
+		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
+		if err != nil {
+			audit.Close()
+			return nil, nil, fmt.Errorf("jobs: %w", err)
+		}
+		opts.Jobs, opts.Apply = jobs, applySource(cfg.Exec)
+	}
+	srv, err := server.New(opts)
+	if err != nil {
+		audit.Close()
+		return nil, nil, err
+	}
+	return srv, func() { audit.Close() }, nil
+}
+
+// planSource is what POST /v1/plan plans with. engine.PlanFleet wraps exec in remote.ReadOnly, so
+// an uploaded tree can be planned against this host but never applied to it. The key makes the
+// plan's hash cover the environment values and hook bodies the plan itself does not print.
+func planSource(exec remote.Executor, key []byte) server.PlanFunc {
+	return func(ctx context.Context, dir, service string) (*engine.FleetPlan, error) {
+		return engine.PlanFleet(ctx, exec, dir, service, engine.WithBindKey(key))
+	}
+}
+
+// applySource is what POST /v1/apply applies with, once the server has checked the plan's hash.
+// Progress goes to the job's own log, not the process log.
+func applySource(exec remote.Executor) server.ApplyFunc {
+	return func(ctx context.Context, dir string, plan *engine.FleetPlan, logf func(format string, a ...any)) error {
+		d := engine.NewDeployer(exec)
+		d.SetLogger(logf)
+		return d.ApplyPlan(ctx, dir, plan)
+	}
+}
+
+// loadOrCreateKey returns the daemon's plan key, creating it (32 random bytes, 0600) on first
+// start. It is stable across restarts, so a plan hash is still good after one. A key file that is
+// too short or readable by others is refused rather than trusted.
+func loadOrCreateKey(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, []byte(hex.EncodeToString(key)+"\n"), 0o600); err != nil {
+			return nil, fmt.Errorf("plan key: %w", err)
+		}
+		return key, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("plan key: %w", err)
+	}
+	if st, err := os.Stat(path); err != nil || st.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("plan key %s must not be readable by anyone else (chmod 600)", path)
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(key) < 32 {
+		return nil, fmt.Errorf("plan key %s is not 32 bytes of hex; delete it to make a new one", path)
+	}
+	return key, nil
 }
 
 func handleTokenCommand(args []string) {

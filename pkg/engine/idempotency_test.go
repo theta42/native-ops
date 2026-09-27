@@ -31,6 +31,8 @@ type hostSim struct {
 	inits   []string // container_init scripts executed, in order
 	snaps   []string
 	nextIP  int
+	// fail, when set, is asked about every command before it runs; a non-nil error is returned instead.
+	fail func(cmd string) error
 }
 
 type simCtr struct {
@@ -70,6 +72,11 @@ func (s *hostSim) get(name string) (*simCtr, bool) { c, ok := s.ctrs[name]; retu
 
 func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 	s.cmds = append(s.cmds, cmd)
+	if s.fail != nil {
+		if err := s.fail(cmd); err != nil {
+			return "", err
+		}
+	}
 	q := simQuotedRe.FindAllStringSubmatch(cmd, -1)
 	arg := func(i int) string { return q[i][1] }
 

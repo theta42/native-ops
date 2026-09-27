@@ -17,6 +17,9 @@ type AuditEntry struct {
 	Status int       `json:"status"`
 	Remote string    `json:"remote,omitempty"`
 	Millis int64     `json:"ms"`
+	// Detail is a short note from the handler about what the request did (e.g. a plan's
+	// commit and outcome). Handlers only put validated, non-secret values in it.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Audit appends entries to a file opened 0600. A nil *Audit discards entries.

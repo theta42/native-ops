@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -113,5 +114,58 @@ healthcheck:
 	}
 	if tmpl.RoutingPattern != "{slug}.example.com" {
 		t.Errorf("expected routing pattern '{slug}.example.com', got '%s'", tmpl.RoutingPattern)
+	}
+}
+
+func TestLoadServicesReadsEveryManifestInNameOrderAndFailsBeforeAnythingIsApplied(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		if err := os.MkdirAll(filepath.Join(dir, "services", name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if body != "" {
+			os.WriteFile(filepath.Join(dir, "services", name, "service.yml"), []byte(body), 0o644)
+		}
+	}
+	write("web", "name: web\nimage: x\n")
+	write("aaa", "image: y\n") // the directory name is the service name when the manifest has none
+	write("no-manifest", "")
+	svcs, err := LoadServices(dir, "")
+	if err != nil || len(svcs) != 2 || svcs[0].Name != "aaa" || svcs[1].Name != "web" {
+		t.Fatalf("got %v %v", svcs, err)
+	}
+	if one, _ := LoadServices(dir, "web"); len(one) != 1 || one[0].Name != "web" {
+		t.Fatalf("only one service: %v", one)
+	}
+	write("aaa", "name: [broken")
+	if _, err := LoadServices(dir, ""); err == nil {
+		t.Fatal("a manifest that does not parse must be an error before anything is applied")
+	}
+}
+
+func TestManifestPathsCannotLeaveTheConfigDirectory(t *testing.T) {
+	for _, ok := range []string{"env", "services/web/.env", "./a/b", "a/../b"} {
+		if !RelativeInside(ok) {
+			t.Errorf("%q stays inside and should be allowed", ok)
+		}
+	}
+	for _, bad := range []string{"", "/etc/passwd", "..", "../x", "a/../../x", "a/../..", "x\x00y"} {
+		if RelativeInside(bad) {
+			t.Errorf("%q escapes and must be refused", bad)
+		}
+	}
+	dir := t.TempDir()
+	f := filepath.Join(dir, "service.yml")
+	os.WriteFile(f, []byte("name: web\nimage: x\nenv_file: ../../etc/shadow\n"), 0o644)
+	if _, err := LoadServiceConfig(f); err == nil || !strings.Contains(err.Error(), "env_file") {
+		t.Fatalf("an env_file outside the config directory must be refused when the manifest is loaded, got %v", err)
+	}
+	os.WriteFile(f, []byte("name: web\nimage: x\nenv_file: /etc/shadow\n"), 0o644)
+	if _, err := LoadServiceConfig(f); err == nil {
+		t.Fatal("an absolute env_file must be refused")
+	}
+	os.WriteFile(f, []byte("name: web\nimage: x\nenv_file: env\n"), 0o644)
+	if _, err := LoadServiceConfig(f); err != nil {
+		t.Fatalf("an env_file inside is fine: %v", err)
 	}
 }
