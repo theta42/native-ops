@@ -19,6 +19,9 @@ a person sets up by hand.
 | `GET /healthz` | none | liveness (`{"ok":true,"version":...}`), no state |
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images and warnings for the host |
+| `POST /v1/plan` | deployer | what `apply` would change for the configuration you upload (never changes the host) |
+| `POST /v1/apply` | deployer | apply the plan you reviewed, as a job (only with `--enable-apply`) |
+| `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | apply jobs and their outcome; the log is shown to deployers and admins only |
 | `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
@@ -38,8 +41,8 @@ can create privileged containers), so it is deliberately small:
 - Tokens are `nops_` plus 64 hex characters. Only the SHA-256 is stored, in a `0600` file inside a
   `0700` state directory; a world-readable token file is refused at startup. The secret is shown
   once, at creation, and compared in constant time.
-- Roles: `viewer` < `deployer` < `admin`. Nothing needs more than `viewer` yet; the gate is tested
-  so the write endpoints that follow inherit it.
+- Roles: `viewer` < `deployer` < `admin`. Reading needs `viewer`; sending a configuration to be
+  planned needs `deployer`. The gate is tested so the write endpoints that follow inherit it.
 - Every request is appended to `audit.log` (JSON lines): time, token name, method, path, status,
   remote address, duration. Never the query string, never a credential.
 - The UI is served with a strict Content-Security-Policy (`default-src 'none'`, no inline script or
@@ -52,6 +55,87 @@ can create privileged containers), so it is deliberately small:
   the page names a file the binary does not serve.
 - It listens on loopback (or the Incus bridge address) and must sit behind TLS, e.g. the Caddy
   edge. Do not expose the port directly.
+
+## Planning from CI
+
+A pipeline sends the tree it checked out; the daemon needs no git access and holds no
+credentials for your repository. The answer is what `native-ops plan` prints, plus a hash of it:
+
+```bash
+tar -czf - -C . fleet.yml services templates \
+  | curl -fsS -X POST "$NATIVE_OPS_URL/v1/plan?sha=$COMMIT&service=gitea" \
+      -H "Authorization: Bearer $NATIVE_OPS_TOKEN" -H "Content-Type: application/gzip" \
+      --data-binary @- -o plan.json
+jq -r .text plan.json            # the plan, ready to read (or post to the pull request)
+jq -e '.exit != 1' plan.json     # fail the job only when apply would fail
+```
+
+`exit` follows `native-ops plan`: `0` nothing to change, `2` changes pending, `1` blocked. `hash`
+identifies exactly what the plan would do (the same changes give the same hash), so a later
+apply can be tied to the plan somebody reviewed. `sha` and `service` are optional and only
+recorded in the audit log.
+
+The upload is untrusted, and is handled that way:
+
+- It must be a gzip-compressed tar of regular files and directories. A symlink, hard link,
+  device, an absolute name or one that climbs out with `..` is refused, not skipped; nothing can
+  be written outside the private temporary directory it is unpacked into, which is removed
+  afterwards. Permission bits in the archive are ignored.
+- At most 32 MiB uploaded, 128 MiB unpacked (counted as bytes actually written) and 5000
+  entries, and at most 4 plans at a time (`429` beyond that).
+- A manifest path (`env_file`, a hook file) that leaves the configuration directory is an error,
+  so a pull request cannot make the plan read a file elsewhere on the host.
+- The plan runs behind the same read-only executor as the CLI: the uploaded tree can be
+  planned against the host but nothing in it can change the host. Environment values never
+  appear in the answer, only key names.
+- A configuration the daemon cannot use is `400` with the reason (`bad_config`, `bad_archive`);
+  a host it cannot read is a generic `502`.
+- The audit log records who planned, the commit, the service, the outcome and the hash (never
+  the archive, and never a query string).
+
+## Applying from CI
+
+Applying is off unless the daemon is started with `--enable-apply`: without it the daemon can
+read the host and plan an uploaded tree, and nothing more. With it, an apply is harder than a plan
+on purpose:
+
+```bash
+# 1. plan (a pull request can post .text); keep the hash of the plan that was reviewed
+curl ... "$URL/v1/plan?sha=$COMMIT"  --data-binary @conf.tgz -o plan.json
+HASH=$(jq -r .hash plan.json)
+
+# 2. apply that plan: the same tree, and the hash. 202 with a job; poll it
+curl ... -X POST "$URL/v1/apply?sha=$COMMIT&expect=$HASH" --data-binary @conf.tgz -o job.json
+curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succeeded | failed | interrupted
+```
+
+- **`expect` is required.** The daemon plans the upload again, and unless that plan has the hash
+  you gave it answers `409 plan_changed` with the plan it would run now, and touches nothing. What
+  was reviewed is what runs; if the host or the configuration moved since, you review again. The
+  hash is keyed with a secret the daemon keeps (`plan.key` in the state directory, stable across
+  restarts), so it also covers the parts of a manifest the plan does not print: environment
+  values and hook bodies. Approving one secret and uploading another is refused, and the hash tells
+  nobody anything about the value.
+- **A blocked plan is never applied** (`409 blocked`), and a plan with nothing to change starts no
+  job (`200 nothing_to_do`).
+- **One apply at a time** on the host (`409 busy`, naming the running job), taken before the
+  upload is read and released even when the request is refused.
+- **Only what the plan lists is applied**, in plan order, stopping at the first failure. Services
+  after it are untouched; running the same apply again is safe and continues.
+- **The job is a record.** It outlives the request and is written to `jobs/<id>.json` (0600) as it
+  runs: who, which commit, the plan hash, timestamps, the log and the outcome. The last 200 are
+  kept. A job that was still running when the daemon stopped is marked `interrupted` on the next
+  start, with the log so far: the host may be part-way through it, and the fix is to apply again.
+  A stop waits up to 5 minutes for a running apply to finish first (`TimeoutStopSec=6min` in the unit).
+- The audit log records the request (`apply job=... sha=... hash=...`, or why it was refused) and
+  the end of the job.
+
+An apply runs `incus` as the daemon's user (which is in `incus-admin`, so it can do to instances
+whatever a deployer's manifest says) and host hooks (`pre_deploy`, `post_deploy`) as that user,
+inside the unit's sandbox (`ProtectSystem=strict`; only its state directory is writable). A
+`deployer` token is therefore as powerful as the manifests it can upload: keep it in the CI secret
+store, use one token per pipeline, and do not give it to a job that runs pull-request code
+before it is merged. Plan from pull requests; apply only from the protected branch.
 
 ## Tokens and bootstrapping
 
@@ -83,6 +167,5 @@ with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the
 
 ## Roadmap
 
-`plan` (a dry-run of `apply`), `apply` at a git ref, instance update/migrate/backup as audited
-jobs with per-host locking, and OIDC sign-in for the UI. The API is versioned (`/v1`) so a
-separate fleet manager can depend on it.
+Instance update/migrate/backup as jobs; a live view of a running job in the UI; and OIDC sign-in
+for the UI. The API is versioned (`/v1`) so a separate fleet manager can depend on it.

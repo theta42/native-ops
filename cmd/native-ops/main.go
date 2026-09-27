@@ -216,38 +216,6 @@ func handleHostCommand(ctx context.Context, args []string) {
 	}
 }
 
-// loadServices reads the service manifests apply and plan work on, in the same order for both.
-func loadServices(configDir, only string) ([]*config.ServiceConfig, error) {
-	servicesDir := filepath.Join(configDir, "services")
-	entries, err := os.ReadDir(servicesDir)
-	if err != nil {
-		return nil, fmt.Errorf("read services directory %s: %w", servicesDir, err)
-	}
-	var out []*config.ServiceConfig
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		svcName := entry.Name()
-		if only != "" && only != svcName {
-			continue
-		}
-		svcFile := filepath.Join(servicesDir, svcName, "service.yml")
-		if _, err := os.Stat(svcFile); os.IsNotExist(err) {
-			continue
-		}
-		svcCfg, err := config.LoadServiceConfig(svcFile)
-		if err != nil {
-			return nil, fmt.Errorf("loading %s: %w", svcFile, err)
-		}
-		if svcCfg.Name == "" {
-			svcCfg.Name = svcName
-		}
-		out = append(out, svcCfg)
-	}
-	return out, nil
-}
-
 func handleApplyCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("apply", flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf directory")
@@ -260,7 +228,7 @@ func handleApplyCommand(ctx context.Context, args []string) {
 	}
 	fmt.Printf("Applying infrastructure for fleet: %s (%s)\n", fleet.Name, fleet.Domain)
 
-	services, err := loadServices(*configDir, *targetService)
+	services, err := config.LoadServices(*configDir, *targetService)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -296,20 +264,10 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "Failed to load fleet config: %v\n", err)
 		return 1
 	}
-	services, err := loadServices(*configDir, *targetService)
+	fp, err := engine.PlanFleet(ctx, remote.NewLocalExecutor(), *configDir, *targetService)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
-	}
-	deployer := engine.NewDeployer(remote.ReadOnly(remote.NewLocalExecutor()))
-	fp := &engine.FleetPlan{Services: []*engine.ServicePlan{}}
-	for _, svcCfg := range services {
-		p, err := deployer.PlanService(ctx, svcCfg, *configDir)
-		if err != nil {
-			fmt.Fprintf(stderr, "Could not plan service %s: %v\n", svcCfg.Name, err)
-			return 1
-		}
-		fp.Services = append(fp.Services, p)
 	}
 
 	if *asJSON {
@@ -323,13 +281,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "Plan for fleet: %s. Nothing has been changed.\n\n", who)
 		fmt.Fprint(stdout, fp.Render())
 	}
-	switch {
-	case fp.Blocked():
-		return 1
-	case fp.Pending():
-		return 2
-	}
-	return 0
+	return fp.ExitStatus()
 }
 
 func handleInstanceCommand(ctx context.Context, args []string) {

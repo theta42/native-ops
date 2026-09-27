@@ -20,6 +20,7 @@ type InstanceManager struct {
 	exec  remote.Executor
 	// healthGate is a field so tests can stub the wait.
 	healthGate func(ctx context.Context, ip string, hc config.HealthCheckConfig) error
+	logf       func(format string, a ...any)
 }
 
 func NewInstanceManager(exec remote.Executor) *InstanceManager {
@@ -29,6 +30,13 @@ func NewInstanceManager(exec remote.Executor) *InstanceManager {
 		caddy:      caddy.NewEdgeManager(exec, "edge"),
 		exec:       exec,
 		healthGate: ic.HealthGate,
+		logf:       log.Printf,
+	}
+}
+
+func (m *InstanceManager) log(format string, a ...any) {
+	if m.logf != nil {
+		m.logf(format, a...)
 	}
 }
 
@@ -52,7 +60,7 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 	if !incus.ValidName(p.Name) {
 		return "", fmt.Errorf("invalid instance name %q", p.Name)
 	}
-	log.Printf("==> [Instance] Launching dynamic instance: %s (slug=%s)\n", p.Name, p.Slug)
+	m.log("==> [Instance] Launching dynamic instance: %s (slug=%s)\n", p.Name, p.Slug)
 
 	// 1. Resolve image
 	imageRef := p.Template.Image
@@ -87,7 +95,7 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		if st.Config[incus.TemplateKey] != p.Template.Name || p.Template.Name == "" {
 			return "", fmt.Errorf("instance %s already exists and was not launched from template %q; refusing to adopt it (use `instance update` to change an existing instance)", p.Name, p.Template.Name)
 		}
-		log.Printf("    %s already exists from this template; resuming\n", p.Name)
+		m.log("    %s already exists from this template; resuming\n", p.Name)
 	} else {
 		cfg := make(map[string]string, len(limits)+2)
 		for k, v := range limits {
@@ -137,7 +145,7 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		}
 		if changed {
 			if err := m.incus.RestartService(ctx, p.Name, serviceName); err != nil {
-				log.Printf("    WARNING: %v\n", err)
+				m.log("    WARNING: %v\n", err)
 			}
 		}
 	}
@@ -187,7 +195,7 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		}
 	}
 
-	log.Printf("==> [Instance] Instance %s is up at %s\n", p.Name, ip)
+	m.log("==> [Instance] Instance %s is up at %s\n", p.Name, ip)
 	return ip, nil
 }
 
@@ -246,7 +254,7 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 	if !incus.ValidName(service) {
 		return fmt.Errorf("invalid service name %q", service)
 	}
-	log.Printf("==> [Instance] Immutable update for instance: %s\n", name)
+	m.log("==> [Instance] Immutable update for instance: %s\n", name)
 
 	// 1. Resolve the target and read the running state. Nothing is changed yet.
 	target, err := m.incus.ResolveImage(ctx, newImageRef)
@@ -263,7 +271,7 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		current := (isFingerprint(target) && st.BaseImage == target) ||
 			(!isFingerprint(target) && st.Config[incus.ImageKey] == newImageRef)
 		if current {
-			log.Printf("==> [Instance] %s already runs %s; nothing to do\n", name, newImageRef)
+			m.log("==> [Instance] %s already runs %s; nothing to do\n", name, newImageRef)
 			if st.Config[incus.ImageKey] != newImageRef {
 				if err := m.incus.SetInstanceConfig(ctx, name, incus.ImageKey, newImageRef); err != nil {
 					return err
@@ -296,7 +304,7 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 	if !opts.SkipSnapshot {
 		snap := fmt.Sprintf("pre-update-%s", time.Now().UTC().Format("20060102-150405"))
 		for _, v := range st.Volumes() {
-			log.Printf("    Snapshotting volume %s/%s (%s)...\n", v.Pool, v.Name, snap)
+			m.log("    Snapshotting volume %s/%s (%s)...\n", v.Pool, v.Name, snap)
 			if err := m.incus.SnapshotVolume(ctx, v.Pool, v.Name, snap); err != nil {
 				return fmt.Errorf("pre-update snapshot failed, nothing was changed: %w", err)
 			}
@@ -349,13 +357,13 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		if err := m.repointRoute(ctx, name); err != nil {
 			return fmt.Errorf("%s was updated to %s, but its Caddy route could not be pointed at the new container: %w", name, newImageRef, err)
 		}
-		log.Printf("==> [Instance] Updated %s to %s\n", name, newImageRef)
+		m.log("==> [Instance] Updated %s to %s\n", name, newImageRef)
 		return nil
 	}
 	if st.BaseImage == "" {
 		return fmt.Errorf("update failed and the previous image is unknown, so no automatic rollback was possible (volume snapshots are named pre-update-*): %w", updateErr)
 	}
-	log.Printf("    Update failed (%v); rolling back to the previous image %s...\n", updateErr, st.BaseImage)
+	m.log("    Update failed (%v); rolling back to the previous image %s...\n", updateErr, st.BaseImage)
 	if rbErr := replace(st.BaseImage, st.Config); rbErr != nil {
 		return fmt.Errorf("update failed: %v; rollback ALSO failed (volume snapshots are named pre-update-*): %w", updateErr, rbErr)
 	}
@@ -378,7 +386,7 @@ func (m *InstanceManager) repointRoute(ctx context.Context, name string) error {
 		return err
 	}
 	if changed {
-		log.Printf("    Pointed the Caddy route of %s at its new address\n", name)
+		m.log("    Pointed the Caddy route of %s at its new address\n", name)
 	}
 	return nil
 }
@@ -394,9 +402,9 @@ func (m *InstanceManager) Destroy(ctx context.Context, name string, purgeVolume 
 	if !incus.ValidName(name) {
 		return fmt.Errorf("invalid instance name %q", name)
 	}
-	log.Printf("==> [Instance] Destroying instance: %s\n", name)
+	m.log("==> [Instance] Destroying instance: %s\n", name)
 	if err := m.caddy.RemoveSite(ctx, name); err != nil {
-		log.Printf("    WARNING: could not remove the Caddy route for %s: %v\n", name, err)
+		m.log("    WARNING: could not remove the Caddy route for %s: %v\n", name, err)
 	}
 	if err := m.incus.StopAndDeleteContainer(ctx, name); err != nil {
 		return fmt.Errorf("delete container: %w", err)

@@ -30,10 +30,19 @@ var uiFS embed.FS
 
 // Options configures a Server.
 type Options struct {
-	Addr      string
-	Tokens    *TokenStore
-	Audit     *Audit
-	Status    func(ctx context.Context) (*status.Snapshot, error)
+	Addr   string
+	Tokens *TokenStore
+	Audit  *Audit
+	Status func(ctx context.Context) (*status.Snapshot, error)
+	// Plan works out what apply would do for an unpacked configuration directory. Without it
+	// POST /v1/plan is not served. It must not change the host.
+	Plan PlanFunc
+	// Apply and Jobs together enable POST /v1/apply and /v1/jobs. Apply changes the host, so it is
+	// only ever called with a plan that passed the gate in handleApply.
+	Apply ApplyFunc
+	Jobs  *Jobs
+	// JobDrain is how long a shutdown waits for a running apply to finish (default 5 minutes).
+	JobDrain  time.Duration
 	Version   string
 	StatusTTL time.Duration // how long a status snapshot is reused (default 5s)
 }
@@ -44,21 +53,39 @@ type Server struct {
 	cmu      sync.Mutex
 	cache    *status.Snapshot
 	cachedAt time.Time
+
+	planSlots chan struct{}
+	applyMu   sync.Mutex // one apply at a time on this host
+	jobsWG    sync.WaitGroup
 }
 
 func New(opts Options) (*Server, error) {
 	if opts.Tokens == nil || opts.Status == nil {
 		return nil, errors.New("server needs a token store and a status source")
 	}
+	if (opts.Apply != nil) != (opts.Jobs != nil) || (opts.Apply != nil && opts.Plan == nil) {
+		return nil, errors.New("apply needs a plan source and a job store, and neither is useful alone")
+	}
+	if opts.JobDrain <= 0 {
+		opts.JobDrain = 5 * time.Minute
+	}
 	if opts.StatusTTL <= 0 {
 		opts.StatusTTL = 5 * time.Second
 	}
-	return &Server{opts: opts}, nil
+	return &Server{opts: opts, planSlots: make(chan struct{}, maxConcurrentPlans)}, nil
 }
 
 type actorHolder struct {
-	name string
-	role Role
+	name   string
+	role   Role
+	detail string
+}
+
+// auditDetail attaches a note to the current request's audit entry.
+func auditDetail(r *http.Request, format string, a ...any) {
+	if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
+		h.detail = fmt.Sprintf(format, a...)
+	}
 }
 
 type actorKey struct{}
@@ -119,7 +146,7 @@ func (s *Server) audited(next http.Handler) http.Handler {
 		remote, _, _ := net.SplitHostPort(r.RemoteAddr)
 		s.opts.Audit.Log(AuditEntry{
 			Time: start.UTC(), Actor: h.name, Role: h.role, Method: r.Method, Path: r.URL.Path,
-			Status: sw.code, Remote: remote, Millis: time.Since(start).Milliseconds(),
+			Status: sw.code, Remote: remote, Millis: time.Since(start).Milliseconds(), Detail: h.detail,
 		})
 	})
 }
@@ -216,6 +243,14 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, snap)
 	}))
+	if s.opts.Plan != nil {
+		mux.Handle("POST /v1/plan", s.auth(RoleDeployer, s.handlePlan))
+	}
+	if s.opts.Apply != nil {
+		mux.Handle("POST /v1/apply", s.auth(RoleDeployer, s.handleApply))
+		mux.Handle("GET /v1/jobs", s.auth(RoleViewer, s.handleJobs))
+		mux.Handle("GET /v1/jobs/{id}", s.auth(RoleViewer, s.handleJob))
+	}
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)
 	mux.Handle("GET /index.html", ui)
@@ -248,7 +283,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      120 * time.Second, // a plan upload is read (30s) and planned (60s) before the answer is written
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
@@ -262,6 +297,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		defer cancel()
 		if err := srv.Shutdown(sctx); err != nil {
 			return fmt.Errorf("shutdown: %w", err)
+		}
+		// A running apply is not cut off: wait for it, so the host is not left part-way.
+		if !s.WaitForJobs(s.opts.JobDrain) {
+			log.Printf("shutdown: an apply is still running after %s; it will be recorded as interrupted", s.opts.JobDrain)
 		}
 		return nil
 	}

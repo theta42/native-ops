@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -234,8 +235,55 @@ func LoadServiceConfig(path string) (*ServiceConfig, error) {
 	if err := yaml.Unmarshal(data, &svc); err != nil {
 		return nil, fmt.Errorf("failed to parse service config %s: %w", path, err)
 	}
+	if svc.EnvFile != "" && !RelativeInside(svc.EnvFile) {
+		return nil, fmt.Errorf("service config %s: env_file %q must be a relative path inside the config directory", path, svc.EnvFile)
+	}
 
 	return &svc, nil
+}
+
+// RelativeInside reports whether rel is a relative path that stays inside the directory it is
+// joined to: not absolute, and no ".." that climbs out of it. A manifest can come from a
+// pull request or an upload, so a path in it must never be able to name a file elsewhere on the host.
+func RelativeInside(rel string) bool {
+	if rel == "" || filepath.IsAbs(rel) || strings.ContainsRune(rel, 0) {
+		return false
+	}
+	c := filepath.Clean(rel)
+	return c != ".." && !strings.HasPrefix(c, ".."+string(filepath.Separator))
+}
+
+// LoadServices reads every services/<name>/service.yml under configDir (only that one when
+// only is set), in name order. `apply` and `plan` both use it, so they always work on the same set.
+func LoadServices(configDir, only string) ([]*ServiceConfig, error) {
+	servicesDir := filepath.Join(configDir, "services")
+	entries, err := os.ReadDir(servicesDir)
+	if err != nil {
+		return nil, fmt.Errorf("read services directory %s: %w", servicesDir, err)
+	}
+	var out []*ServiceConfig
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if only != "" && only != name {
+			continue
+		}
+		file := filepath.Join(servicesDir, name, "service.yml")
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			continue
+		}
+		svc, err := LoadServiceConfig(file)
+		if err != nil {
+			return nil, fmt.Errorf("loading %s: %w", file, err)
+		}
+		if svc.Name == "" {
+			svc.Name = name
+		}
+		out = append(out, svc)
+	}
+	return out, nil
 }
 
 // LoadTemplateConfig reads a template.yml file.
