@@ -19,11 +19,12 @@ import (
 )
 
 type fixture struct {
-	srv    *httptest.Server
-	secret string
-	viewer string
-	calls  *atomic.Int32
-	audit  string
+	srv     *httptest.Server
+	secret  string
+	viewer  string
+	planner string
+	calls   *atomic.Int32
+	audit   string
 }
 
 func setup(t *testing.T, ttl time.Duration, statusErr error) *fixture {
@@ -40,6 +41,7 @@ func setupWith(t *testing.T, ttl time.Duration, statusErr error, plan PlanFunc) 
 	}
 	admin, _, _ := tokens.Create("ci-admin", RoleAdmin)
 	viewer, _, _ := tokens.Create("dash", RoleViewer)
+	planner, _, _ := tokens.Create("pr-ci", RolePlanner)
 	audit, err := OpenAudit(filepath.Join(dir, "audit.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +61,7 @@ func setupWith(t *testing.T, ttl time.Duration, statusErr error, plan PlanFunc) 
 	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
-	return &fixture{srv: ts, secret: admin, viewer: viewer, calls: calls, audit: filepath.Join(dir, "audit.log")}
+	return &fixture{srv: ts, secret: admin, viewer: viewer, planner: planner, calls: calls, audit: filepath.Join(dir, "audit.log")}
 }
 
 func (f *fixture) do(t *testing.T, method, path, token string) (*http.Response, string) {

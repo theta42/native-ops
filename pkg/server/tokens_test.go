@@ -121,6 +121,14 @@ func TestRoleOrdering(t *testing.T) {
 	if !RoleAdmin.Allows(RoleViewer) || !RoleDeployer.Allows(RoleViewer) || RoleViewer.Allows(RoleDeployer) || RoleDeployer.Allows(RoleAdmin) {
 		t.Fatal("viewer < deployer < admin")
 	}
+	// planner sits between: it may plan (a read), never apply.
+	if !RolePlanner.Allows(RoleViewer) || !RolePlanner.Allows(RolePlanner) || RolePlanner.Allows(RoleDeployer) || RolePlanner.Allows(RoleAdmin) ||
+		RoleViewer.Allows(RolePlanner) || !RoleDeployer.Allows(RolePlanner) || !RoleAdmin.Allows(RolePlanner) {
+		t.Fatal("viewer < planner < deployer < admin")
+	}
+	if !ValidRole(RolePlanner) {
+		t.Fatal("planner is a role a token can be created with")
+	}
 	if Role("").Allows(RoleViewer) || Role("root").Allows(RoleViewer) {
 		t.Fatal("an unknown role has no access")
 	}

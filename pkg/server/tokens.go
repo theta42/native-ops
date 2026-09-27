@@ -15,12 +15,15 @@ import (
 	"time"
 )
 
-// Role orders what a token may do: viewer reads, deployer may change instances
-// (later), admin manages tokens.
+// Role orders what a token may do: viewer reads; planner may also upload a configuration to be
+// planned (which never changes the host), so it is the role for a pull-request pipeline, whose
+// secrets any branch of the repository can read; deployer may change the host (apply); admin
+// manages tokens.
 type Role string
 
 const (
 	RoleViewer   Role = "viewer"
+	RolePlanner  Role = "planner"
 	RoleDeployer Role = "deployer"
 	RoleAdmin    Role = "admin"
 )
@@ -29,10 +32,12 @@ func (r Role) rank() int {
 	switch r {
 	case RoleViewer:
 		return 1
-	case RoleDeployer:
+	case RolePlanner:
 		return 2
-	case RoleAdmin:
+	case RoleDeployer:
 		return 3
+	case RoleAdmin:
+		return 4
 	}
 	return 0
 }

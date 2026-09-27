@@ -128,7 +128,7 @@ func TestPlanEndpointAcceptsATreeInsideOneTopLevelDirectory(t *testing.T) {
 	}
 }
 
-func TestPlanEndpointNeedsADeployerToken(t *testing.T) {
+func TestPlanEndpointNeedsAPlannerToken(t *testing.T) {
 	rec := &planRecorder{plan: creatingPlan()}
 	f := setupWith(t, time.Minute, nil, rec.fn)
 	for _, tok := range []string{"", "garbage"} {
@@ -141,6 +141,12 @@ func TestPlanEndpointNeedsADeployerToken(t *testing.T) {
 	}
 	if len(rec.dirs) != 0 {
 		t.Fatal("a refused request must never reach the plan, or even unpack anything")
+	}
+	// A planner (the pull-request pipeline's role) and anyone above it may plan.
+	for name, tok := range map[string]string{"planner": f.planner, "admin": f.secret} {
+		if res, body := f.post(t, "/v1/plan", tok, "application/gzip", goodTree(t)); res.StatusCode != 200 {
+			t.Errorf("a %s must be able to plan, got %d %s", name, res.StatusCode, body)
+		}
 	}
 	if res, _ := f.do(t, "GET", "/v1/plan", f.secret); res.StatusCode == 200 {
 		t.Error("plan is a POST")
