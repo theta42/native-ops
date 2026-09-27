@@ -41,6 +41,9 @@ type Options struct {
 	// only ever called with a plan that passed the gate in handleApply.
 	Apply ApplyFunc
 	Jobs  *Jobs
+	// Plans records the plans made and the admin approvals that let an apply through. It is
+	// required with Apply: an apply only ever runs a plan somebody approved.
+	Plans *Plans
 	// JobDrain is how long a shutdown waits for a running apply to finish (default 5 minutes).
 	JobDrain  time.Duration
 	Version   string
@@ -63,8 +66,8 @@ func New(opts Options) (*Server, error) {
 	if opts.Tokens == nil || opts.Status == nil {
 		return nil, errors.New("server needs a token store and a status source")
 	}
-	if (opts.Apply != nil) != (opts.Jobs != nil) || (opts.Apply != nil && opts.Plan == nil) {
-		return nil, errors.New("apply needs a plan source and a job store, and neither is useful alone")
+	if (opts.Apply != nil) != (opts.Jobs != nil) || (opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil)) {
+		return nil, errors.New("apply needs a plan source, a plan store (approvals) and a job store, and none is useful alone")
 	}
 	if opts.JobDrain <= 0 {
 		opts.JobDrain = 5 * time.Minute
@@ -245,6 +248,12 @@ func (s *Server) Handler() http.Handler {
 	}))
 	if s.opts.Plan != nil {
 		mux.Handle("POST /v1/plan", s.auth(RolePlanner, s.handlePlan))
+	}
+	if s.opts.Plans != nil {
+		mux.Handle("GET /v1/plans", s.auth(RoleViewer, s.handlePlanList))
+		mux.Handle("GET /v1/plans/{hash}", s.auth(RoleViewer, s.handlePlanGet))
+		mux.Handle("POST /v1/plans/{hash}/approve", s.auth(RoleAdmin, s.handlePlanApprove))
+		mux.Handle("DELETE /v1/plans/{hash}/approval", s.auth(RoleAdmin, s.handlePlanRevoke))
 	}
 	if s.opts.Apply != nil {
 		mux.Handle("POST /v1/apply", s.auth(RoleDeployer, s.handleApply))

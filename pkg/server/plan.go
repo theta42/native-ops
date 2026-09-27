@@ -126,6 +126,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.recordPlan(r, u, fp)
 	auditDetail(r, "plan sha=%s service=%s exit=%d hash=%s", orDash(u.sha), orDash(u.service), fp.ExitStatus(), fp.Hash()[:12])
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sha":  u.sha,
