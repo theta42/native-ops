@@ -161,8 +161,19 @@ func TestPlanThenApplyThroughTheDaemon(t *testing.T) {
 	if code, _ := call(t, "POST", ts.URL+"/v1/apply?expect="+hash, viewer, tree); code != 403 {
 		t.Fatalf("a viewer must not apply, got %d", code)
 	}
+	// The right hash, from a deployer, is still not enough: nobody approved this plan.
+	if code, out := call(t, "POST", ts.URL+"/v1/apply?expect="+hash, deployer, tree); code != 403 || out["code"] != "not_approved" {
+		t.Fatalf("an unapproved plan: %d %v", code, out)
+	}
 	if m := mutating(); m != "" {
 		t.Fatalf("a refused apply must change nothing:\n%s", m)
+	}
+	if code, _ := call(t, "POST", ts.URL+"/v1/plans/"+hash+"/approve", deployer, nil); code != 403 {
+		t.Fatalf("a deployer must not approve, got %d", code)
+	}
+	admin := adminToken(t, stateDir)
+	if code, out := call(t, "POST", ts.URL+"/v1/plans/"+hash+"/approve", admin, nil); code != 200 || out["state"] != "approved" {
+		t.Fatalf("an admin approves: %d %v", code, out)
 	}
 
 	code, out := call(t, "POST", ts.URL+"/v1/apply?sha=abc1234&expect="+hash, deployer, tree)
@@ -191,7 +202,7 @@ func TestPlanThenApplyThroughTheDaemon(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(stateDir, "jobs", id+".json")); err != nil {
 		t.Fatalf("the job is recorded on disk: %v", err)
 	}
-	// The host changed, so the plan somebody approved is not the plan now.
+	// The host changed, so the plan somebody approved is not the plan now (and its approval is used up).
 	if code, out := call(t, "POST", ts.URL+"/v1/apply?expect="+hash, deployer, tree); code != 409 || out["code"] != "plan_changed" {
 		t.Fatalf("after applying, the old hash must be refused: %d %v", code, out)
 	}
@@ -245,4 +256,14 @@ func TestAPlanHashStillHoldsAfterTheDaemonRestarts(t *testing.T) {
 	if len(first) != 64 || first != second {
 		t.Fatalf("a hash approved before a restart must still match after it: %q vs %q", first, second)
 	}
+}
+
+func adminToken(t *testing.T, stateDir string) string {
+	t.Helper()
+	store, err := server.OpenTokenStore(filepath.Join(stateDir, "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _, _ := store.Create("admin", server.RoleAdmin)
+	return tok
 }

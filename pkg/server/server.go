@@ -46,6 +46,9 @@ type Options struct {
 	// list). InstancePolicy says what a spec may ask for.
 	Instances      InstanceOps
 	InstancePolicy engine.InstancePolicy
+	// Plans records the plans made and the admin approvals that let an apply through. It is
+	// required with Apply: an apply only ever runs a plan somebody approved.
+	Plans *Plans
 	// JobDrain is how long a shutdown waits for a running apply to finish (default 5 minutes).
 	JobDrain  time.Duration
 	Version   string
@@ -71,8 +74,8 @@ func New(opts Options) (*Server, error) {
 	if (opts.Apply != nil || opts.Instances != nil) && opts.Jobs == nil {
 		return nil, errors.New("apply and instances need a job store: every change to the host is a job with a record")
 	}
-	if opts.Apply != nil && opts.Plan == nil {
-		return nil, errors.New("apply needs a plan source to check the plan hash against")
+	if opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil) {
+		return nil, errors.New("apply needs a plan source and a plan store (approvals) to check the plan against")
 	}
 	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil {
 		return nil, errors.New("a job store is only useful with apply or instances")
@@ -279,6 +282,12 @@ func (s *Server) Handler() http.Handler {
 	}))
 	if s.opts.Plan != nil {
 		mux.Handle("POST /v1/plan", s.auth(RolePlanner, s.handlePlan))
+	}
+	if s.opts.Plans != nil {
+		mux.Handle("GET /v1/plans", s.auth(RoleViewer, s.handlePlanList))
+		mux.Handle("GET /v1/plans/{hash}", s.auth(RoleViewer, s.handlePlanGet))
+		mux.Handle("POST /v1/plans/{hash}/approve", s.auth(RoleAdmin, s.handlePlanApprove))
+		mux.Handle("DELETE /v1/plans/{hash}/approval", s.auth(RoleAdmin, s.handlePlanRevoke))
 	}
 	if s.opts.Instances != nil {
 		mux.Handle("GET /v1/instances", s.authScoped(RoleViewer, s.handleInstanceList))
