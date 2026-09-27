@@ -39,7 +39,12 @@ jobs:
             GOARCH="${target#*/}"
             BIN_NAME="native-ops_${TAG}_${GOOS}_${GOARCH}"
             echo "Building ${BIN_NAME}..."
-            GOOS="$GOOS" GOARCH="$GOARCH" go build -ldflags="-s -w -X main.Version=${TAG}" -o "dist/${BIN_NAME}" ./cmd/native-ops
+            # CGO off: one static binary that runs on any Linux (older glibc, Alpine, a minimal container),
+            # which is the point of a tool you drop onto a host.
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags="-s -w -X main.Version=${TAG}" -o "dist/${BIN_NAME}" ./cmd/native-ops
+            if [ "$GOOS" = "linux" ] && ! file "dist/${BIN_NAME}" | grep -q "statically linked"; then
+              echo "::error::${BIN_NAME} is not statically linked"; file "dist/${BIN_NAME}"; exit 1
+            fi
             tar -czf "dist/${BIN_NAME}.tar.gz" -C dist "${BIN_NAME}"
             rm "dist/${BIN_NAME}"
           done
