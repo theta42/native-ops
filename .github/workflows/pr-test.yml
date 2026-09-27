@@ -27,4 +27,4 @@ jobs:
         run: go test -v -race ./...
 
       - name: Verify Build
-        run: go build -v -o /dev/null ./cmd/native-ops
+        run: CGO_ENABLED=0 go build -v -o /dev/null ./cmd/native-ops
