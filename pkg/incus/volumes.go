@@ -64,7 +64,10 @@ func (c *Client) DeleteVolume(ctx context.Context, pool, volume string) error {
 	if pool == "" {
 		pool = "default"
 	}
-	_, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume delete %s %s", pool, volume))
+	if !ValidName(pool) || !ValidName(volume) {
+		return fmt.Errorf("invalid pool/volume name %q/%q", pool, volume)
+	}
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume delete %s %s", ShQuote(pool), ShQuote(volume)))
 	if err != nil {
 		return fmt.Errorf("delete volume %s/%s: %w", pool, volume, err)
 	}

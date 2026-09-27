@@ -101,12 +101,16 @@ func handleServeCommand(ctx context.Context, args []string) {
 	addr := flags.String("addr", "127.0.0.1:8686", "Listen address (put TLS in front of it, e.g. the Caddy edge)")
 	pool := flags.String("pool", "default", "Storage pool holding the data volumes")
 	enableApply := flags.Bool("enable-apply", false, "Serve POST /v1/apply and /v1/jobs (off by default: without it the daemon can read and plan, never change)")
+	enableInstances := flags.Bool("enable-instances", false, "Serve the tenant-instance endpoints (PUT/DELETE /v1/instances/{name}); a token with a scope may use only these")
+	instanceProfiles := flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
+	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
 	srv, closeFn, err := newDaemon(daemonConfig{
-		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply,
-		Exec: remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
+		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, EnableInstances: *enableInstances,
+		InstancePolicy: engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
+		Exec:           remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -125,6 +129,8 @@ func handleServeCommand(ctx context.Context, args []string) {
 type daemonConfig struct {
 	Addr, Pool, StateDir string
 	EnableApply          bool
+	EnableInstances      bool
+	InstancePolicy       engine.InstancePolicy
 	Exec                 remote.Executor
 	BootstrapToken       string
 }
@@ -156,13 +162,19 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) { return status.Collect(ctx, cfg.Exec, cfg.Pool) },
 		Plan:   planSource(cfg.Exec, key),
 	}
-	if cfg.EnableApply {
+	if cfg.EnableApply || cfg.EnableInstances {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
 		if err != nil {
 			audit.Close()
 			return nil, nil, fmt.Errorf("jobs: %w", err)
 		}
-		opts.Jobs, opts.Apply = jobs, applySource(cfg.Exec)
+		opts.Jobs = jobs
+		if cfg.EnableApply {
+			opts.Apply = applySource(cfg.Exec)
+		}
+		if cfg.EnableInstances {
+			opts.Instances, opts.InstancePolicy = engine.NewInstances(cfg.Exec), cfg.InstancePolicy
+		}
 	}
 	srv, err := server.New(opts)
 	if err != nil {
@@ -170,6 +182,16 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		return nil, nil, err
 	}
 	return srv, func() { audit.Close() }, nil
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // planSource is what POST /v1/plan plans with. engine.PlanFleet wraps exec in remote.ReadOnly, so
@@ -229,6 +251,9 @@ func handleTokenCommand(args []string) {
 	stateDir := stateDirFlag(flags)
 	name := flags.String("name", "", "Token name (create)")
 	role := flags.String("role", "viewer", "viewer, planner, deployer or admin (create)")
+	names := flags.String("names", "", "Limit the token to tenant instances with these names, as globs, comma separated, e.g. 'demo-*,rest-*' (create; needs --images, and the deployer role)")
+	images := flags.String("images", "", "The images such a token may launch, as globs, e.g. 'opsavor-platform:*' (create)")
+	domains := flags.String("domains", "", "The domains such a token may publish a route for, as globs, e.g. '*.opsavor.app' (create)")
 	id := flags.String("id", "", "Token id (revoke)")
 	_ = flags.Parse(args[1:])
 
@@ -238,7 +263,7 @@ func handleTokenCommand(args []string) {
 	}
 	switch action {
 	case "create":
-		secret, t, err := store.Create(*name, server.Role(*role))
+		secret, t, err := store.CreateScoped(*name, server.Role(*role), server.Scope{Names: splitList(*names), Images: splitList(*images), Domains: splitList(*domains)})
 		if err != nil {
 			log.Fatalf("token create: %v", err)
 		}
@@ -249,9 +274,13 @@ func handleTokenCommand(args []string) {
 			log.Fatalf("token list: %v", err)
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tNAME\tROLE\tCREATED")
+		fmt.Fprintln(w, "ID\tNAME\tROLE\tSCOPE\tCREATED")
 		for _, t := range ts {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", t.ID, t.Name, t.Role, t.Created.Format("2006-01-02"))
+			scope := "-"
+			if t.Scoped() {
+				scope = "names=" + strings.Join(t.Scope.Names, ",") + " images=" + strings.Join(t.Scope.Images, ",") + " domains=" + strings.Join(t.Scope.Domains, ",")
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t.ID, t.Name, t.Role, scope, t.Created.Format("2006-01-02"))
 		}
 		_ = w.Flush()
 	case "revoke":

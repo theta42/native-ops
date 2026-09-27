@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -47,15 +49,68 @@ func (r Role) Allows(min Role) bool { return r.rank() > 0 && r.rank() >= min.ran
 
 func ValidRole(r Role) bool { return r.rank() > 0 }
 
+// Scope limits a token to managing tenant instances, and to particular ones: the instance names, image
+// references and route domains it may use, as globs (path.Match). A token with a scope can call only the
+// instance endpoints, never plan, apply or read the host's status, so a system that manages tenants (the
+// fleet manager) holds a token that cannot touch gitea, plane or anything else, whatever it is asked to do.
+type Scope struct {
+	Names   []string `json:"names,omitempty"`
+	Images  []string `json:"images,omitempty"`
+	Domains []string `json:"domains,omitempty"` // empty: no route may be published
+}
+
+// Any reports whether the scope limits anything.
+func (s Scope) Any() bool { return len(s.Names)+len(s.Images)+len(s.Domains) > 0 }
+
+var patternRe = regexp.MustCompile(`^[A-Za-z0-9*?._:/@-]{1,100}$`)
+
+// Validate checks that the patterns are usable and that a scope names what it allows.
+func (s Scope) Validate() error {
+	if !s.Any() {
+		return nil
+	}
+	if len(s.Names) == 0 || len(s.Images) == 0 {
+		return errors.New("a scoped token needs at least one instance name pattern and one image pattern")
+	}
+	for _, list := range [][]string{s.Names, s.Images, s.Domains} {
+		for _, p := range list {
+			if !patternRe.MatchString(p) {
+				return fmt.Errorf("pattern %q is not allowed", p)
+			}
+			if _, err := path.Match(p, ""); err != nil {
+				return fmt.Errorf("pattern %q is not valid: %v", p, err)
+			}
+		}
+	}
+	return nil
+}
+
+func matchAny(patterns []string, v string) bool {
+	for _, p := range patterns {
+		if ok, _ := path.Match(p, v); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Scope) AllowsName(n string) bool   { return matchAny(s.Names, n) }
+func (s Scope) AllowsImage(i string) bool  { return matchAny(s.Images, i) }
+func (s Scope) AllowsDomain(d string) bool { return matchAny(s.Domains, d) }
+
 // Token is one API credential. Only the SHA-256 of the secret is ever stored;
 // the secret itself is shown once, at creation.
 type Token struct {
 	ID      string    `json:"id"`
 	Name    string    `json:"name"`
 	Role    Role      `json:"role"`
+	Scope   *Scope    `json:"scope,omitempty"`
 	Hash    string    `json:"hash"`
 	Created time.Time `json:"created"`
 }
+
+// Scoped reports whether the token is limited to a scope of instances.
+func (t Token) Scoped() bool { return t.Scope != nil && t.Scope.Any() }
 
 const secretPrefix = "nops_"
 
@@ -165,12 +220,24 @@ func (s *TokenStore) SetBootstrap(secret string) error {
 
 // Create makes a new token and returns its secret, which is not recoverable afterwards.
 func (s *TokenStore) Create(name string, role Role) (secret string, t Token, err error) {
+	return s.CreateScoped(name, role, Scope{})
+}
+
+// CreateScoped makes a token limited to a scope of instances (see Scope). It needs at least the
+// deployer role: the scope narrows what that role may touch.
+func (s *TokenStore) CreateScoped(name string, role Role, scope Scope) (secret string, t Token, err error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 60 || strings.ContainsAny(name, "\n\r") {
 		return "", Token{}, errors.New("a token needs a short name")
 	}
 	if !ValidRole(role) {
-		return "", Token{}, fmt.Errorf("unknown role %q (viewer, deployer or admin)", role)
+		return "", Token{}, fmt.Errorf("unknown role %q (viewer, planner, deployer or admin)", role)
+	}
+	if err := scope.Validate(); err != nil {
+		return "", Token{}, err
+	}
+	if scope.Any() && role != RoleDeployer {
+		return "", Token{}, errors.New("a scoped token must have the deployer role (the scope is what limits it)")
 	}
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -179,6 +246,9 @@ func (s *TokenStore) Create(name string, role Role) (secret string, t Token, err
 	secret = secretPrefix + hex.EncodeToString(b)
 	h := hashSecret(secret)
 	t = Token{ID: h[:8], Name: name, Role: role, Hash: h, Created: time.Now().UTC()}
+	if scope.Any() {
+		t.Scope = &scope
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.reload(true); err != nil {
