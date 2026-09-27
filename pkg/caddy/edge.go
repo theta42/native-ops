@@ -329,8 +329,19 @@ func (e *EdgeManager) RemoveSite(ctx context.Context, siteName string) error {
 	return e.Reload(ctx)
 }
 
-// resolvScript rewrites resolv.conf only when it is not already in the expected state.
-const resolvScript = `grep -qx 'nameserver 10.0.100.1' /etc/resolv.conf 2>/dev/null || { rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 10.0.100.1\n' > /etc/resolv.conf && chmod 644 /etc/resolv.conf; }`
+// resolvScript repairs resolv.conf, but only when the edge cannot currently resolve its own hostname --
+// whatever is managing DNS there (a symlink to systemd-resolved's stub, on a fresh container, is the
+// normal case and must be left alone). The check is functional, never a text pattern: an earlier version
+// looked for the literal line "nameserver 10.0.100.1" and, not finding it in a working resolv.conf,
+// replaced it with one that put public resolvers (1.1.1.1, 8.8.8.8) ahead of that line. A resolver stops
+// at the first server that actually answers a query, including with "no such host", so from that moment
+// every route naming another container by hostname (all of them) failed and the edge returned 502 for
+// every site -- the first time a real route publish ran this script (theta42/native-ops#23).
+//
+// The repair uses the container's own default gateway, which on an Incus-managed bridge network is also
+// its DNS server: it resolves every container's name (having just asked for the edge's own name proves
+// that) and forwards everything else, so nothing else needs to be listed.
+const resolvScript = `getent hosts "$(hostname)" >/dev/null 2>&1 || { gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}'); [ -n "$gw" ] && printf 'search incus\nnameserver %s\n' "$gw" > /etc/resolv.conf && chmod 644 /etc/resolv.conf; }`
 
 // Reload executes a graceful caddy reload. If that fails it restarts the edge
 // container and tries once more (the edge gets its address from the bridge's
