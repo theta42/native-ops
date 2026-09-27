@@ -106,8 +106,6 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 // runApply runs one job to its end and releases everything the request handed to it.
 func (s *Server) runApply(id JobID, actor string, u *upload, fp *engine.FleetPlan) {
 	defer s.jobsWG.Done()
-	defer s.applyMu.Unlock()
-	defer u.discard()
 
 	logf := func(format string, a ...any) { s.opts.Jobs.Logf(id, format, a...) }
 	var err error
@@ -128,6 +126,12 @@ func (s *Server) runApply(id JobID, actor string, u *upload, fp *engine.FleetPla
 	} else {
 		logf("done")
 	}
+
+	// Free the host BEFORE the job is reported finished: a client that sees "succeeded" and starts
+	// the next apply must find the tree gone and the host free, not a 409 for a job that is over.
+	u.discard()
+	s.applyMu.Unlock()
+
 	s.opts.Jobs.Finish(id, err)
 	outcome, code := "succeeded", http.StatusOK
 	if err != nil {
