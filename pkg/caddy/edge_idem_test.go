@@ -24,6 +24,13 @@ type edgeSim struct {
 	restarts    int
 	rejectWhen  string // `caddy validate` fails while any file contains this
 	reloadFails bool
+
+	// resolvBroken simulates whether the container can currently resolve its own hostname -- false (the
+	// default) is a resolver that already works by some other means (a fresh container's systemd-resolved
+	// symlink, say) and resolvScript must leave it alone. Fixing it, when it is true, makes it false: the
+	// container's own resolution is what the fix repairs, so a second attempt finds nothing to do.
+	resolvBroken bool
+	resolvFixes  int // how many times the resolv repair actually ran
 }
 
 var _ remote.Executor = (*edgeSim)(nil)
@@ -66,6 +73,12 @@ func (s *edgeSim) Run(_ context.Context, cmd string) (string, error) {
 		s.reloads++
 	case strings.Contains(cmd, "incus restart"):
 		s.restarts++
+	case strings.Contains(cmd, "getent hosts"):
+		if s.resolvBroken {
+			s.resolvFixes++
+			s.files["/etc/resolv.conf"] = "search incus\nnameserver 10.0.100.1\n"
+			s.resolvBroken = false // the fix repairs the very thing it checks, so it won't run again
+		}
 	case strings.Contains(cmd, "-- rm -f"):
 		m := regexp.MustCompile(`rm -f '([^']*)'`).FindStringSubmatch(cmd)
 		delete(s.files, m[1])
@@ -186,6 +199,51 @@ func TestPublishSiteRestoresThePreviousConfigWhenCaddyRejectsTheNewOne(t *testin
 	}
 	if _, exists := sim.files["/etc/caddy/sites/other.caddy"]; exists {
 		t.Fatal("a rejected new site must not be left behind")
+	}
+}
+
+func TestReloadNeverTouchesAResolverThatAlreadyWorks(t *testing.T) {
+	sim := newEdgeSim()
+	e := NewEdgeManager(sim, "edge")
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if err := e.PublishSite(ctx, "gitea", route, "10.0.100.21"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sim.resolvFixes != 0 {
+		t.Fatalf("a resolver that already works must never be rewritten, got %d fixes", sim.resolvFixes)
+	}
+	if _, touched := sim.files["/etc/resolv.conf"]; touched {
+		t.Fatal("/etc/resolv.conf must not be touched when resolution already works")
+	}
+}
+
+func TestReloadRepairsAResolverThatCannotResolveTheEdgeItself(t *testing.T) {
+	sim := newEdgeSim()
+	sim.resolvBroken = true
+	e := NewEdgeManager(sim, "edge")
+	ctx := context.Background()
+	if err := e.PublishSite(ctx, "gitea", route, "10.0.100.21"); err != nil {
+		t.Fatal(err)
+	}
+	if sim.resolvFixes != 1 {
+		t.Fatalf("expected one repair, got %d", sim.resolvFixes)
+	}
+	got := sim.files["/etc/resolv.conf"]
+	if !strings.HasPrefix(got, "nameserver ") && !strings.Contains(got, "\nnameserver ") {
+		t.Fatalf("the repaired file must set a nameserver:\n%s", got)
+	}
+	if strings.Contains(got, "1.1.1.1") || strings.Contains(got, "8.8.8.8") {
+		t.Fatalf("a public resolver must never be written ahead of (or instead of) the bridge's own: %s", got)
+	}
+
+	// Repaired: a second publish finds nothing to fix.
+	if err := e.PublishSite(ctx, "home", route, "10.0.100.22"); err != nil {
+		t.Fatal(err)
+	}
+	if sim.resolvFixes != 1 {
+		t.Fatalf("a working resolver must not be repaired again, got %d fixes", sim.resolvFixes)
 	}
 }
 
