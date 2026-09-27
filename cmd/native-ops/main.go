@@ -626,7 +626,8 @@ func handleImageCommand(ctx context.Context, args []string) {
 		log.Fatal("Error: image build requires <app> and <ref>")
 	}
 	exec := remote.NewLocalExecutor()
-	if err := engine.BuildImage(ctx, exec, *configDir, flags.Arg(0), flags.Arg(1)); err != nil {
+	logf := func(format string, a ...any) { fmt.Printf(format, a...) }
+	if err := engine.BuildImage(ctx, exec, *configDir, flags.Arg(0), flags.Arg(1), logf); err != nil {
 		log.Fatalf("Image build failed: %v", err)
 	}
 	fmt.Printf("Built image %s@%s\n", flags.Arg(0), flags.Arg(1))
