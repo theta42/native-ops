@@ -20,7 +20,9 @@ a person sets up by hand.
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images and warnings for the host |
 | `POST /v1/plan` | planner | what `apply` would change for the configuration you upload (never changes the host) |
-| `POST /v1/apply` | deployer | apply the plan you reviewed, as a job (only with `--enable-apply`) |
+| `GET /v1/plans`, `GET /v1/plans/{hash}` | viewer | the plans that were made, and where each stands (pending, approved, used, expired, blocked) |
+| `POST /v1/plans/{hash}/approve`, `DELETE /v1/plans/{hash}/approval` | admin | approve one apply of exactly this plan, or take the approval back |
+| `POST /v1/apply` | deployer | apply an **approved** plan, as a job (only with `--enable-apply`) |
 | `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | apply jobs and their outcome; the log is shown to deployers and admins only |
 | `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
 
@@ -107,7 +109,9 @@ on purpose:
 curl ... "$URL/v1/plan?sha=$COMMIT"  --data-binary @conf.tgz -o plan.json
 HASH=$(jq -r .hash plan.json)
 
-# 2. apply that plan: the same tree, and the hash. 202 with a job; poll it
+# 2. an admin approves that plan hash (the UI's Plans page, or POST /v1/plans/$HASH/approve)
+
+# 3. apply that plan: the same tree, and the hash. 202 with a job; poll it
 curl ... -X POST "$URL/v1/apply?sha=$COMMIT&expect=$HASH" --data-binary @conf.tgz -o job.json
 curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succeeded | failed | interrupted
 ```
@@ -119,6 +123,15 @@ curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succe
   restarts), so it also covers the parts of a manifest the plan does not print: environment
   values and hook bodies. Approving one secret and uploading another is refused, and the hash tells
   nobody anything about the value.
+- **An admin has to approve that plan first.** The deployer token that CI holds is not enough to
+  change the host, because this Git host shows a repository's secrets to every branch of it. Every
+  plan the daemon makes is recorded (`plans/<hash>.json`, 0600). An admin approves one in the UI
+  (Plans, then Approve) or with `POST /v1/plans/<hash>/approve`; the approval names who gave it,
+  **lets exactly one apply of exactly that plan through, and expires** (an hour; `--approval-ttl`).
+  Without it the apply answers `403 not_approved` with the plan and where to approve it, and
+  nothing runs; an expired one is `403 approval_expired`. Presenting the same plan again after it
+  was applied is a new occurrence and needs a new approval. A plan that is blocked, or that has
+  nothing to change, cannot be approved. Approvals survive a restart of the daemon and are audited.
 - **A blocked plan is never applied** (`409 blocked`), and a plan with nothing to change starts no
   job (`200 nothing_to_do`).
 - **One apply at a time** on the host (`409 busy`, naming the running job), taken before the
@@ -133,14 +146,18 @@ curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succe
 - The audit log records the request (`apply job=... sha=... hash=...`, or why it was refused) and
   the end of the job.
 
+The UI (`/`) has a Plans page (each plan, what it would do, who asked, and an Approve or Withdraw
+button for admins) and, when apply is on, a Jobs page with each job's outcome and log.
+
 An apply runs `incus` as the daemon's user (which is in `incus-admin`, so it can do to instances
 whatever a deployer's manifest says) and host hooks (`pre_deploy`, `post_deploy`) as that user,
 inside the unit's sandbox (`ProtectSystem=strict`; only its state directory is writable). A
-`deployer` token is therefore as powerful as the manifests it can upload: use one token per
-pipeline, and do not give it to a job that runs pull-request code before it is merged. Plan from
-pull requests with a `planner` token; apply only from the protected branch. (A Git host that lets any
-branch of a repository read its secrets cannot keep a deployer token from a pull request by itself:
-the planner role is what makes plan-on-PR safe, and gating apply on an approval is the next step.)
+`deployer` token is therefore as powerful as the manifests an admin approves it to apply: use one
+token per pipeline, plan from pull requests with a `planner` token, and apply from the protected
+branch. Because a Git host that shows secrets to every branch cannot keep a deployer token from a
+pull request, the approval is what stops that token from changing the host on its own: the most a
+stolen or misused deployer token can do is apply a plan an admin already looked at and approved,
+once, within the hour.
 
 ## Tokens and bootstrapping
 
@@ -172,5 +189,6 @@ with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the
 
 ## Roadmap
 
-Instance update/migrate/backup as jobs; a live view of a running job in the UI; and OIDC sign-in
-for the UI. The API is versioned (`/v1`) so a separate fleet manager can depend on it.
+Instance update/migrate/backup as jobs; OIDC sign-in for the UI (so an admin does not paste a
+token); and a live view of a running job. The API is versioned (`/v1`) so a separate fleet manager
+can depend on it.

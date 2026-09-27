@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -66,6 +67,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash := fp.Hash()
+	s.recordPlan(r, u, fp)
 	answer := func(code int, kind, msg string) {
 		writeJSON(w, code, map[string]any{"error": msg, "code": kind, "hash": hash, "exit": fp.ExitStatus(), "plan": fp, "text": fp.Render()})
 	}
@@ -84,6 +86,23 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The plan is the one that was reviewed and it has changes. It still needs an admin's approval:
+	// a deployer token is not enough on its own to change the host.
+	if err := s.opts.Plans.Check(hash); err != nil {
+		switch {
+		case errors.Is(err, ErrApprovalUsed):
+			auditDetail(r, "apply rejected: approval already used hash=%s", hash[:12])
+			answer(http.StatusForbidden, "approval_used", "the approval for this plan was already used by an apply. An admin has to approve it again.")
+		case errors.Is(err, ErrApprovalExpiry):
+			auditDetail(r, "apply rejected: approval expired hash=%s", hash[:12])
+			answer(http.StatusForbidden, "approval_expired", "the approval for this plan has expired. An admin has to approve it again.")
+		default:
+			auditDetail(r, "apply rejected: not approved hash=%s", hash[:12])
+			answer(http.StatusForbidden, "not_approved", "this plan has not been approved. An admin can approve it (in the UI under Plans, or POST /v1/plans/"+hash+"/approve); then run the apply again.")
+		}
+		return
+	}
+
 	actor := "-"
 	if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
 		actor = h.name
@@ -92,6 +111,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("apply: create job: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was applied")
+		return
+	}
+	// One approval, one apply: it is used up here, before anything runs. The apply lock is held, so no
+	// other apply can have used it since Check.
+	if err := s.opts.Plans.Consume(hash, job.ID); err != nil {
+		s.opts.Jobs.Finish(job.ID, fmt.Errorf("the approval could not be used: %v", err))
+		writeError(w, http.StatusInternalServerError, "internal", "could not use the approval, so nothing was applied")
 		return
 	}
 	auditDetail(r, "apply job=%s sha=%s service=%s hash=%s", job.ID, orDash(u.sha), orDash(u.service), hash[:12])

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/remote"
@@ -100,12 +101,13 @@ func handleServeCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := flags.String("addr", "127.0.0.1:8686", "Listen address (put TLS in front of it, e.g. the Caddy edge)")
 	pool := flags.String("pool", "default", "Storage pool holding the data volumes")
-	enableApply := flags.Bool("enable-apply", false, "Serve POST /v1/apply and /v1/jobs (off by default: without it the daemon can read and plan, never change)")
+	enableApply := flags.Bool("enable-apply", false, "Serve POST /v1/apply and /v1/jobs (off by default: without it the daemon can read and plan, never change). An apply also needs an admin's approval of the plan")
+	approvalTTL := flags.Duration("approval-ttl", time.Hour, "How long an admin's approval of a plan lasts")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
 	srv, closeFn, err := newDaemon(daemonConfig{
-		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply,
+		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL,
 		Exec: remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
 	})
 	if err != nil {
@@ -125,6 +127,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 type daemonConfig struct {
 	Addr, Pool, StateDir string
 	EnableApply          bool
+	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
 }
@@ -151,8 +154,15 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		audit.Close()
 		return nil, nil, err
 	}
+	// Plans are recorded whether or not apply is on: the UI shows them, and an admin can approve one
+	// ahead of time. Only an apply ever uses an approval.
+	plans, err := server.OpenPlans(filepath.Join(cfg.StateDir, "plans"), cfg.ApprovalTTL)
+	if err != nil {
+		audit.Close()
+		return nil, nil, fmt.Errorf("plans: %w", err)
+	}
 	opts := server.Options{
-		Addr: cfg.Addr, Tokens: tokens, Audit: audit, Version: Version,
+		Addr: cfg.Addr, Tokens: tokens, Audit: audit, Version: Version, Plans: plans,
 		Status: func(ctx context.Context) (*status.Snapshot, error) { return status.Collect(ctx, cfg.Exec, cfg.Pool) },
 		Plan:   planSource(cfg.Exec, key),
 	}

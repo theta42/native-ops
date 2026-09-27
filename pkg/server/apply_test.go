@@ -34,16 +34,26 @@ type applyRig struct {
 
 	deployerToken   string
 	serverUnderTest *Server
+
+	plans *Plans
+	// autoApprove makes apply() plan and have an admin approve first, so the tests of what an apply does
+	// once it is allowed to run stay about that. The gate's own tests turn it off.
+	autoApprove bool
 }
 
 func newApplyRig(t *testing.T) *applyRig {
 	t.Helper()
-	rig := &applyRig{plan: &planRecorder{plan: creatingPlan()}, jobsDir: filepath.Join(t.TempDir(), "jobs")}
+	rig := &applyRig{plan: &planRecorder{plan: creatingPlan()}, jobsDir: filepath.Join(t.TempDir(), "jobs"), autoApprove: true}
 	jobs, err := OpenJobs(rig.jobsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
+	plans, err := OpenPlans(filepath.Join(dir, "plans"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.plans = plans
 	tokens, _ := OpenTokenStore(filepath.Join(dir, "tokens.json"))
 	admin, _, _ := tokens.Create("ci-admin", RoleAdmin)
 	viewer, _, _ := tokens.Create("dash", RoleViewer)
@@ -51,7 +61,7 @@ func newApplyRig(t *testing.T) *applyRig {
 	planner, _, _ := tokens.Create("pr-ci", RolePlanner)
 	audit, _ := OpenAudit(filepath.Join(dir, "audit.log"))
 	t.Cleanup(func() { audit.Close() })
-	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Plan: rig.plan.fn, Jobs: jobs,
+	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Plan: rig.plan.fn, Jobs: jobs, Plans: plans,
 		Status: func(context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil },
 		Apply: func(ctx context.Context, cfg string, p *engine.FleetPlan, logf func(string, ...any)) error {
 			rig.applies.Add(1)
@@ -88,7 +98,24 @@ func newApplyRig(t *testing.T) *applyRig {
 
 func (r *applyRig) apply(t *testing.T, token, query string, body []byte) (*http.Response, string) {
 	t.Helper()
+	if r.autoApprove {
+		r.approveFor(t, query, body)
+	}
 	return r.post(t, "/v1/apply"+query, token, "application/gzip", body)
+}
+
+// approveFor does what a person does before an apply: the plan is made, and an admin approves the hash
+// the apply is about to ask for. Plans that cannot be approved (blocked, nothing to do) just stay so.
+func (r *applyRig) approveFor(t *testing.T, query string, body []byte) {
+	t.Helper()
+	const key = "expect="
+	i := strings.Index(query, key)
+	if i < 0 || len(query) < i+len(key)+64 {
+		return
+	}
+	hash := query[i+len(key) : i+len(key)+64]
+	r.post(t, "/v1/plan", r.deployerToken, "application/gzip", body)
+	r.post(t, "/v1/plans/"+hash+"/approve", r.secret, "", nil)
 }
 
 func (r *applyRig) waitJob(t *testing.T, id string, want JobStatus) Job {
@@ -165,6 +192,7 @@ func TestApplyRunsTheReviewedPlanAsAJobAndKeepsTheRecord(t *testing.T) {
 
 func TestApplyRefusesWithoutTheHashOfAReviewedPlan(t *testing.T) {
 	rig := newApplyRig(t)
+	rig.autoApprove = false // these are refusals: nothing may reach the plan, not even a helper's
 	for _, q := range []string{"", "?expect=", "?expect=abc", "?expect=" + strings.Repeat("g", 64), "?expect=" + strings.Repeat("A", 64), "?expect=" + strings.Repeat("a", 65)} {
 		res, body := rig.apply(t, rig.deployerToken, q, goodTree(t))
 		if res.StatusCode != 400 || !strings.Contains(body, "bad_request") {
@@ -174,6 +202,7 @@ func TestApplyRefusesWithoutTheHashOfAReviewedPlan(t *testing.T) {
 	if rig.applies.Load() != 0 || len(rig.plan.dirs) != 0 {
 		t.Fatal("nothing may be unpacked, planned or applied without the hash")
 	}
+	rig.autoApprove = true
 	// A refusal must not leave the host locked.
 	if res, _ := rig.apply(t, rig.deployerToken, "?expect="+creatingPlan().Hash(), goodTree(t)); res.StatusCode != 202 {
 		t.Fatalf("the next apply must be able to run, got %d", res.StatusCode)
@@ -231,6 +260,7 @@ func TestApplyNeverRunsABlockedPlanOrStartsAJobForNothing(t *testing.T) {
 
 func TestApplyNeedsADeployerAndOnlyShowsLogsToOne(t *testing.T) {
 	rig := newApplyRig(t)
+	rig.autoApprove = false // the refusals below must reach nothing, not even a helper's plan
 	hash := creatingPlan().Hash()
 	for _, tok := range []string{"", "garbage"} {
 		if res, _ := rig.apply(t, tok, "?expect="+hash, goodTree(t)); res.StatusCode != 401 {
@@ -248,6 +278,7 @@ func TestApplyNeedsADeployerAndOnlyShowsLogsToOne(t *testing.T) {
 		t.Fatal("a refused request reaches nothing")
 	}
 
+	rig.autoApprove = true
 	_, body := rig.apply(t, rig.deployerToken, "?expect="+hash, goodTree(t))
 	id := jobID(t, body)
 	rig.waitJob(t, id, JobSucceeded)
