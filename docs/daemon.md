@@ -23,7 +23,9 @@ a person sets up by hand.
 | `GET /v1/plans`, `GET /v1/plans/{hash}` | viewer | the plans that were made, and where each stands (pending, approved, used, expired, blocked) |
 | `POST /v1/plans/{hash}/approve`, `DELETE /v1/plans/{hash}/approval` | admin | approve one apply of exactly this plan, or take the approval back |
 | `POST /v1/apply` | deployer | apply an **approved** plan, as a job (only with `--enable-apply`) |
-| `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | apply jobs and their outcome; the log is shown to deployers and admins only |
+| `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | jobs (apply and instance changes) and their outcome; the log is shown to deployers and admins only |
+| `PUT /v1/instances/{name}`, `POST /v1/instances/{name}/update`, `DELETE /v1/instances/{name}` | deployer | create, move to another image, or remove a tenant instance, as a job (only with `--enable-instances`) |
+| `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see |
 | `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
@@ -158,6 +160,52 @@ branch. Because a Git host that shows secrets to every branch cannot keep a depl
 pull request, the approval is what stops that token from changing the host on its own: the most a
 stolen or misused deployer token can do is apply a plan an admin already looked at and approved,
 once, within the hour.
+
+## Tenant instances (for a fleet manager)
+
+Static services (gitea, plane, ...) are declared in git and applied. **Tenants** (one instance per customer,
+created and removed while the product runs) are managed by a system that knows about customers, through
+this API, without holding a key to the host. Off unless the daemon is started with `--enable-instances`.
+
+```bash
+# a token that can only ever manage demo-*/rest-* instances, from one image family, on one zone
+native-ops token create --state-dir /var/lib/native-ops --name fleet-manager --role deployer \
+    --names 'demo-*,rest-*' --images 'opsavor-platform:*' --domains '*.opsavor.app'
+
+curl -X PUT "$URL/v1/instances/demo-multi" -H "Authorization: Bearer $TOKEN" -d '{
+  "template": "platform", "image": "opsavor-platform:latest",
+  "limits": {"limits.cpu": "1", "limits.memory": "1GB"},
+  "volumes": [{"name": "demo-multi-data", "path": "/app/.data"}],
+  "service": "platform", "env": {"OPSAVOR_SEED": "multi", "PORT": "8787"},
+  "health": {"path": "/health", "port": 8787},
+  "domain": "demo-multi.opsavor.app", "route_directives": ["import strip-forged-identity"]
+}'                                          # 202 and a job; poll GET /v1/jobs/{id}
+```
+
+`PUT` makes the instance exist as described: it creates it (volume, environment file at
+`/etc/default/<service>`, the unit started once the environment is there, health gate, route), or resumes and
+converges the one an earlier call created, so it is safe to repeat. `update` moves it to another image through
+the safe path (volume snapshot first, environment carried over, health-gated, rolled back on failure).
+`DELETE` removes it and its route; `?purge_volumes=true` also deletes the data volumes named after it.
+
+What stops a fleet manager, or anyone holding its token, from doing more than that:
+
+- **A scope.** A token created with `--names`/`--images`/`--domains` (globs) can call only these endpoints, and
+  only for instances, images and domains that match; it is refused everywhere else (plan, apply, status). It
+  must be a `deployer` token and needs names and images (no domains means no route may be published).
+- **A strict spec.** A request is checked against a short list of shapes before anything runs: only the
+  profiles the operator allows (`--instance-profiles`, default `base,service`), only `limits.cpu` and
+  `limits.memory`, data volumes named `<instance>-...` at clean absolute paths, environment names in
+  `[A-Z_][A-Z0-9_]*` with no line breaks, a health check, a host name, and route directives that are only
+  `import <snippet>` from the operator's list (`--instance-route-imports`, default none). Unknown fields are
+  refused. There is no way to ask for a privileged container, a host path, another instance's volume, or a
+  shell.
+- **Only tenants.** An instance can be changed or removed here only if it was launched from a template
+  (`user.native-ops.template`). gitea, plane and every other static service carry none and are refused, for
+  every token, an admin's included; an instance of another template is never taken over.
+- **One change at a time**, shared with apply: `409 busy` while a job runs, and a finished job means the host
+  is free. Each change is a job with a record; tenant secrets in `env` never appear in a job log, the audit log
+  or any answer.
 
 ## Tokens and bootstrapping
 

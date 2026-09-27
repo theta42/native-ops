@@ -122,48 +122,59 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	auditDetail(r, "apply job=%s sha=%s service=%s hash=%s", job.ID, orDash(u.sha), orDash(u.service), hash[:12])
 	handedOff = true
-	s.jobsWG.Add(1)
-	go s.runApply(job.ID, actor, u, fp)
+	s.runApply(job.ID, actor, u, fp) // returns at once: the job runs in the background
 
 	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
 	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "hash": hash, "plan": fp, "text": fp.Render()})
 }
 
-// runApply runs one job to its end and releases everything the request handed to it.
+// runApply runs one apply job to its end and releases everything the request handed to it.
 func (s *Server) runApply(id JobID, actor string, u *upload, fp *engine.FleetPlan) {
-	defer s.jobsWG.Done()
+	s.startJob(id, actor, "apply of plan "+fp.Hash()[:12], "apply", u.discard, func(ctx context.Context, logf func(string, ...any)) error {
+		return s.opts.Apply(ctx, u.root, fp, logf)
+	})
+}
 
-	logf := func(format string, a ...any) { s.opts.Jobs.Logf(id, format, a...) }
-	var err error
-	func() {
-		defer func() {
-			if p := recover(); p != nil {
-				err = fmt.Errorf("apply panicked: %v", p)
-				log.Printf("apply %s: panic: %v", id, p)
-			}
+// startJob runs work as the job id in the background. The caller holds the host lock (applyMu); it is
+// released, and cleanup run, BEFORE the job is reported finished: a client that sees "succeeded" and
+// starts the next change must find the host free, not a 409 for a job that is over. what says what the
+// job is, for its log; audit is how its end is named in the audit log.
+func (s *Server) startJob(id JobID, actor, what, audit string, cleanup func(), work func(ctx context.Context, logf func(string, ...any)) error) {
+	s.jobsWG.Add(1)
+	go func() {
+		defer s.jobsWG.Done()
+		logf := func(format string, a ...any) { s.opts.Jobs.Logf(id, format, a...) }
+		var err error
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					err = fmt.Errorf("%s panicked: %v", what, p)
+					log.Printf("job %s: panic: %v", id, p)
+				}
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), maxApplyDuration)
+			defer cancel()
+			logf("%s started by %s", what, actor)
+			err = work(ctx, logf)
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), maxApplyDuration)
-		defer cancel()
-		logf("apply of plan %s started by %s", fp.Hash()[:12], actor)
-		err = s.opts.Apply(ctx, u.root, fp, logf)
+		if err != nil {
+			logf("FAILED: %v", err)
+		} else {
+			logf("done")
+		}
+
+		if cleanup != nil {
+			cleanup()
+		}
+		s.applyMu.Unlock()
+
+		s.opts.Jobs.Finish(id, err)
+		outcome, code := "succeeded", http.StatusOK
+		if err != nil {
+			outcome, code = "failed", http.StatusInternalServerError
+		}
+		s.opts.Audit.Log(AuditEntry{Time: time.Now().UTC(), Actor: actor, Method: "JOB", Path: "/v1/jobs/" + string(id), Status: code, Detail: audit + " " + outcome})
 	}()
-	if err != nil {
-		logf("FAILED: %v", err)
-	} else {
-		logf("done")
-	}
-
-	// Free the host BEFORE the job is reported finished: a client that sees "succeeded" and starts
-	// the next apply must find the tree gone and the host free, not a 409 for a job that is over.
-	u.discard()
-	s.applyMu.Unlock()
-
-	s.opts.Jobs.Finish(id, err)
-	outcome, code := "succeeded", http.StatusOK
-	if err != nil {
-		outcome, code = "failed", http.StatusInternalServerError
-	}
-	s.opts.Audit.Log(AuditEntry{Time: time.Now().UTC(), Actor: actor, Method: "JOB", Path: "/v1/jobs/" + string(id), Status: code, Detail: "apply " + outcome})
 }
 
 // handleJobs is GET /v1/jobs: the recent jobs, newest first, without logs.

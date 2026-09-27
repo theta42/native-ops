@@ -139,10 +139,16 @@ func newJobID(now time.Time) JobID {
 
 // Create records a new running job.
 func (j *Jobs) Create(actor, sha, service, planHash string) (Job, error) {
+	return j.CreateKind("apply", actor, sha, service, planHash)
+}
+
+// CreateKind records a new running job of the given kind ("apply", "instance:put", ...). service is the
+// service or instance the job is about.
+func (j *Jobs) CreateKind(kind, actor, sha, service, planHash string) (Job, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	now := time.Now().UTC()
-	job := &Job{ID: newJobID(now), Kind: "apply", Status: JobRunning, Actor: actor, Sha: sha, Service: service, PlanHash: planHash, Created: now}
+	job := &Job{ID: newJobID(now), Kind: kind, Status: JobRunning, Actor: actor, Sha: sha, Service: service, PlanHash: planHash, Created: now}
 	if err := j.persist(job); err != nil {
 		return Job{}, err
 	}

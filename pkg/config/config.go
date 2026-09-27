@@ -179,7 +179,9 @@ type TemplateConfig struct {
 	EnvTemplate    map[string]string `yaml:"env_template,omitempty"`
 	HealthCheck    HealthCheckConfig `yaml:"healthcheck,omitempty"`
 	RoutingPattern string            `yaml:"routing_pattern,omitempty"` // e.g. "{slug}.example.com"
-	Hooks          ServiceHooks      `yaml:"hooks,omitempty"`
+	// RoutingDirectives are extra Caddy directives for the route (for example "import strip-forged-identity").
+	RoutingDirectives []string     `yaml:"routing_directives,omitempty"`
+	Hooks             ServiceHooks `yaml:"hooks,omitempty"`
 }
 
 // HostSpec defines the parameters to create or resize a host VM / Droplet.

@@ -41,7 +41,11 @@ type applyRig struct {
 	autoApprove bool
 }
 
-func newApplyRig(t *testing.T) *applyRig {
+func newApplyRig(t *testing.T) *applyRig { return newApplyRigWith(t, nil) }
+
+// newApplyRigWith is newApplyRig with a chance to change the server's options before it is built, so a
+// test can turn on more of the daemon (the instance endpoints, say) next to apply.
+func newApplyRigWith(t *testing.T, tweak func(*Options)) *applyRig {
 	t.Helper()
 	rig := &applyRig{plan: &planRecorder{plan: creatingPlan()}, jobsDir: filepath.Join(t.TempDir(), "jobs"), autoApprove: true}
 	jobs, err := OpenJobs(rig.jobsDir)
@@ -61,7 +65,7 @@ func newApplyRig(t *testing.T) *applyRig {
 	planner, _, _ := tokens.Create("pr-ci", RolePlanner)
 	audit, _ := OpenAudit(filepath.Join(dir, "audit.log"))
 	t.Cleanup(func() { audit.Close() })
-	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Plan: rig.plan.fn, Jobs: jobs, Plans: plans,
+	opts := Options{Tokens: tokens, Audit: audit, Version: "test", Plan: rig.plan.fn, Jobs: jobs, Plans: plans,
 		Status: func(context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil },
 		Apply: func(ctx context.Context, cfg string, p *engine.FleetPlan, logf func(string, ...any)) error {
 			rig.applies.Add(1)
@@ -80,7 +84,11 @@ func newApplyRig(t *testing.T) *applyRig {
 				panic("boom")
 			}
 			return rig.err
-		}})
+		}}
+	if tweak != nil {
+		tweak(&opts)
+	}
+	s, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}

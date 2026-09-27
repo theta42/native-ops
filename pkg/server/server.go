@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/status"
 )
 
@@ -41,6 +42,10 @@ type Options struct {
 	// only ever called with a plan that passed the gate in handleApply.
 	Apply ApplyFunc
 	Jobs  *Jobs
+	// Instances, with Jobs, enables the tenant-instance endpoints (PUT/DELETE /v1/instances/{name}, update,
+	// list). InstancePolicy says what a spec may ask for.
+	Instances      InstanceOps
+	InstancePolicy engine.InstancePolicy
 	// Plans records the plans made and the admin approvals that let an apply through. It is
 	// required with Apply: an apply only ever runs a plan somebody approved.
 	Plans *Plans
@@ -66,8 +71,14 @@ func New(opts Options) (*Server, error) {
 	if opts.Tokens == nil || opts.Status == nil {
 		return nil, errors.New("server needs a token store and a status source")
 	}
-	if (opts.Apply != nil) != (opts.Jobs != nil) || (opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil)) {
-		return nil, errors.New("apply needs a plan source, a plan store (approvals) and a job store, and none is useful alone")
+	if (opts.Apply != nil || opts.Instances != nil) && opts.Jobs == nil {
+		return nil, errors.New("apply and instances need a job store: every change to the host is a job with a record")
+	}
+	if opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil) {
+		return nil, errors.New("apply needs a plan source and a plan store (approvals) to check the plan against")
+	}
+	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil {
+		return nil, errors.New("a job store is only useful with apply or instances")
 	}
 	if opts.JobDrain <= 0 {
 		opts.JobDrain = 5 * time.Minute
@@ -82,6 +93,7 @@ type actorHolder struct {
 	name   string
 	role   Role
 	detail string
+	scope  *Scope // set when the token is limited to tenant instances
 }
 
 // auditDetail attaches a note to the current request's audit entry.
@@ -120,7 +132,18 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
+// auth requires a token of at least the given role. A token limited to a scope of tenant instances is
+// refused here: it may only call the instance endpoints (authScoped).
 func (s *Server) auth(min Role, next http.HandlerFunc) http.Handler {
+	return s.authWith(min, false, next)
+}
+
+// authScoped is auth for the endpoints a scoped token may call. The handler enforces the scope.
+func (s *Server) authScoped(min Role, next http.HandlerFunc) http.Handler {
+	return s.authWith(min, true, next)
+}
+
+func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t, ok := s.opts.Tokens.Verify(bearer(r))
 		if !ok {
@@ -130,9 +153,16 @@ func (s *Server) auth(min Role, next http.HandlerFunc) http.Handler {
 		}
 		if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
 			h.name, h.role = t.Name, t.Role
+			if t.Scoped() {
+				h.scope = t.Scope
+			}
 		}
 		if !t.Role.Allows(min) {
 			writeError(w, http.StatusForbidden, "forbidden", "this token's role cannot do that")
+			return
+		}
+		if t.Scoped() && !allowScoped {
+			writeError(w, http.StatusForbidden, "forbidden", "this token is limited to managing its own instances")
 			return
 		}
 		next(w, r)
@@ -233,9 +263,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.opts.Version})
 	})
-	mux.Handle("GET /v1/whoami", s.auth(RoleViewer, func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /v1/whoami", s.authScoped(RoleViewer, func(w http.ResponseWriter, r *http.Request) {
 		h, _ := r.Context().Value(actorKey{}).(*actorHolder)
-		writeJSON(w, http.StatusOK, map[string]any{"name": h.name, "role": h.role, "version": s.opts.Version})
+		out := map[string]any{"name": h.name, "role": h.role, "version": s.opts.Version}
+		if h.scope != nil {
+			out["scope"] = h.scope
+		}
+		writeJSON(w, http.StatusOK, out)
 	}))
 	mux.Handle("GET /v1/status", s.auth(RoleViewer, func(w http.ResponseWriter, r *http.Request) {
 		snap, err := s.snapshot(r.Context())
@@ -255,10 +289,19 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("POST /v1/plans/{hash}/approve", s.auth(RoleAdmin, s.handlePlanApprove))
 		mux.Handle("DELETE /v1/plans/{hash}/approval", s.auth(RoleAdmin, s.handlePlanRevoke))
 	}
+	if s.opts.Instances != nil {
+		mux.Handle("GET /v1/instances", s.authScoped(RoleViewer, s.handleInstanceList))
+		mux.Handle("GET /v1/instances/{name}", s.authScoped(RoleViewer, s.handleInstanceGet))
+		mux.Handle("PUT /v1/instances/{name}", s.authScoped(RoleDeployer, s.handleInstancePut))
+		mux.Handle("POST /v1/instances/{name}/update", s.authScoped(RoleDeployer, s.handleInstanceUpdate))
+		mux.Handle("DELETE /v1/instances/{name}", s.authScoped(RoleDeployer, s.handleInstanceDelete))
+	}
+	if s.opts.Jobs != nil {
+		mux.Handle("GET /v1/jobs", s.authScoped(RoleViewer, s.handleJobs))
+		mux.Handle("GET /v1/jobs/{id}", s.authScoped(RoleViewer, s.handleJob))
+	}
 	if s.opts.Apply != nil {
 		mux.Handle("POST /v1/apply", s.auth(RoleDeployer, s.handleApply))
-		mux.Handle("GET /v1/jobs", s.auth(RoleViewer, s.handleJobs))
-		mux.Handle("GET /v1/jobs/{id}", s.auth(RoleViewer, s.handleJob))
 	}
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)

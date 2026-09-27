@@ -177,8 +177,9 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 			port = 8787
 		}
 		routing := config.RoutingConfig{
-			Domain:       domain,
-			UpstreamPort: port,
+			Domain:          domain,
+			UpstreamPort:    port,
+			ExtraDirectives: p.Template.RoutingDirectives,
 		}
 		ips, err := m.incus.GlobalIPv4s(ctx, p.Name)
 		if err != nil {
