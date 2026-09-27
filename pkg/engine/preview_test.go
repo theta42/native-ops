@@ -12,11 +12,15 @@ import (
 	"github.com/theta42/native-ops/pkg/remote"
 )
 
-type fakeExec struct{ cmds []string }
+type fakeExec struct {
+	cmds []string
+	out  string // returned by every Run call
+	err  error  // returned by every Run call when set; nil (the default) means every call succeeds
+}
 
 func (f *fakeExec) Run(_ context.Context, command string) (string, error) {
 	f.cmds = append(f.cmds, command)
-	return "", nil
+	return f.out, f.err
 }
 func (f *fakeExec) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
 func (f *fakeExec) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
@@ -63,14 +67,14 @@ func TestBuildImageRunsConfRecipe(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &fakeExec{}
-	if err := BuildImage(context.Background(), exec, dir, "platform", "feat/x"); err != nil {
+	if err := BuildImage(context.Background(), exec, dir, "platform", "feat/x", nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(exec.cmds) != 1 || !strings.Contains(exec.cmds[0], "build-image.sh") ||
-		!strings.Contains(exec.cmds[0], `"platform"`) || !strings.Contains(exec.cmds[0], `"feat/x"`) {
+		!strings.Contains(exec.cmds[0], `'platform'`) || !strings.Contains(exec.cmds[0], `'feat/x'`) {
 		t.Fatalf("unexpected command: %v", exec.cmds)
 	}
-	if err := BuildImage(context.Background(), exec, t.TempDir(), "platform", "main"); err == nil {
+	if err := BuildImage(context.Background(), exec, t.TempDir(), "platform", "main", nil); err == nil {
 		t.Fatal("expected an error when the conf has no build-image.sh")
 	}
 }

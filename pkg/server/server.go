@@ -49,6 +49,9 @@ type Options struct {
 	// Plans records the plans made and the admin approvals that let an apply through. It is
 	// required with Apply: an apply only ever runs a plan somebody approved.
 	Plans *Plans
+	// ImageBuild, with Jobs, enables POST /v1/images/build. A token with a scope may use it for an
+	// image its scope allows (see InstanceOps); one without a scope may build anything.
+	ImageBuild ImageBuildFunc
 	// JobDrain is how long a shutdown waits for a running apply to finish (default 5 minutes).
 	JobDrain  time.Duration
 	Version   string
@@ -71,14 +74,14 @@ func New(opts Options) (*Server, error) {
 	if opts.Tokens == nil || opts.Status == nil {
 		return nil, errors.New("server needs a token store and a status source")
 	}
-	if (opts.Apply != nil || opts.Instances != nil) && opts.Jobs == nil {
-		return nil, errors.New("apply and instances need a job store: every change to the host is a job with a record")
+	if (opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil) && opts.Jobs == nil {
+		return nil, errors.New("apply, instances and image builds need a job store: every change to the host is a job with a record")
 	}
 	if opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil) {
 		return nil, errors.New("apply needs a plan source and a plan store (approvals) to check the plan against")
 	}
-	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil {
-		return nil, errors.New("a job store is only useful with apply or instances")
+	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil && opts.ImageBuild == nil {
+		return nil, errors.New("a job store is only useful with apply, instances or image builds")
 	}
 	if opts.JobDrain <= 0 {
 		opts.JobDrain = 5 * time.Minute
@@ -302,6 +305,9 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.Apply != nil {
 		mux.Handle("POST /v1/apply", s.auth(RoleDeployer, s.handleApply))
+	}
+	if s.opts.ImageBuild != nil {
+		mux.Handle("POST /v1/images/build", s.authScoped(RoleDeployer, s.handleImageBuild))
 	}
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)

@@ -106,13 +106,15 @@ func handleServeCommand(ctx context.Context, args []string) {
 	enableInstances := flags.Bool("enable-instances", false, "Serve the tenant-instance endpoints (PUT/DELETE /v1/instances/{name}); a token with a scope may use only these")
 	instanceProfiles := flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
 	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
+	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
 	srv, closeFn, err := newDaemon(daemonConfig{
 		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
-		InstancePolicy: engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
-		Exec:           remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
+		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
+		EnableImageBuild: *enableImageBuild,
+		Exec:             remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -133,6 +135,7 @@ type daemonConfig struct {
 	EnableApply          bool
 	EnableInstances      bool
 	InstancePolicy       engine.InstancePolicy
+	EnableImageBuild     bool
 	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
@@ -172,7 +175,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) { return status.Collect(ctx, cfg.Exec, cfg.Pool) },
 		Plan:   planSource(cfg.Exec, key),
 	}
-	if cfg.EnableApply || cfg.EnableInstances {
+	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
 		if err != nil {
 			audit.Close()
@@ -184,6 +187,9 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		if cfg.EnableInstances {
 			opts.Instances, opts.InstancePolicy = engine.NewInstances(cfg.Exec), cfg.InstancePolicy
+		}
+		if cfg.EnableImageBuild {
+			opts.ImageBuild = imageBuildSource(cfg.Exec)
 		}
 	}
 	srv, err := server.New(opts)
@@ -220,6 +226,13 @@ func applySource(exec remote.Executor) server.ApplyFunc {
 		d := engine.NewDeployer(exec)
 		d.SetLogger(logf)
 		return d.ApplyPlan(ctx, dir, plan)
+	}
+}
+
+// imageBuildSource is what POST /v1/images/build builds with.
+func imageBuildSource(exec remote.Executor) server.ImageBuildFunc {
+	return func(ctx context.Context, dir, app, ref string, logf func(string, ...any)) error {
+		return engine.BuildImage(ctx, exec, dir, app, ref, logf)
 	}
 }
 
