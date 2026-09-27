@@ -121,6 +121,14 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		if err := m.incus.EnsureVolumeAttached(ctx, p.Name, pool, actualVolName, vol.Path, vol.Shifted); err != nil {
 			return "", fmt.Errorf("attach volume %s: %w", actualVolName, err)
 		}
+		// Runs whether the volume was just attached or was already there: a fresh volume attaches
+		// root-owned regardless of the image, and a resumed instance whose earlier launch predates
+		// Owner (or whose owner fix failed) is repaired the same way, just by asking again.
+		if vol.Owner != "" {
+			if err := m.incus.EnsurePathOwner(ctx, p.Name, vol.Path, vol.Owner); err != nil {
+				return "", fmt.Errorf("set owner of volume %s: %w", actualVolName, err)
+			}
+		}
 	}
 
 	// 5. Build and converge env (declared keys are set, other keys are preserved)

@@ -23,6 +23,12 @@ var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 // ValidName reports whether s is safe to use as an instance, volume or unit name.
 func ValidName(s string) bool { return nameRe.MatchString(s) }
 
+var userNameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// ValidUserName reports whether s is a plausible name for a Unix user inside an instance (the shape
+// useradd itself accepts), so it is safe to pass to chown.
+func ValidUserName(s string) bool { return userNameRe.MatchString(s) }
+
 // VolumeRef identifies a custom storage volume attached to an instance.
 type VolumeRef struct{ Pool, Name string }
 

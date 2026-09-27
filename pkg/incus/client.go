@@ -413,6 +413,31 @@ func (c *Client) RestartService(ctx context.Context, containerName, serviceName 
 	return nil
 }
 
+// EnsurePathOwner makes path (already attached inside containerName -- typically a data volume's mount
+// point) belong to owner, a user that must already exist there, unless it already does. It is never
+// recursive: a fresh volume attaches root-owned regardless of what the image's own directory was owned
+// by, so a service that runs as another user needs exactly its mount point (not its contents) handed
+// over once, and re-running finds nothing left to do (see InstanceSpec.VolumeSpec.Owner).
+func (c *Client) EnsurePathOwner(ctx context.Context, containerName, path, owner string) error {
+	if !ValidName(containerName) || !ValidUserName(owner) {
+		return fmt.Errorf("invalid container/owner %q/%q", containerName, owner)
+	}
+	if path == "" || !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\x00") {
+		return fmt.Errorf("invalid path %q", path)
+	}
+	current, err := c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- stat -c %%U %s", ShQuote(containerName), ShQuote(path)))
+	if err != nil {
+		return fmt.Errorf("stat %s in %s: %w", path, containerName, err)
+	}
+	if strings.TrimSpace(current) == owner {
+		return nil
+	}
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus exec %s -- chown %s %s", ShQuote(containerName), ShQuote(owner), ShQuote(path))); err != nil {
+		return fmt.Errorf("set owner of %s in %s to %s: %w", path, containerName, owner, err)
+	}
+	return nil
+}
+
 // ResizeLimits applies live config keys (CPU/memory cgroup limits) to a running container without restart.
 func (c *Client) ResizeLimits(ctx context.Context, containerName string, limits map[string]string) error {
 	if !ValidName(containerName) {

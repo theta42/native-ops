@@ -129,6 +129,10 @@ type VolumeMount struct {
 	Pool     string `yaml:"pool,omitempty"`
 	Shifted  bool   `yaml:"shifted"` // default: true (security.shifted=true)
 	ReadOnly bool   `yaml:"read_only"`
+	// Owner, if set, is a user inside the instance that the mount point is handed to once attached (a
+	// fresh volume attaches root-owned regardless of the image, so a service that runs as another user
+	// otherwise cannot write to its own data directory). Empty leaves it as Incus attaches it.
+	Owner string `yaml:"owner,omitempty"`
 }
 
 // HealthCheckConfig defines how to verify a container after launch.

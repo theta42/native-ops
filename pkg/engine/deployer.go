@@ -303,6 +303,11 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		if err := d.incus.EnsureVolumeAttached(ctx, svc.Name, servicePool(vol.Pool), vol.Name, vol.Path, vol.Shifted); err != nil {
 			return fmt.Errorf("attach volume: %w", err)
 		}
+		if vol.Owner != "" {
+			if err := d.incus.EnsurePathOwner(ctx, svc.Name, vol.Path, vol.Owner); err != nil {
+				return fmt.Errorf("set owner of volume %s: %w", vol.Name, err)
+			}
+		}
 	}
 
 	if svc.Hooks.ContainerInit != "" {
@@ -502,6 +507,11 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 			}
 			if err := d.incus.EnsureVolumeAttached(ctx, svc.Name, servicePool(vol.Pool), vol.Name, vol.Path, vol.Shifted); err != nil {
 				return fmt.Errorf("attach volume: %w", err)
+			}
+			if vol.Owner != "" {
+				if err := d.incus.EnsurePathOwner(ctx, svc.Name, vol.Path, vol.Owner); err != nil {
+					return fmt.Errorf("set owner of volume %s: %w", vol.Name, err)
+				}
 			}
 		}
 		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Name, declaredEnv); err != nil {

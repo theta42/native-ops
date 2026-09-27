@@ -31,21 +31,24 @@ func TestASpecCanOnlyAskForWhatATenantNeeds(t *testing.T) {
 		t.Fatalf("the platform spec must be valid: %v", err)
 	}
 	bad := map[string]func(s *InstanceSpec){
-		"a profile that is not allowed":      func(s *InstanceSpec) { s.Profiles = []string{"base", "privileged"} },
-		"an uppercase template":              func(s *InstanceSpec) { s.Template = "Platform" },
-		"a template with a space":            func(s *InstanceSpec) { s.Template = "a b" },
-		"an image with a shell in it":        func(s *InstanceSpec) { s.Image = "img; rm -rf /" },
-		"an image with a quote":              func(s *InstanceSpec) { s.Image = "img'x" },
-		"an empty image":                     func(s *InstanceSpec) { s.Image = "" },
-		"an unknown limit":                   func(s *InstanceSpec) { s.Limits = map[string]string{"limits.processes": "1"} },
-		"a privileged flag as a limit":       func(s *InstanceSpec) { s.Limits = map[string]string{"security.privileged": "true"} },
-		"a cpu that is not a number":         func(s *InstanceSpec) { s.Limits = map[string]string{"limits.cpu": "all"} },
-		"a memory without a unit":            func(s *InstanceSpec) { s.Limits = map[string]string{"limits.memory": "1000000"} },
-		"another instance's volume":          func(s *InstanceSpec) { s.Volumes[0].Name = "gitea-data" },
-		"a volume that only shares a prefix": func(s *InstanceSpec) { s.Volumes[0].Name = "demo-multiplayer-data" },
-		"a relative volume path":             func(s *InstanceSpec) { s.Volumes[0].Path = "app/.data" },
-		"a volume path that climbs":          func(s *InstanceSpec) { s.Volumes[0].Path = "/app/../etc" },
-		"an unclean volume path":             func(s *InstanceSpec) { s.Volumes[0].Path = "/app//.data" },
+		"a profile that is not allowed":        func(s *InstanceSpec) { s.Profiles = []string{"base", "privileged"} },
+		"an uppercase template":                func(s *InstanceSpec) { s.Template = "Platform" },
+		"a template with a space":              func(s *InstanceSpec) { s.Template = "a b" },
+		"an image with a shell in it":          func(s *InstanceSpec) { s.Image = "img; rm -rf /" },
+		"an image with a quote":                func(s *InstanceSpec) { s.Image = "img'x" },
+		"an empty image":                       func(s *InstanceSpec) { s.Image = "" },
+		"an unknown limit":                     func(s *InstanceSpec) { s.Limits = map[string]string{"limits.processes": "1"} },
+		"a privileged flag as a limit":         func(s *InstanceSpec) { s.Limits = map[string]string{"security.privileged": "true"} },
+		"a cpu that is not a number":           func(s *InstanceSpec) { s.Limits = map[string]string{"limits.cpu": "all"} },
+		"a memory without a unit":              func(s *InstanceSpec) { s.Limits = map[string]string{"limits.memory": "1000000"} },
+		"another instance's volume":            func(s *InstanceSpec) { s.Volumes[0].Name = "gitea-data" },
+		"a volume that only shares a prefix":   func(s *InstanceSpec) { s.Volumes[0].Name = "demo-multiplayer-data" },
+		"a relative volume path":               func(s *InstanceSpec) { s.Volumes[0].Path = "app/.data" },
+		"a volume path that climbs":            func(s *InstanceSpec) { s.Volumes[0].Path = "/app/../etc" },
+		"an unclean volume path":               func(s *InstanceSpec) { s.Volumes[0].Path = "/app//.data" },
+		"an uppercase volume owner":            func(s *InstanceSpec) { s.Volumes[0].Owner = "Platform" },
+		"a volume owner with a shell in it":    func(s *InstanceSpec) { s.Volumes[0].Owner = "x; rm -rf /" },
+		"a volume owner starting with a digit": func(s *InstanceSpec) { s.Volumes[0].Owner = "1platform" },
 		"too many volumes": func(s *InstanceSpec) {
 			for i := 0; i < 5; i++ {
 				s.Volumes = append(s.Volumes, VolumeSpec{Name: "demo-multi-v", Path: "/v" + string(rune('a'+i))})
@@ -89,6 +92,15 @@ func TestASpecCanOnlyAskForWhatATenantNeeds(t *testing.T) {
 	s := platformSpec()
 	if err := s.Validate("demo-multi", DefaultInstancePolicy); err == nil {
 		t.Error("with no imports allowed, an import is refused")
+	}
+	// A plausible owner is accepted, and reaches the template's volume, unchanged.
+	s = platformSpec()
+	s.Volumes[0].Owner = "www-data"
+	if err := s.Validate("demo-multi", testPolicy); err != nil {
+		t.Fatalf("a plausible volume owner must be accepted: %v", err)
+	}
+	if got := s.TemplateConfig().Volumes[0].Owner; got != "www-data" {
+		t.Fatalf("the volume owner must reach the template config, got %q", got)
 	}
 }
 
@@ -150,6 +162,46 @@ func TestLaunchingATenantThroughTheAdapterIsComplete(t *testing.T) {
 	}
 	if m := sim.mutations(); len(m) != 0 {
 		t.Fatalf("a repeated launch must change nothing:\n%s", strings.Join(m, "\n"))
+	}
+}
+
+func TestLaunchGivesAFreshVolumeToItsOwnerAndRepairsAResumedOneOnlyOnce(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["opsavor-platform:latest"] = fpA
+	in := newTestInstances(sim)
+	ctx := context.Background()
+	spec := platformSpec()
+	spec.Volumes[0].Owner = "platform"
+
+	if _, err := in.Launch(ctx, "demo-multi", spec, nil); err != nil {
+		t.Fatal(err)
+	}
+	c := sim.ctrs["demo-multi"]
+	if c.owners["/app/.data"] != "platform" || c.chowns != 1 {
+		t.Fatalf("a fresh volume must be handed to its owner once: owners=%v chowns=%d", c.owners, c.chowns)
+	}
+
+	// Asking again (a resumed instance) finds it already right: no second chown.
+	sim.reset()
+	if _, err := in.Launch(ctx, "demo-multi", spec, nil); err != nil {
+		t.Fatal(err)
+	}
+	if c.chowns != 1 {
+		t.Fatalf("a volume that already belongs to its owner must not be chowned again, got %d", c.chowns)
+	}
+	if m := sim.mutations(); len(m) != 0 {
+		t.Fatalf("nothing to fix, so nothing may run: %v", m)
+	}
+
+	// A spec with no owner never asks: a caller that does not use this field sees no new behavior.
+	sim2 := newHostSim(t)
+	sim2.aliases["opsavor-platform:latest"] = fpA
+	in2 := newTestInstances(sim2)
+	if _, err := in2.Launch(ctx, "demo-bad", platformSpec(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := sim2.ctrs["demo-bad"].chowns; got != 0 {
+		t.Fatalf("no owner was asked for, so nothing must be chowned, got %d", got)
 	}
 }
 

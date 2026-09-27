@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -260,5 +262,113 @@ func TestWaitSystemdGivesUpAndFailsFastWithoutSystemctl(t *testing.T) {
 	systemdWait = time.Hour
 	if err := NewClient(ex).RestartService(context.Background(), "web", "svc"); err == nil || !strings.Contains(err.Error(), "no systemctl") || len(ex.cmds) != 1 {
 		t.Fatalf("a container without systemctl must fail at once, not after the timeout: %v (%d attempts)", err, len(ex.cmds))
+	}
+}
+
+func TestValidUserName(t *testing.T) {
+	for _, s := range []string{"platform", "www-data", "_apt", "a", strings.Repeat("a", 32)} {
+		if !ValidUserName(s) {
+			t.Errorf("%q should be a valid user name", s)
+		}
+	}
+	for _, s := range []string{"Root", "1abc", "-x", "has space", "a;b", "", strings.Repeat("a", 33), "a/b"} {
+		if ValidUserName(s) {
+			t.Errorf("%q should not be a valid user name", s)
+		}
+	}
+}
+
+// seqExec answers Run calls one at a time from a queue, so a test can script a read followed by a
+// conditional write, the way EnsurePathOwner uses its executor.
+type seqExec struct {
+	cmds  []string
+	queue []struct {
+		out string
+		err error
+	}
+}
+
+func (s *seqExec) Run(_ context.Context, cmd string) (string, error) {
+	s.cmds = append(s.cmds, cmd)
+	if len(s.queue) == 0 {
+		return "", nil
+	}
+	r := s.queue[0]
+	s.queue = s.queue[1:]
+	return r.out, r.err
+}
+func (s *seqExec) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
+func (s *seqExec) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
+func (s *seqExec) Close() error                                                    { return nil }
+func (s *seqExec) give(out string, err error) {
+	s.queue = append(s.queue, struct {
+		out string
+		err error
+	}{out, err})
+}
+
+func TestEnsurePathOwnerOnlyChownsWhenTheCurrentOwnerDiffers(t *testing.T) {
+	ex := &seqExec{}
+	c := NewClient(ex)
+
+	// Already owned by platform: a read, no write.
+	ex.give("platform\n", nil)
+	if err := c.EnsurePathOwner(context.Background(), "demo-multi", "/app/.data", "platform"); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.cmds) != 1 || !strings.Contains(ex.cmds[0], "stat -c %U") {
+		t.Fatalf("expected exactly one read, got %v", ex.cmds)
+	}
+
+	// Owned by root (a fresh mount): a read, then exactly the chown asked for.
+	ex.cmds = nil
+	ex.give("root\n", nil)
+	if err := c.EnsurePathOwner(context.Background(), "demo-multi", "/app/.data", "platform"); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.cmds) != 2 {
+		t.Fatalf("expected a read and a write, got %v", ex.cmds)
+	}
+	want := "incus exec " + ShQuote("demo-multi") + " -- chown " + ShQuote("platform") + " " + ShQuote("/app/.data")
+	if ex.cmds[1] != want {
+		t.Fatalf("\n got %s\nwant %s", ex.cmds[1], want)
+	}
+
+	// The read itself fails: reported, no chown attempted.
+	ex.cmds = nil
+	ex.give("", fmt.Errorf("no such file"))
+	if err := c.EnsurePathOwner(context.Background(), "demo-multi", "/app/.data", "platform"); err == nil {
+		t.Fatal("a failed read must be reported")
+	}
+	if len(ex.cmds) != 1 {
+		t.Fatalf("a failed read must not be followed by a chown: %v", ex.cmds)
+	}
+
+	// The chown itself fails: reported.
+	ex.cmds = nil
+	ex.give("root\n", nil)
+	ex.give("", fmt.Errorf("permission denied"))
+	if err := c.EnsurePathOwner(context.Background(), "demo-multi", "/app/.data", "platform"); err == nil {
+		t.Fatal("a failed chown must be reported")
+	}
+}
+
+func TestEnsurePathOwnerRejectsUnsafeInput(t *testing.T) {
+	for name, tc := range map[string]struct{ container, path, owner string }{
+		"bad container": {"bad;x", "/app/.data", "platform"},
+		"bad owner":     {"demo", "/app/.data", "root; rm -rf /"},
+		"relative path": {"demo", "app/.data", "platform"},
+		"empty path":    {"demo", "", "platform"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ex := &stubExec{}
+			c := NewClient(ex)
+			if err := c.EnsurePathOwner(context.Background(), tc.container, tc.path, tc.owner); err == nil {
+				t.Fatal("expected rejection")
+			}
+			if len(ex.cmds) != 0 {
+				t.Fatalf("unsafe input must be rejected before anything runs: %v", ex.cmds)
+			}
+		})
 	}
 }
