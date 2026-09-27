@@ -142,8 +142,13 @@ func TestApplyRunsTheReviewedPlanAsAJobAndKeepsTheRecord(t *testing.T) {
 	if st.Mode().Perm() != 0o600 {
 		t.Errorf("job files are 0600, got %v", st.Mode().Perm())
 	}
+	// "succeeded" must mean the host is free again, at once: the tree is gone and the next apply is
+	// accepted, not refused as busy by a job that is over.
 	if _, err := os.Stat(rig.plan.dirs[0]); !os.IsNotExist(err) {
-		t.Fatal("the unpacked tree must be removed after the job")
+		t.Fatal("the unpacked tree must be removed before the job is reported finished")
+	}
+	if res, b := rig.apply(t, rig.deployerToken, "?expect="+hash, goodTree(t)); res.StatusCode != 202 {
+		t.Fatalf("the moment a job reports succeeded the next apply must be accepted, got %d %s", res.StatusCode, b)
 	}
 
 	raw, _ := os.ReadFile(rig.audit)
@@ -309,6 +314,19 @@ func TestOfManySimultaneousAppliesExactlyOneRuns(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	// The accepted request answers 202 before its job goroutine has necessarily started: wait for
+	// the one apply to actually begin, then check that no second one ever does.
+	select {
+	case <-rig.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the accepted apply never started")
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-rig.started:
+		t.Fatal("a second apply started")
+	default:
+	}
 	close(rig.block)
 	if accepted.Load() != 1 || refused.Load() != 7 || rig.applies.Load() != 1 {
 		t.Fatalf("accepted=%d refused=%d applied=%d, want exactly one", accepted.Load(), refused.Load(), rig.applies.Load())
