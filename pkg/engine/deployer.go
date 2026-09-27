@@ -26,6 +26,12 @@ type Deployer struct {
 
 	// healthGate is a field so tests can stub the wait.
 	healthGate func(ctx context.Context, ip string, hc config.HealthCheckConfig) error
+
+	logf func(format string, a ...any)
+	// bind, when set, is mixed into a plan's hash: a digest of everything the manifest says that the
+	// plan does not print (environment values, hook bodies, health checks), so that the hash of a
+	// plan covers what apply would really do. See WithBindKey.
+	bind func(data []byte) string
 }
 
 func NewDeployer(exec remote.Executor) *Deployer {
@@ -36,6 +42,20 @@ func NewDeployer(exec remote.Executor) *Deployer {
 		exec:       exec,
 		inst:       NewInstanceManager(exec),
 		healthGate: ic.HealthGate,
+		logf:       log.Printf,
+	}
+}
+
+// SetLogger sends the progress this deployer (and its instance manager) reports to logf instead of
+// the process log. A daemon uses it to keep each job's log to itself.
+func (d *Deployer) SetLogger(logf func(format string, a ...any)) {
+	d.logf = logf
+	d.inst.logf = logf
+}
+
+func (d *Deployer) log(format string, a ...any) {
+	if d.logf != nil {
+		d.logf(format, a...)
 	}
 }
 
@@ -165,7 +185,7 @@ func (d *Deployer) runHostHook(ctx context.Context, label, svcName, script strin
 	b64 := base64.StdEncoding.EncodeToString([]byte(script))
 	out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | bash", b64))
 	if err != nil {
-		log.Printf("    %s hook failed for %s: %s (err: %v)\n", label, svcName, out, err)
+		d.log("    %s hook failed for %s: %s (err: %v)\n", label, svcName, out, err)
 		return fmt.Errorf("%s hook failed for %s: %w (output: %s)", label, svcName, err, out)
 	}
 	return nil
@@ -175,7 +195,7 @@ func (d *Deployer) runContainerHook(ctx context.Context, name, script string) er
 	b64 := base64.StdEncoding.EncodeToString([]byte(script))
 	out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- bash", b64, incus.ShQuote(name)))
 	if err != nil {
-		log.Printf("    Container init failed for %s: %s (err: %v)\n", name, out, err)
+		d.log("    Container init failed for %s: %s (err: %v)\n", name, out, err)
 		return fmt.Errorf("container_init hook failed for %s: %w (output: %s)", name, err, out)
 	}
 	return nil
@@ -234,7 +254,7 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 	if !incus.ValidName(svc.Name) {
 		return fmt.Errorf("invalid service name %q", svc.Name)
 	}
-	log.Printf("==> [Deploy] Reconciling service: %s\n", svc.Name)
+	d.log("==> [Deploy] Reconciling service: %s\n", svc.Name)
 	deployRef, fp := d.resolveServiceImage(ctx, svc.Image)
 	exists, err := d.incus.InstanceExists(ctx, svc.Name)
 	if err != nil {
@@ -254,14 +274,14 @@ func (d *Deployer) profilesOf(svc *config.ServiceConfig) []string {
 }
 
 func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, configDir, deployRef string) error {
-	log.Printf("    %s does not exist yet; launching\n", svc.Name)
+	d.log("    %s does not exist yet; launching\n", svc.Name)
 	for _, vol := range svc.Volumes {
 		if err := d.incus.EnsureVolume(ctx, vol.Pool, vol.Name); err != nil {
 			return fmt.Errorf("ensure volume %s: %w", vol.Name, err)
 		}
 	}
 	if svc.Hooks.PreDeploy != "" {
-		log.Printf("    Running pre-deploy hook for %s...\n", svc.Name)
+		d.log("    Running pre-deploy hook for %s...\n", svc.Name)
 		if err := d.runHostHook(ctx, "pre-deploy", svc.Name, hookScript(configDir, svc.Name, svc.Hooks.PreDeploy)); err != nil {
 			return err
 		}
@@ -272,21 +292,21 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		cfg[k] = v
 	}
 	cfg[incus.ImageKey] = deployRef
-	log.Printf("    Launching container %s from image %s...\n", svc.Name, deployRef)
+	d.log("    Launching container %s from image %s...\n", svc.Name, deployRef)
 	if err := d.incus.LaunchContainer(ctx, deployRef, svc.Name, d.profilesOf(svc), cfg); err != nil {
 		return fmt.Errorf("launch container: %w", err)
 	}
 
 	// Attach volumes BEFORE writing anything to their mount paths.
 	for _, vol := range svc.Volumes {
-		log.Printf("    Attaching volume %s to %s at %s (shifted=%t)...\n", vol.Name, svc.Name, vol.Path, vol.Shifted)
+		d.log("    Attaching volume %s to %s at %s (shifted=%t)...\n", vol.Name, svc.Name, vol.Path, vol.Shifted)
 		if err := d.incus.EnsureVolumeAttached(ctx, svc.Name, servicePool(vol.Pool), vol.Name, vol.Path, vol.Shifted); err != nil {
 			return fmt.Errorf("attach volume: %w", err)
 		}
 	}
 
 	if svc.Hooks.ContainerInit != "" {
-		log.Printf("    Running container_init hook for %s...\n", svc.Name)
+		d.log("    Running container_init hook for %s...\n", svc.Name)
 		if err := d.runContainerHook(ctx, svc.Name, hookScript(configDir, svc.Name, svc.Hooks.ContainerInit)); err != nil {
 			return err
 		}
@@ -295,9 +315,9 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 	if changed, err := ensureEnv(ctx, d.incus, svc.Name, svc.Name, serviceEnv(svc, configDir)); err != nil {
 		return fmt.Errorf("write env file: %w", err)
 	} else if changed {
-		log.Printf("    Wrote /etc/default/%s\n", svc.Name)
+		d.log("    Wrote /etc/default/%s\n", svc.Name)
 		if err := d.incus.RestartService(ctx, svc.Name, svc.Name); err != nil {
-			log.Printf("    WARNING: %v\n", err)
+			d.log("    WARNING: %v\n", err)
 		}
 	}
 
@@ -305,7 +325,7 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 	if err != nil {
 		return fmt.Errorf("resolve IP for %s: %w", svc.Name, err)
 	}
-	log.Printf("    Container IP: %s\n", ip)
+	d.log("    Container IP: %s\n", ip)
 
 	if svc.Name == "edge" {
 		if err := d.caddy.EnsureBaseCaddyfile(ctx); err != nil {
@@ -323,12 +343,12 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		return err
 	}
 	if svc.Hooks.PostDeploy != "" {
-		log.Printf("    Running post-deploy hook for %s...\n", svc.Name)
+		d.log("    Running post-deploy hook for %s...\n", svc.Name)
 		if err := d.runHostHook(ctx, "post-deploy", svc.Name, hookScript(configDir, svc.Name, svc.Hooks.PostDeploy)); err != nil {
 			return err
 		}
 	}
-	log.Printf("==> [Deploy] Deployed %s (%s)\n", svc.Name, ip)
+	d.log("==> [Deploy] Deployed %s (%s)\n", svc.Name, ip)
 	return nil
 }
 
@@ -336,10 +356,10 @@ func (d *Deployer) checkHealth(ctx context.Context, svc *config.ServiceConfig, i
 	if svc.HealthCheck.Path == "" {
 		return nil
 	}
-	log.Printf("    Probing healthcheck (%s:%d%s)...\n", ip, svc.HealthCheck.Port, svc.HealthCheck.Path)
+	d.log("    Probing healthcheck (%s:%d%s)...\n", ip, svc.HealthCheck.Port, svc.HealthCheck.Path)
 	if err := d.healthGate(ctx, ip, svc.HealthCheck); err != nil {
 		diag, _ := d.exec.Run(ctx, fmt.Sprintf("incus exec %s -- journalctl -u %s --no-pager -n 30 || true", incus.ShQuote(svc.Name), incus.ShQuote(svc.Name)))
-		log.Printf("    Health gate failed! Container %s logs:\n%s\n", svc.Name, diag)
+		d.log("    Health gate failed! Container %s logs:\n%s\n", svc.Name, diag)
 		return fmt.Errorf("health gate failed: %w", err)
 	}
 	return nil
@@ -429,7 +449,7 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 	replace := false
 	switch imageDecision(st, fp, deployRef) {
 	case imageUnknown:
-		log.Printf("    WARNING: the image %s was launched from is unknown; not replacing %s\n", svc.Image, svc.Name)
+		d.log("    WARNING: the image %s was launched from is unknown; not replacing %s\n", svc.Image, svc.Name)
 	case imageAdopt:
 		// Launched before references were recorded: adopt what runs as the desired state.
 		if err := d.incus.SetInstanceConfig(ctx, svc.Name, incus.ImageKey, deployRef); err != nil {
@@ -443,7 +463,7 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 	changed := false
 
 	if replace {
-		log.Printf("    Image changed; replacing %s through the safe update path\n", svc.Name)
+		d.log("    Image changed; replacing %s through the safe update path\n", svc.Name)
 		if svc.Hooks.PreDeploy != "" {
 			if err := d.runHostHook(ctx, "pre-deploy", svc.Name, hookScript(configDir, svc.Name, svc.Hooks.PreDeploy)); err != nil {
 				return err
@@ -470,7 +490,7 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 		// Limits apply live, no restart.
 		drift := limitsDrift(st, svc.Limits)
 		if len(drift) > 0 {
-			log.Printf("    Applying changed limits to %s: %v\n", svc.Name, drift)
+			d.log("    Applying changed limits to %s: %v\n", svc.Name, drift)
 			if err := d.incus.ResizeLimits(ctx, svc.Name, drift); err != nil {
 				return err
 			}
@@ -487,14 +507,14 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Name, declaredEnv); err != nil {
 			return err
 		} else if envChanged {
-			log.Printf("    Environment changed; restarting %s\n", svc.Name)
+			d.log("    Environment changed; restarting %s\n", svc.Name)
 			if err := d.incus.RestartService(ctx, svc.Name, svc.Name); err != nil {
 				return err
 			}
 			changed = true
 		}
 		if !sameProfiles(st.Profiles, d.profilesOf(svc)) {
-			log.Printf("    WARNING: profiles of %s differ (live %v, declared %v); apply does not change profiles\n", svc.Name, st.Profiles, d.profilesOf(svc))
+			d.log("    WARNING: profiles of %s differ (live %v, declared %v); apply does not change profiles\n", svc.Name, st.Profiles, d.profilesOf(svc))
 		}
 		if svc.HealthCheck.Path != "" {
 			ip, err := d.incus.ContainerIPv4(ctx, svc.Name, 30*time.Second)
@@ -511,15 +531,15 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 		return err
 	}
 	if replace && svc.Hooks.PostDeploy != "" {
-		log.Printf("    Running post-deploy hook for %s...\n", svc.Name)
+		d.log("    Running post-deploy hook for %s...\n", svc.Name)
 		if err := d.runHostHook(ctx, "post-deploy", svc.Name, hookScript(configDir, svc.Name, svc.Hooks.PostDeploy)); err != nil {
 			return err
 		}
 	}
 	if changed {
-		log.Printf("==> [Deploy] Converged %s\n", svc.Name)
+		d.log("==> [Deploy] Converged %s\n", svc.Name)
 	} else {
-		log.Printf("==> [Deploy] %s already matches its manifest\n", svc.Name)
+		d.log("==> [Deploy] %s already matches its manifest\n", svc.Name)
 	}
 	return nil
 }

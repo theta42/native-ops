@@ -20,6 +20,8 @@ a person sets up by hand.
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images and warnings for the host |
 | `POST /v1/plan` | deployer | what `apply` would change for the configuration you upload (never changes the host) |
+| `POST /v1/apply` | deployer | apply the plan you reviewed, as a job (only with `--enable-apply`) |
+| `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | apply jobs and their outcome; the log is shown to deployers and admins only |
 | `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
@@ -91,6 +93,50 @@ The upload is untrusted, and is handled that way:
 - The audit log records who planned, the commit, the service, the outcome and the hash (never
   the archive, and never a query string).
 
+## Applying from CI
+
+Applying is off unless the daemon is started with `--enable-apply`: without it the daemon can
+read the host and plan an uploaded tree, and nothing more. With it, an apply is harder than a plan
+on purpose:
+
+```bash
+# 1. plan (a pull request can post .text); keep the hash of the plan that was reviewed
+curl ... "$URL/v1/plan?sha=$COMMIT"  --data-binary @conf.tgz -o plan.json
+HASH=$(jq -r .hash plan.json)
+
+# 2. apply that plan: the same tree, and the hash. 202 with a job; poll it
+curl ... -X POST "$URL/v1/apply?sha=$COMMIT&expect=$HASH" --data-binary @conf.tgz -o job.json
+curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succeeded | failed | interrupted
+```
+
+- **`expect` is required.** The daemon plans the upload again, and unless that plan has the hash
+  you gave it answers `409 plan_changed` with the plan it would run now, and touches nothing. What
+  was reviewed is what runs; if the host or the configuration moved since, you review again. The
+  hash is keyed with a secret the daemon keeps (`plan.key` in the state directory, stable across
+  restarts), so it also covers the parts of a manifest the plan does not print: environment
+  values and hook bodies. Approving one secret and uploading another is refused, and the hash tells
+  nobody anything about the value.
+- **A blocked plan is never applied** (`409 blocked`), and a plan with nothing to change starts no
+  job (`200 nothing_to_do`).
+- **One apply at a time** on the host (`409 busy`, naming the running job), taken before the
+  upload is read and released even when the request is refused.
+- **Only what the plan lists is applied**, in plan order, stopping at the first failure. Services
+  after it are untouched; running the same apply again is safe and continues.
+- **The job is a record.** It outlives the request and is written to `jobs/<id>.json` (0600) as it
+  runs: who, which commit, the plan hash, timestamps, the log and the outcome. The last 200 are
+  kept. A job that was still running when the daemon stopped is marked `interrupted` on the next
+  start, with the log so far: the host may be part-way through it, and the fix is to apply again.
+  A stop waits up to 5 minutes for a running apply to finish first (`TimeoutStopSec=6min` in the unit).
+- The audit log records the request (`apply job=... sha=... hash=...`, or why it was refused) and
+  the end of the job.
+
+An apply runs `incus` as the daemon's user (which is in `incus-admin`, so it can do to instances
+whatever a deployer's manifest says) and host hooks (`pre_deploy`, `post_deploy`) as that user,
+inside the unit's sandbox (`ProtectSystem=strict`; only its state directory is writable). A
+`deployer` token is therefore as powerful as the manifests it can upload: keep it in the CI secret
+store, use one token per pipeline, and do not give it to a job that runs pull-request code
+before it is merged. Plan from pull requests; apply only from the protected branch.
+
 ## Tokens and bootstrapping
 
 ```
@@ -121,7 +167,5 @@ with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the
 
 ## Roadmap
 
-`apply` of an uploaded tree as an audited job with per-host locking, which must present the
-`hash` of the plan that was reviewed and refuses to run if the host or the manifests have changed
-since; instance update/migrate/backup as jobs; and OIDC sign-in for the UI. The API is versioned
-(`/v1`) so a separate fleet manager can depend on it.
+Instance update/migrate/backup as jobs; a live view of a running job in the UI; and OIDC sign-in
+for the UI. The API is versioned (`/v1`) so a separate fleet manager can depend on it.
