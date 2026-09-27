@@ -19,7 +19,7 @@ a person sets up by hand.
 | `GET /healthz` | none | liveness (`{"ok":true,"version":...}`), no state |
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images and warnings for the host |
-| `POST /v1/plan` | deployer | what `apply` would change for the configuration you upload (never changes the host) |
+| `POST /v1/plan` | planner | what `apply` would change for the configuration you upload (never changes the host) |
 | `POST /v1/apply` | deployer | apply the plan you reviewed, as a job (only with `--enable-apply`) |
 | `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | apply jobs and their outcome; the log is shown to deployers and admins only |
 | `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
@@ -41,8 +41,10 @@ can create privileged containers), so it is deliberately small:
 - Tokens are `nops_` plus 64 hex characters. Only the SHA-256 is stored, in a `0600` file inside a
   `0700` state directory; a world-readable token file is refused at startup. The secret is shown
   once, at creation, and compared in constant time.
-- Roles: `viewer` < `deployer` < `admin`. Reading needs `viewer`; sending a configuration to be
-  planned needs `deployer`. The gate is tested so the write endpoints that follow inherit it.
+- Roles: `viewer` < `planner` < `deployer` < `admin`. Reading needs `viewer`; sending a configuration
+  to be planned needs `planner` (a plan never changes the host, so this is the role for a pull-request
+  pipeline: the secrets of a repository are readable by any branch of it); applying needs `deployer`;
+  managing tokens needs `admin`. The gate is tested so the write endpoints that follow inherit it.
 - Every request is appended to `audit.log` (JSON lines): time, token name, method, path, status,
   remote address, duration. Never the query string, never a credential.
 - The UI is served with a strict Content-Security-Policy (`default-src 'none'`, no inline script or
@@ -59,7 +61,8 @@ can create privileged containers), so it is deliberately small:
 ## Planning from CI
 
 A pipeline sends the tree it checked out; the daemon needs no git access and holds no
-credentials for your repository. The answer is what `native-ops plan` prints, plus a hash of it:
+credentials for your repository. Give a pull-request pipeline a `planner` token: it can plan, and
+can never apply even if a branch rewrites the workflow to try. The answer is what `native-ops plan` prints, plus a hash of it:
 
 ```bash
 tar -czf - -C . fleet.yml services templates \
@@ -133,14 +136,16 @@ curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succe
 An apply runs `incus` as the daemon's user (which is in `incus-admin`, so it can do to instances
 whatever a deployer's manifest says) and host hooks (`pre_deploy`, `post_deploy`) as that user,
 inside the unit's sandbox (`ProtectSystem=strict`; only its state directory is writable). A
-`deployer` token is therefore as powerful as the manifests it can upload: keep it in the CI secret
-store, use one token per pipeline, and do not give it to a job that runs pull-request code
-before it is merged. Plan from pull requests; apply only from the protected branch.
+`deployer` token is therefore as powerful as the manifests it can upload: use one token per
+pipeline, and do not give it to a job that runs pull-request code before it is merged. Plan from
+pull requests with a `planner` token; apply only from the protected branch. (A Git host that lets any
+branch of a repository read its secrets cannot keep a deployer token from a pull request by itself:
+the planner role is what makes plan-on-PR safe, and gating apply on an approval is the next step.)
 
 ## Tokens and bootstrapping
 
 ```
-native-ops token create --state-dir /var/lib/native-ops --name ci --role deployer
+native-ops token create --state-dir /var/lib/native-ops --name ci-plan --role planner
 native-ops token list   --state-dir /var/lib/native-ops
 native-ops token revoke --state-dir /var/lib/native-ops --id <id>
 ```

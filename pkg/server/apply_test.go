@@ -48,6 +48,7 @@ func newApplyRig(t *testing.T) *applyRig {
 	admin, _, _ := tokens.Create("ci-admin", RoleAdmin)
 	viewer, _, _ := tokens.Create("dash", RoleViewer)
 	deployer, _, _ := tokens.Create("ci", RoleDeployer)
+	planner, _, _ := tokens.Create("pr-ci", RolePlanner)
 	audit, _ := OpenAudit(filepath.Join(dir, "audit.log"))
 	t.Cleanup(func() { audit.Close() })
 	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Plan: rig.plan.fn, Jobs: jobs,
@@ -77,6 +78,7 @@ func newApplyRig(t *testing.T) *applyRig {
 	t.Cleanup(ts.Close)
 	rig.fixture = &fixture{srv: ts, secret: admin, viewer: viewer, audit: filepath.Join(dir, "audit.log"), calls: &atomic.Int32{}}
 	rig.deployerToken = deployer
+	rig.fixture.planner = planner
 	rig.serverUnderTest = s
 	// Runs before the temp directories are removed: a job accepted by a test but not awaited by it
 	// must not still be writing into them.
@@ -238,6 +240,10 @@ func TestApplyNeedsADeployerAndOnlyShowsLogsToOne(t *testing.T) {
 	if res, _ := rig.apply(t, rig.viewer, "?expect="+hash, goodTree(t)); res.StatusCode != 403 {
 		t.Fatalf("a viewer must not apply, got %d", res.StatusCode)
 	}
+	// The pull-request pipeline's token can plan but never apply, whatever the tree says.
+	if res, _ := rig.apply(t, rig.planner, "?expect="+hash, goodTree(t)); res.StatusCode != 403 {
+		t.Fatalf("a planner must not apply, got %d", res.StatusCode)
+	}
 	if rig.applies.Load() != 0 || len(rig.plan.dirs) != 0 {
 		t.Fatal("a refused request reaches nothing")
 	}
@@ -249,7 +255,7 @@ func TestApplyNeedsADeployerAndOnlyShowsLogsToOne(t *testing.T) {
 	for _, c := range []struct {
 		token   string
 		wantLog bool
-	}{{rig.viewer, false}, {rig.deployerToken, true}, {rig.secret, true}} {
+	}{{rig.viewer, false}, {rig.planner, false}, {rig.deployerToken, true}, {rig.secret, true}} {
 		res, b := rig.do(t, "GET", "/v1/jobs/"+id, c.token)
 		var j Job
 		json.Unmarshal([]byte(b), &j)

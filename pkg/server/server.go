@@ -244,7 +244,7 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, snap)
 	}))
 	if s.opts.Plan != nil {
-		mux.Handle("POST /v1/plan", s.auth(RoleDeployer, s.handlePlan))
+		mux.Handle("POST /v1/plan", s.auth(RolePlanner, s.handlePlan))
 	}
 	if s.opts.Apply != nil {
 		mux.Handle("POST /v1/apply", s.auth(RoleDeployer, s.handleApply))

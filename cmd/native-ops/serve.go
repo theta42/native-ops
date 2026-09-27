@@ -228,7 +228,7 @@ func handleTokenCommand(args []string) {
 	flags := flag.NewFlagSet("token "+action, flag.ExitOnError)
 	stateDir := stateDirFlag(flags)
 	name := flags.String("name", "", "Token name (create)")
-	role := flags.String("role", "viewer", "viewer, deployer or admin (create)")
+	role := flags.String("role", "viewer", "viewer, planner, deployer or admin (create)")
 	id := flags.String("id", "", "Token id (revoke)")
 	_ = flags.Parse(args[1:])
 
