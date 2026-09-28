@@ -49,7 +49,7 @@ func collectEdge(ctx context.Context, ex remote.Executor, container string) *Edg
 	} else {
 		e.Routes = routes
 	}
-	paths, err := ex.Run(ctx, base+`sh -c 'find /root/.local/share/caddy /data/caddy -name "*.crt" -type f 2>/dev/null'`)
+	paths, err := ex.Run(ctx, base+`sh -c 'find /root/.local/share/caddy /data/caddy -name "*.crt" -type f 2>/dev/null || true'`)
 	if err != nil {
 		e.Warnings = append(e.Warnings, "could not list edge certificates: "+err.Error())
 	} else {
