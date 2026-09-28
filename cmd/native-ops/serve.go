@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/theta42/native-ops/pkg/engine"
+	"github.com/theta42/native-ops/pkg/provider"
+	"github.com/theta42/native-ops/pkg/provider/digitalocean"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/server"
 	"github.com/theta42/native-ops/pkg/status"
@@ -119,9 +121,25 @@ func handleServeCommand(ctx context.Context, args []string) {
 	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. opsavor.ai). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
 	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin. Env: NATIVE_OPS_OIDC_ROLE")
 	oidcLabel := flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
+	edgeContainer := flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
+	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from, e.g. digitalocean (needs DO_API_TOKEN in the environment). Env: NATIVE_OPS_DNS_PROVIDER")
+	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for, e.g. 'opsavor.app,opsavor.work'. Env: NATIVE_OPS_DNS_DOMAINS")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
+	var dnsProv provider.DNSProvider
+	if *dnsProviderFlag != "" {
+		switch *dnsProviderFlag {
+		case "digitalocean", "do":
+			do, err := digitalocean.New("")
+			if err != nil {
+				log.Fatalf("dns provider: %v", err)
+			}
+			dnsProv = do
+		default:
+			log.Fatalf("unknown --dns-provider %q", *dnsProviderFlag)
+		}
+	}
 	srv, closeFn, err := newDaemon(daemonConfig{
 		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
@@ -129,6 +147,9 @@ func handleServeCommand(ctx context.Context, args []string) {
 		EnableAuth:       *enableAuth,
 		OIDC: server.OIDCSettings{Issuer: *oidcIssuer, ClientID: *oidcClientID, ClientSecret: *oidcClientSecret,
 			RedirectURL: *oidcRedirectURL, AllowedDomain: *oidcAllowedDomain, Role: server.Role(*oidcRole), Label: *oidcLabel},
+		EdgeContainer: *edgeContainer,
+		DNS:           dnsProv,
+		DNSDomains:    splitList(*dnsDomains),
 		Exec:             remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
 	})
 	if err != nil {
@@ -158,6 +179,11 @@ type daemonConfig struct {
 	// OpenID Connect sign-in; either implies a user store and a session signer.
 	EnableAuth bool
 	OIDC       server.OIDCSettings
+	// Host observability: the edge container whose routes and certificates are reported (empty skips),
+	// and an optional DNS provider plus the zones to list records from.
+	EdgeContainer string
+	DNS           provider.DNSProvider
+	DNSDomains    []string
 }
 
 // newDaemon builds the server. Without EnableApply the daemon can read the host and plan an
@@ -191,7 +217,9 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 	}
 	opts := server.Options{
 		Addr: cfg.Addr, Tokens: tokens, Audit: audit, Version: Version, Plans: plans,
-		Status: func(ctx context.Context) (*status.Snapshot, error) { return status.Collect(ctx, cfg.Exec, cfg.Pool) },
+		Status: func(ctx context.Context) (*status.Snapshot, error) {
+			return status.CollectFull(ctx, cfg.Exec, status.Options{Pool: cfg.Pool, EdgeContainer: cfg.EdgeContainer, DNS: cfg.DNS, DNSDomains: cfg.DNSDomains})
+		},
 		Plan:   planSource(cfg.Exec, key),
 	}
 	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild {

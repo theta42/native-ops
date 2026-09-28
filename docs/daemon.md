@@ -18,7 +18,7 @@ a person sets up by hand.
 |---|---|---|
 | `GET /healthz` | none | liveness (`{"ok":true,"version":...}`), no state |
 | `GET /v1/whoami` | any token | which token and role you are |
-| `GET /v1/status` | viewer | instances, data volumes, images and warnings for the host |
+| `GET /v1/status` | viewer | instances, data volumes, images, host metrics (load, memory, swap, pool disk, uptime) and warnings -- plus, when configured, the edge's routes and certificates and the DNS records in the configured zones |
 | `POST /v1/plan` | planner | what `apply` would change for the configuration you upload (never changes the host) |
 | `GET /v1/plans`, `GET /v1/plans/{hash}` | viewer | the plans that were made, and where each stands (pending, approved, used, expired, blocked) |
 | `POST /v1/plans/{hash}/approve`, `DELETE /v1/plans/{hash}/approval` | admin | approve one apply of exactly this plan, or take the approval back |
@@ -29,11 +29,19 @@ a person sets up by hand.
 | `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
 | `POST /v1/images/build` | deployer | build and publish an application image from an uploaded configuration tree, as a job (only with `--enable-image-build`) |
 | `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see |
-| `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
+| `GET /` | none | the UI (Overview, Instances, Volumes, Network). It holds no data; it signs in (or takes a token) and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
 for instance config (OCI containers keep their secrets in `environment.*`); values are never read
 into the output, other than resource limits and `user.native-ops.*` bookkeeping.
+
+Beyond the Incus inventory the snapshot carries the host's own **metrics** (load, memory, swap, the
+pool's disk, uptime), the **edge's routes** (each hostname and the upstreams it points at) and
+**certificates** (names, issuer, expiry), and the **DNS records** in configured zones. The daemon reads
+the edge's live Caddy config and certificate store through Incus (`--edge-container`, default `edge`),
+and lists DNS through a provider (`--dns-provider digitalocean --dns-domains opsavor.app,opsavor.work`,
+using `DO_API_TOKEN`). `native-ops status` includes the metrics; the daemon adds the edge and DNS when
+they are configured.
 
 Errors are `{"error": ..., "code": ...}`; a failure to read the host is a generic `502` and never
 echoes internal text.
