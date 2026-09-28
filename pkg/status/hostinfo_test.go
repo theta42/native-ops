@@ -93,8 +93,8 @@ func TestParseCert(t *testing.T) {
 
 func TestCollectEdgeReadsRoutesAndCerts(t *testing.T) {
 	f := &fakeExec{out: map[string]string{
-		"config/":        caddyConfig,
-		"find /data/caddy": "/data/caddy/certificates/acme/x/example.com.crt\n",
+		"caddy adapt":        caddyConfig,
+		"find /root/.local/share/caddy": "/data/caddy/certificates/acme/x/example.com.crt\n",
 		"example.com.crt": testCertPEM(t),
 	}}
 	e := collectEdge(context.Background(), f, "edge")
@@ -150,7 +150,7 @@ func TestCollectFullIncludesMetricsEdgeDNS(t *testing.T) {
 		"cat /proc/meminfo": "MemTotal: 1000 kB\nMemAvailable: 400 kB\n",
 		"cat /proc/uptime":  "500.0 1000.0\n",
 		"df -Pk":            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 100 40 60 40% /\n",
-		"config/":           caddyConfig, "find /data/caddy": "/data/caddy/certificates/x/example.com.crt\n", "example.com.crt": testCertPEM(t),
+		"caddy adapt":           caddyConfig, "find /root/.local/share/caddy": "/root/.local/share/caddy/certificates/x/example.com.crt\n", "example.com.crt": testCertPEM(t),
 	}}
 	p := fakeDNS{records: map[string][]provider.DNSRecord{"opsavor.app": {{Type: "A", Name: "@", Value: "1.2.3.4"}}}}
 	s, err := CollectFull(context.Background(), f, Options{Pool: "default", EdgeContainer: "edge", DNS: p, DNSDomains: []string{"opsavor.app"}})
