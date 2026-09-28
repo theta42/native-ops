@@ -158,9 +158,48 @@ function hostCard(s) {
 }
 
 function overviewView(s) {
-  return h("div", { class: "row" },
-    h("div", { class: "col-lg-6" }, hostCard(s)),
-    h("div", { class: "col-lg-6" }, warningsCard(s)));
+  return h("div", {},
+    h("div", { class: "row" },
+      h("div", { class: "col-lg-6" }, hostCard(s)),
+      h("div", { class: "col-lg-6" }, metricsCard(s))),
+    h("div", { class: "row" }, h("div", { class: "col-12" }, warningsCard(s))));
+}
+
+const gb = (kb) => (kb ? `${(kb / 1048576).toFixed(1)} GB` : "");
+
+function metricsCard(s) {
+  const m = s.metrics;
+  const line = (label, value) => h("tr", {}, h("th", { class: "w-25" }, label), h("td", {}, value));
+  if (!m) return card("gauge-high", "Metrics", empty("This daemon does not report host metrics."));
+  const mem = m.mem_total_kb ? `${gb(m.mem_total_kb - m.mem_avail_kb)} used of ${gb(m.mem_total_kb)} (${gb(m.mem_avail_kb)} free)` : "";
+  const swap = m.swap_total_kb ? `${gb(m.swap_used_kb)} of ${gb(m.swap_total_kb)}` : "";
+  const uptime = m.uptime_sec ? `${Math.floor(m.uptime_sec / 86400)}d ${Math.floor((m.uptime_sec % 86400) / 3600)}h` : "";
+  return card("gauge-high", "Metrics", h("div", { class: "table-responsive" }, h("table", { class: "table table-sm mb-0" }, h("tbody", {},
+    line("Load", `${m.load1} / ${m.load5} / ${m.load15}${m.cores ? ` (${m.cores} cores)` : ""}`),
+    line("Memory", mem),
+    swap ? line("Swap", swap) : null,
+    m.disk ? line("Pool disk", `${gb(m.disk.used_kb)} of ${gb(m.disk.total_kb)} used (${m.disk.use_percent}%), ${gb(m.disk.available_kb)} free at ${m.disk.mount}`) : null,
+    uptime ? line("Uptime", uptime) : null))));
+}
+
+function networkView(s) {
+  const e = s.edge || {};
+  const routes = (e.routes || []).map((r) => [r.host, (r.upstreams || []).join(", ") || badge("no upstream", "secondary")]);
+  const certs = (e.certs || []).map((c) => {
+    const days = Math.floor((new Date(c.not_after) - Date.now()) / 86400000);
+    return [(c.names || []).join(", "), c.issuer || "", when(c.not_before), when(c.not_after), badge(`${days}d`, days < 14 ? "danger" : days < 30 ? "warning" : "success")];
+  });
+  const dns = (s.dns || []).map((r) => [r.domain, r.type, r.name, r.value, r.ttl || ""]);
+  return h("div", {},
+    card("network-wired", "Routes (where they point)",
+      routes.length ? table(["Host", "Upstream"], routes) : empty(e.container ? `Nothing is published on the edge (${e.container}).` : "This daemon does not read the edge."),
+      h("span", { class: "badge text-bg-secondary" }, routes.length)),
+    card("certificate", "Certificates",
+      certs.length ? table(["Names", "Issuer", "From", "Expires", "Left"], certs) : empty("No certificates found in the edge's store."),
+      h("span", { class: "badge text-bg-secondary" }, certs.length)),
+    card("globe", "DNS records",
+      dns.length ? table(["Zone", "Type", "Name", "Value", "TTL"], dns) : empty("No DNS records (the daemon needs --dns-provider and --dns-domains)."),
+      h("span", { class: "badge text-bg-secondary" }, dns.length)));
 }
 
 function instancesView(s) {
@@ -293,7 +332,7 @@ const pages = [
   { re: /^\/jobs\/(j-[0-9]+-[0-9a-f]{8})$/, nav: "/jobs", load: (m) => api("/v1/jobs/" + m[1]), render: jobView },
 ];
 
-const routes = { "/": overviewView, "/instances": instancesView, "/volumes": volumesView };
+const routes = { "/": overviewView, "/instances": instancesView, "/volumes": volumesView, "/network": networkView };
 
 // The current place: a status page (from the snapshot) or a page that loads its own data.
 function currentRoute() {

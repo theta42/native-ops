@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/theta42/native-ops/pkg/incus"
+	"github.com/theta42/native-ops/pkg/provider"
 	"github.com/theta42/native-ops/pkg/remote"
 )
 
@@ -30,6 +31,9 @@ type Snapshot struct {
 	Instances []Instance   `json:"instances"`
 	Volumes   []Volume     `json:"volumes"`
 	Images    ImageSummary `json:"images"`
+	Metrics   *Metrics     `json:"metrics,omitempty"`
+	Edge      *Edge        `json:"edge,omitempty"`
+	DNS       []DNSRecord  `json:"dns,omitempty"`
 	Warnings  []string     `json:"warnings,omitempty"`
 }
 
@@ -282,7 +286,23 @@ func Analyze(s *Snapshot, now time.Time) []string {
 
 // Collect gathers a Snapshot through ex (a local shell, or SSH to the host).
 // Only the instance list is required; the rest degrade to warnings.
+// Options say what to gather beyond the Incus inventory.
+type Options struct {
+	Pool          string
+	EdgeContainer string // e.g. "edge": read its routes and certificates; empty skips it
+	DNS           provider.DNSProvider
+	DNSDomains    []string
+}
+
+// Collect is the inventory alone (the CLI's `native-ops status` default).
 func Collect(ctx context.Context, ex remote.Executor, pool string) (*Snapshot, error) {
+	return CollectFull(ctx, ex, Options{Pool: pool})
+}
+
+// CollectFull gathers the inventory, the host metrics, and -- when configured -- what the edge is
+// serving and the DNS records that point at it.
+func CollectFull(ctx context.Context, ex remote.Executor, opts Options) (*Snapshot, error) {
+	pool := opts.Pool
 	if !incus.ValidName(pool) {
 		return nil, fmt.Errorf("invalid pool name %q", pool)
 	}
@@ -325,6 +345,18 @@ func Collect(ctx context.Context, ex remote.Executor, pool string) (*Snapshot, e
 		s.Warnings = append(s.Warnings, err.Error())
 	}
 
+	s.Metrics = collectMetrics(ctx, ex, pool)
+	if opts.EdgeContainer != "" {
+		if e := collectEdge(ctx, ex, opts.EdgeContainer); e != nil {
+			s.Edge = e
+			s.Warnings = append(s.Warnings, e.Warnings...)
+		}
+	}
+	if opts.DNS != nil && len(opts.DNSDomains) > 0 {
+		records, warns := collectDNS(ctx, opts.DNS, opts.DNSDomains)
+		s.DNS = records
+		s.Warnings = append(s.Warnings, warns...)
+	}
 	s.Warnings = append(s.Warnings, Analyze(s, s.Time)...)
 	return s, nil
 }
