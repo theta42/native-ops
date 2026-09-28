@@ -405,6 +405,17 @@ func (m *InstanceManager) Resize(ctx context.Context, name string, limits map[st
 	return m.incus.ResizeLimits(ctx, name, limits)
 }
 
+// Suspend replaces the instance's published route with a static 503 carrying reason, without
+// touching the instance. Undone by asking for the instance again: Launch always republishes the
+// normal route, whatever was there before.
+func (m *InstanceManager) Suspend(ctx context.Context, name string, routing config.RoutingConfig, reason string) error {
+	if !incus.ValidName(name) {
+		return fmt.Errorf("invalid instance name %q", name)
+	}
+	m.log("==> [Instance] Suspending instance: %s (%s)\n", name, reason)
+	return m.caddy.Suspend(ctx, name, routing, reason)
+}
+
 // Destroy tears down an instance, removes its Caddy route, and optionally
 // purges its data volume. Destroying something that is already gone succeeds.
 func (m *InstanceManager) Destroy(ctx context.Context, name string, purgeVolume bool) error {

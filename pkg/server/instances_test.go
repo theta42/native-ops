@@ -20,16 +20,18 @@ import (
 // fakeOps is the host as the instance endpoints see it: which instances exist and from which template
 // ("" for a static service), and a record of what was asked of it.
 type fakeOps struct {
-	mu       sync.Mutex
-	existing map[string]string
-	launched []engine.InstanceSpec
-	names    []string
-	updated  []engine.UpdateRequest
-	deleted  []string
-	purged   []bool
-	err      error
-	block    chan struct{}
-	started  chan struct{}
+	mu        sync.Mutex
+	existing  map[string]string
+	launched  []engine.InstanceSpec
+	names     []string
+	updated   []engine.UpdateRequest
+	resized   []engine.ResizeRequest
+	suspended []engine.SuspendRequest
+	deleted   []string
+	purged    []bool
+	err       error
+	block     chan struct{}
+	started   chan struct{}
 }
 
 func (f *fakeOps) Template(_ context.Context, name string) (string, bool, error) {
@@ -63,6 +65,24 @@ func (f *fakeOps) Update(_ context.Context, name string, req engine.UpdateReques
 	f.updated = append(f.updated, req)
 	f.mu.Unlock()
 	logf("==> updating %s", name)
+	f.wait()
+	return f.err
+}
+
+func (f *fakeOps) Resize(_ context.Context, name string, req engine.ResizeRequest, logf func(string, ...any)) error {
+	f.mu.Lock()
+	f.resized = append(f.resized, req)
+	f.mu.Unlock()
+	logf("==> resizing %s", name)
+	f.wait()
+	return f.err
+}
+
+func (f *fakeOps) Suspend(_ context.Context, name string, req engine.SuspendRequest, logf func(string, ...any)) error {
+	f.mu.Lock()
+	f.suspended = append(f.suspended, req)
+	f.mu.Unlock()
+	logf("==> suspending %s", name)
 	f.wait()
 	return f.err
 }
@@ -417,6 +437,60 @@ func TestUpdateAndDeleteAreJobsToo(t *testing.T) {
 	rig.wait(t, body, JobSucceeded)
 	if rig.ops.purged[1] {
 		t.Fatal("data is kept unless asked for")
+	}
+}
+
+func TestResizeIsAJobWithValidatedLimits(t *testing.T) {
+	rig := newInstRig(t)
+	res, body := rig.do2(t, "POST", "/v1/instances/demo-old/resize", rig.scoped, map[string]any{"limits": map[string]string{"limits.cpu": "2", "limits.memory": "2GB"}})
+	if res.StatusCode != 202 {
+		t.Fatalf("resize: %d %s", res.StatusCode, body)
+	}
+	j := rig.wait(t, body, JobSucceeded)
+	if j.Kind != "instance:resize" || len(rig.ops.resized) != 1 || rig.ops.resized[0].Limits["limits.cpu"] != "2" {
+		t.Fatalf("resize job: %+v %+v", j, rig.ops.resized)
+	}
+	for name, limits := range map[string]map[string]string{
+		"an unknown limit":   {"security.privileged": "true"},
+		"a cpu not a number": {"limits.cpu": "all"},
+		"empty":              {},
+	} {
+		if res, _ := rig.do2(t, "POST", "/v1/instances/demo-old/resize", rig.scoped, map[string]any{"limits": limits}); res.StatusCode != 400 {
+			t.Errorf("%s must be rejected, got %d", name, res.StatusCode)
+		}
+	}
+	if len(rig.ops.resized) != 1 {
+		t.Fatalf("rejected requests must never reach the ops layer: %+v", rig.ops.resized)
+	}
+	if res, _ := rig.do2(t, "POST", "/v1/instances/x-one/resize", rig.narrow, map[string]any{"limits": map[string]string{"limits.cpu": "1"}}); res.StatusCode != 202 {
+		t.Errorf("a name within a narrow scope must be allowed to resize, got %d", res.StatusCode)
+	}
+	if res, _ := rig.do2(t, "POST", "/v1/instances/demo-old/resize", rig.narrow, map[string]any{"limits": map[string]string{"limits.cpu": "1"}}); res.StatusCode != 403 {
+		t.Errorf("a name outside a narrow scope must be refused, got %d", res.StatusCode)
+	}
+}
+
+func TestSuspendIsAJobAndOnlyAllowedDomainsAndImportsAreAccepted(t *testing.T) {
+	rig := newInstRig(t)
+	res, body := rig.do2(t, "POST", "/v1/instances/demo-old/suspend", rig.scoped, map[string]any{"domain": "demo-old.opsavor.app", "reason": "non-payment", "route_directives": []string{"import strip-forged-identity"}})
+	if res.StatusCode != 202 {
+		t.Fatalf("suspend: %d %s", res.StatusCode, body)
+	}
+	j := rig.wait(t, body, JobSucceeded)
+	if j.Kind != "instance:suspend" || len(rig.ops.suspended) != 1 || rig.ops.suspended[0].Reason != "non-payment" {
+		t.Fatalf("suspend job: %+v %+v", j, rig.ops.suspended)
+	}
+	if res, _ := rig.do2(t, "POST", "/v1/instances/demo-old/suspend", rig.scoped, map[string]any{"domain": "evil.example.com", "reason": "x"}); res.StatusCode != 403 {
+		t.Errorf("a domain outside the token's scope must be refused, got %d", res.StatusCode)
+	}
+	if res, _ := rig.do2(t, "POST", "/v1/instances/demo-old/suspend", rig.scoped, map[string]any{"domain": "demo-old.opsavor.app", "reason": ""}); res.StatusCode != 400 {
+		t.Errorf("an empty reason must be refused, got %d", res.StatusCode)
+	}
+	if res, _ := rig.do2(t, "POST", "/v1/instances/demo-old/suspend", rig.scoped, map[string]any{"domain": "demo-old.opsavor.app", "reason": "x", "route_directives": []string{"import admin-only"}}); res.StatusCode != 400 {
+		t.Errorf("an import the operator did not allow must be refused, got %d", res.StatusCode)
+	}
+	if len(rig.ops.suspended) != 1 {
+		t.Fatalf("rejected requests must never reach the ops layer: %+v", rig.ops.suspended)
 	}
 }
 

@@ -25,6 +25,9 @@ a person sets up by hand.
 | `POST /v1/apply` | deployer | apply an **approved** plan, as a job (only with `--enable-apply`) |
 | `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | jobs (apply and instance changes) and their outcome; the log is shown to deployers and admins only |
 | `PUT /v1/instances/{name}`, `POST /v1/instances/{name}/update`, `DELETE /v1/instances/{name}` | deployer | create, move to another image, or remove a tenant instance, as a job (only with `--enable-instances`) |
+| `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
+| `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
+| `POST /v1/images/build` | deployer | build and publish an application image from an uploaded configuration tree, as a job (only with `--enable-image-build`) |
 | `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see |
 | `GET /` | none | the UI (Overview, Instances, Volumes). It holds no data; it asks for a token and calls `/v1/status` |
 
@@ -186,7 +189,12 @@ curl -X PUT "$URL/v1/instances/demo-multi" -H "Authorization: Bearer $TOKEN" -d 
 `/etc/default/<service>`, the unit started once the environment is there, health gate, route), or resumes and
 converges the one an earlier call created, so it is safe to repeat. `update` moves it to another image through
 the safe path (volume snapshot first, environment carried over, health-gated, rolled back on failure).
-`DELETE` removes it and its route; `?purge_volumes=true` also deletes the data volumes named after it.
+`resize` is a live `limits.cpu`/`limits.memory` change (no restart, no image change). `suspend` (`{domain,
+reason,route_directives?}`) replaces the published route with a static 503 naming `reason`, without
+stopping or otherwise touching the instance; there is deliberately no `unsuspend` -- `PUT` always
+republishes the normal route, whatever was there before, so asking for the instance again is how a
+suspension ends. `DELETE` removes it and its route; `?purge_volumes=true` also deletes the data volumes
+named after it.
 
 What stops a fleet manager, or anyone holding its token, from doing more than that:
 
@@ -200,7 +208,8 @@ What stops a fleet manager, or anyone holding its token, from doing more than th
   needs its mount point, never its contents, handed over once), environment names in `[A-Z_][A-Z0-9_]*`
   with no line breaks, a health check, a host name, and route directives that are only `import <snippet>`
   from the operator's list (`--instance-route-imports`, default none). Unknown fields are refused. There is
-  no way to ask for a privileged container, a host path, another instance's volume, or a shell.
+  no way to ask for a privileged container, a host path, another instance's volume, or a shell. `resize`
+  and `suspend` are checked against the same limit and route-import rules.
 - **Only tenants.** An instance can be changed or removed here only if it was launched from a template
   (`user.native-ops.template`). gitea, plane and every other static service carry none and are refused, for
   every token, an admin's included; an instance of another template is never taken over.

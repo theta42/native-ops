@@ -66,6 +66,45 @@ func RenderSiteBlock(domain, upstreamIP string, upstreamPort int, tls string, ex
 	return sb.String()
 }
 
+// reasonRe is deliberately an allowlist, not an escape list: this text lands inside a Caddy site file
+// (a quoted respond argument), a site file is written BEFORE `caddy reload` runs, and the file is
+// imported alongside every other site's -- one reason breaking the file's syntax would fail reload for
+// every site behind the edge, not just this one. A byte outside the allowlist becomes a space.
+var reasonRe = regexp.MustCompile(`[^A-Za-z0-9 .,:;'()/@+_-]`)
+
+const maxReasonChars = 120
+
+// SanitizeSuspendReason narrows reason to a safe, printable allowlist for use inside a Caddy site file.
+// Never empty: a reason that sanitizes away to nothing becomes "suspended".
+func SanitizeSuspendReason(reason string) string {
+	cleaned := reasonRe.ReplaceAllString(reason, " ")
+	cleaned = strings.Join(strings.Fields(cleaned), " ")
+	if len(cleaned) > maxReasonChars {
+		cleaned = strings.TrimSpace(cleaned[:maxReasonChars])
+	}
+	if cleaned == "" {
+		return "suspended"
+	}
+	return cleaned
+}
+
+// RenderSuspendedSiteBlock is the Caddy site for a suspended tenant: the same domain, tls and extra
+// directives (route_directives) an active site for it would carry, but a static 503 with reason
+// instead of a reverse_proxy -- the instance itself is never touched.
+func RenderSuspendedSiteBlock(domain, tls, reason string, extra []string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%s {\n", domain))
+	if tls != "" {
+		sb.WriteString(fmt.Sprintf("    tls %s\n", tls))
+	}
+	for _, line := range extra {
+		sb.WriteString(fmt.Sprintf("    %s\n", line))
+	}
+	fmt.Fprintf(&sb, "    handle {\n        respond %q 503\n    }\n", fmt.Sprintf("This site is suspended: %s. Contact support.", SanitizeSuspendReason(reason)))
+	sb.WriteString("}\n")
+	return sb.String()
+}
+
 // BaseCaddyfile is the Caddyfile native-ops creates for an edge that has none.
 func BaseCaddyfile(email string) string {
 	var sb strings.Builder
@@ -132,6 +171,33 @@ func (e *EdgeManager) PublishSite(ctx context.Context, siteName string, routing 
 	}
 
 	desired := RenderSiteBlock(routing.Domain, upstreamIP, routing.UpstreamPort, routing.TLS, routing.ExtraDirectives)
+	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
+	if err != nil {
+		return err
+	}
+	if hadPrev && prev == desired {
+		return nil
+	}
+	return e.replaceSite(ctx, siteName, desired, prev, hadPrev)
+}
+
+// Suspend replaces a published site with a static 503 responder carrying reason, without touching the
+// instance behind it: the same domain, tls and extra directives an active site for it would carry (the
+// caller supplies them, the same way it does for PublishSite -- Suspend never reads the existing file
+// to find them, so suspending an instance with no published route is a clean, explicit error). Undone
+// by publishing the site normally again (PublishSite/PublishSiteFor): idempotent like every other
+// route write, so it is never a special, one-way state.
+func (e *EdgeManager) Suspend(ctx context.Context, siteName string, routing config.RoutingConfig, reason string) error {
+	if !incus.ValidName(siteName) {
+		return fmt.Errorf("invalid site name %q", siteName)
+	}
+	if !domainRe.MatchString(routing.Domain) {
+		return fmt.Errorf("invalid domain %q", routing.Domain)
+	}
+	if err := e.EnsureBaseCaddyfile(ctx); err != nil {
+		return err
+	}
+	desired := RenderSuspendedSiteBlock(routing.Domain, routing.TLS, reason, routing.ExtraDirectives)
 	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
 	if err != nil {
 		return err
