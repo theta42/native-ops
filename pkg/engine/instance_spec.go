@@ -88,13 +88,8 @@ func (s *InstanceSpec) Validate(name string, pol InstancePolicy) error {
 			return fmt.Errorf("profile %q is not allowed (allowed: %s)", p, strings.Join(pol.Profiles, ", "))
 		}
 	}
-	for k, v := range s.Limits {
-		switch {
-		case k == "limits.cpu" && cpuRe.MatchString(v):
-		case k == "limits.memory" && memRe.MatchString(v):
-		default:
-			return fmt.Errorf("limit %q=%q is not allowed (only limits.cpu as a number and limits.memory such as 1GB)", k, v)
-		}
+	if err := validateLimits(s.Limits); err != nil {
+		return err
 	}
 	if len(s.Volumes) > 4 {
 		return fmt.Errorf("at most 4 volumes")
@@ -160,6 +155,20 @@ func contains(list []string, s string) bool {
 	return false
 }
 
+// validateLimits reports why limits cannot be accepted: only limits.cpu (a plain number) and
+// limits.memory (a number with a unit) are ever allowed, on a launch or a resize.
+func validateLimits(limits map[string]string) error {
+	for k, v := range limits {
+		switch {
+		case k == "limits.cpu" && cpuRe.MatchString(v):
+		case k == "limits.memory" && memRe.MatchString(v):
+		default:
+			return fmt.Errorf("limit %q=%q is not allowed (only limits.cpu as a number and limits.memory such as 1GB)", k, v)
+		}
+	}
+	return nil
+}
+
 // TemplateConfig turns the spec into the engine's template blueprint.
 func (s *InstanceSpec) TemplateConfig() *config.TemplateConfig {
 	t := &config.TemplateConfig{
@@ -205,6 +214,46 @@ func (r *UpdateRequest) Validate() error {
 	if h := r.Health; h != nil {
 		if h.Port < 1 || h.Port > 65535 || h.Timeout < 0 || h.Timeout > 300 || (h.Path != "" && !healthRe.MatchString(h.Path)) {
 			return fmt.Errorf("health needs a port (1-65535), an optional path such as /health and a timeout of at most 300 seconds")
+		}
+	}
+	return nil
+}
+
+// ResizeRequest is a request for a live CPU/memory change: no restart, no image change.
+type ResizeRequest struct {
+	Limits map[string]string `json:"limits"`
+}
+
+// Validate reports why a resize request cannot be accepted.
+func (r *ResizeRequest) Validate() error {
+	if len(r.Limits) == 0 {
+		return fmt.Errorf("limits (limits.cpu and/or limits.memory) is required")
+	}
+	return validateLimits(r.Limits)
+}
+
+// SuspendRequest asks for an instance's published route to be replaced with a static 503 carrying
+// Reason, without touching the instance. Domain and RouteDirectives describe the route the same way a
+// launch does (Suspend never reads the instance's current site file to recover them), so the request
+// is validated with the same instance policy an operator already set for launches.
+type SuspendRequest struct {
+	Domain          string   `json:"domain"`
+	Reason          string   `json:"reason"`
+	RouteDirectives []string `json:"route_directives,omitempty"`
+}
+
+// Validate reports why a suspend request cannot be accepted.
+func (r *SuspendRequest) Validate(pol InstancePolicy) error {
+	if len(r.Domain) > 253 || !domainRe.MatchString(r.Domain) {
+		return fmt.Errorf("domain %q is not a valid host name", r.Domain)
+	}
+	if len(r.Reason) == 0 || len(r.Reason) > 200 {
+		return fmt.Errorf("reason is required and at most 200 characters")
+	}
+	for _, d := range r.RouteDirectives {
+		m := importRe.FindStringSubmatch(d)
+		if m == nil || !contains(pol.RouteImports, m[1]) {
+			return fmt.Errorf("route directive %q is not allowed (allowed imports: %s)", d, strings.Join(pol.RouteImports, ", "))
 		}
 	}
 	return nil
@@ -260,6 +309,19 @@ func (i *Instances) Update(ctx context.Context, name string, req UpdateRequest, 
 		opts.HealthCheck = config.HealthCheckConfig{Path: req.Health.Path, Port: req.Health.Port, Timeout: req.Health.Timeout, Interval: 2}
 	}
 	return i.manager(logf).Update(ctx, name, req.Image, opts)
+}
+
+// Resize applies req's limits live; no restart, no image change.
+func (i *Instances) Resize(ctx context.Context, name string, req ResizeRequest, logf func(string, ...any)) error {
+	return i.manager(logf).Resize(ctx, name, req.Limits)
+}
+
+// Suspend replaces the instance's published route with a static 503 carrying req.Reason, without
+// touching the instance. Undone by asking for the instance again (Launch republishes the normal route
+// unconditionally, so a converge after a suspend clears it).
+func (i *Instances) Suspend(ctx context.Context, name string, req SuspendRequest, logf func(string, ...any)) error {
+	routing := config.RoutingConfig{Domain: req.Domain, ExtraDirectives: req.RouteDirectives}
+	return i.manager(logf).Suspend(ctx, name, routing, req.Reason)
 }
 
 // Destroy removes the instance and its route. With purge it also deletes the data volumes attached to

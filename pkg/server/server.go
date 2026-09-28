@@ -297,6 +297,8 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("GET /v1/instances/{name}", s.authScoped(RoleViewer, s.handleInstanceGet))
 		mux.Handle("PUT /v1/instances/{name}", s.authScoped(RoleDeployer, s.handleInstancePut))
 		mux.Handle("POST /v1/instances/{name}/update", s.authScoped(RoleDeployer, s.handleInstanceUpdate))
+		mux.Handle("POST /v1/instances/{name}/resize", s.authScoped(RoleDeployer, s.handleInstanceResize))
+		mux.Handle("POST /v1/instances/{name}/suspend", s.authScoped(RoleDeployer, s.handleInstanceSuspend))
 		mux.Handle("DELETE /v1/instances/{name}", s.authScoped(RoleDeployer, s.handleInstanceDelete))
 	}
 	if s.opts.Jobs != nil {

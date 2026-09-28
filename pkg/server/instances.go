@@ -19,6 +19,8 @@ type InstanceOps interface {
 	Template(ctx context.Context, name string) (template string, exists bool, err error)
 	Launch(ctx context.Context, name string, spec engine.InstanceSpec, logf func(string, ...any)) (string, error)
 	Update(ctx context.Context, name string, req engine.UpdateRequest, logf func(string, ...any)) error
+	Resize(ctx context.Context, name string, req engine.ResizeRequest, logf func(string, ...any)) error
+	Suspend(ctx context.Context, name string, req engine.SuspendRequest, logf func(string, ...any)) error
 	Destroy(ctx context.Context, name string, purge bool, logf func(string, ...any)) error
 }
 
@@ -176,6 +178,66 @@ func (s *Server) handleInstanceUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.startInstanceJob(w, r, "update", name, func(ctx context.Context, logf func(string, ...any)) error {
 		return s.opts.Instances.Update(ctx, name, req, logf)
+	})
+}
+
+// handleInstanceResize is POST /v1/instances/{name}/resize: a live CPU/memory change, no restart.
+func (s *Server) handleInstanceResize(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req engine.ResizeRequest
+	if !incus.ValidName(name) {
+		writeError(w, http.StatusBadRequest, "bad_request", "not a valid instance name")
+		return
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	_, scope := s.actorScope(r)
+	if msg := checkScope(scope, name, "", ""); msg != "" {
+		auditDetail(r, "instance resize %s refused: outside the token's scope", name)
+		writeError(w, http.StatusForbidden, "out_of_scope", msg)
+		return
+	}
+	if err := req.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
+		return
+	}
+	if !s.requireManaged(w, r, name, "resize") {
+		return
+	}
+	s.startInstanceJob(w, r, "resize", name, func(ctx context.Context, logf func(string, ...any)) error {
+		return s.opts.Instances.Resize(ctx, name, req, logf)
+	})
+}
+
+// handleInstanceSuspend is POST /v1/instances/{name}/suspend: replaces the published route with a
+// static 503 carrying a reason, without touching the instance. Undone by asking for the instance
+// again (PUT /v1/instances/{name}): every launch republishes the normal route unconditionally.
+func (s *Server) handleInstanceSuspend(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req engine.SuspendRequest
+	if !incus.ValidName(name) {
+		writeError(w, http.StatusBadRequest, "bad_request", "not a valid instance name")
+		return
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	_, scope := s.actorScope(r)
+	if msg := checkScope(scope, name, "", req.Domain); msg != "" {
+		auditDetail(r, "instance suspend %s refused: outside the token's scope", name)
+		writeError(w, http.StatusForbidden, "out_of_scope", msg)
+		return
+	}
+	if err := req.Validate(s.opts.InstancePolicy); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
+		return
+	}
+	if !s.requireManaged(w, r, name, "suspend") {
+		return
+	}
+	s.startInstanceJob(w, r, "suspend", name, func(ctx context.Context, logf func(string, ...any)) error {
+		return s.opts.Instances.Suspend(ctx, name, req, logf)
 	})
 }
 

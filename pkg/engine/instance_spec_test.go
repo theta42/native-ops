@@ -121,6 +121,39 @@ func TestAnUpdateRequestIsValidated(t *testing.T) {
 	}
 }
 
+func TestAResizeRequestIsValidated(t *testing.T) {
+	if err := (&ResizeRequest{Limits: map[string]string{"limits.cpu": "2", "limits.memory": "2GB"}}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, r := range map[string]ResizeRequest{
+		"nothing at all":     {},
+		"an unknown limit":   {Limits: map[string]string{"security.privileged": "true"}},
+		"a cpu not a number": {Limits: map[string]string{"limits.cpu": "all"}},
+	} {
+		if err := r.Validate(); err == nil {
+			t.Errorf("%s must be refused", name)
+		}
+	}
+}
+
+func TestASuspendRequestIsValidated(t *testing.T) {
+	ok := SuspendRequest{Domain: "demo-old.opsavor.app", Reason: "non-payment", RouteDirectives: []string{"import strip-forged-identity"}}
+	if err := ok.Validate(testPolicy); err != nil {
+		t.Fatal(err)
+	}
+	for name, r := range map[string]SuspendRequest{
+		"no domain":                 {Reason: "x"},
+		"a wildcard domain":         {Domain: "*.opsavor.app", Reason: "x"},
+		"no reason":                 {Domain: "demo-old.opsavor.app"},
+		"an import not allowed":     {Domain: "demo-old.opsavor.app", Reason: "x", RouteDirectives: []string{"import admin-only"}},
+		"a directive not an import": {Domain: "demo-old.opsavor.app", Reason: "x", RouteDirectives: []string{"reverse_proxy evil:80"}},
+	} {
+		if err := r.Validate(testPolicy); err == nil {
+			t.Errorf("%s must be refused", name)
+		}
+	}
+}
+
 func newTestInstances(sim *hostSim) *Instances {
 	return &Instances{exec: sim, healthGate: func(context.Context, string, config.HealthCheckConfig) error { return nil }}
 }
@@ -162,6 +195,45 @@ func TestLaunchingATenantThroughTheAdapterIsComplete(t *testing.T) {
 	}
 	if m := sim.mutations(); len(m) != 0 {
 		t.Fatalf("a repeated launch must change nothing:\n%s", strings.Join(m, "\n"))
+	}
+}
+
+func TestResizeAndSuspendWireThroughToTheHostAndTheEdge(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["opsavor-platform:latest"] = fpA
+	in := newTestInstances(sim)
+	ctx := context.Background()
+	if _, err := in.Launch(ctx, "demo-multi", platformSpec(), nil); err != nil {
+		t.Fatal(err)
+	}
+	sim.reset()
+	restartsBefore := sim.ctrs["demo-multi"].restarts
+
+	if err := in.Resize(ctx, "demo-multi", ResizeRequest{Limits: map[string]string{"limits.cpu": "4", "limits.memory": "4GB"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if c := sim.ctrs["demo-multi"]; c.config["limits.cpu"] != "4" || c.config["limits.memory"] != "4GB" {
+		t.Fatalf("resize did not reach the container: %+v", c.config)
+	}
+	if c := sim.ctrs["demo-multi"]; c.restarts != restartsBefore {
+		t.Fatalf("a resize must never restart the unit, got %d more restarts", c.restarts-restartsBefore)
+	}
+
+	if err := in.Suspend(ctx, "demo-multi", SuspendRequest{Domain: "demo-multi.example.com", Reason: "non-payment", RouteDirectives: []string{"import strip-forged-identity"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	site := sim.ctrs["edge"].files["/etc/caddy/sites/demo-multi.caddy"]
+	if strings.Contains(site, "reverse_proxy") || !strings.Contains(site, "503") || !strings.Contains(site, "non-payment") {
+		t.Fatalf("expected a 503 responder naming the reason, got:\n%s", site)
+	}
+
+	// Asking for the instance again (what fleet-manager's redeploy already does) undoes the suspension.
+	if _, err := in.Launch(ctx, "demo-multi", platformSpec(), nil); err != nil {
+		t.Fatal(err)
+	}
+	site = sim.ctrs["edge"].files["/etc/caddy/sites/demo-multi.caddy"]
+	if !strings.Contains(site, "reverse_proxy") || strings.Contains(site, "503") {
+		t.Fatalf("re-launching must restore the normal route:\n%s", site)
 	}
 }
 

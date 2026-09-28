@@ -391,3 +391,91 @@ func TestRepointUpstreamRestoresTheRouteIfCaddyRejectsIt(t *testing.T) {
 		t.Fatal("an instance with a route but no address is an error")
 	}
 }
+
+func TestSanitizeSuspendReason(t *testing.T) {
+	cases := map[string]string{
+		"non-payment":                      "non-payment",
+		"":                                 "suspended",
+		"  spaced   out  ":                 "spaced out",
+		"line\nbreak\r\nhere":              "line break here",
+		"quote\" and {brace} and $(shell)": "quote and brace and (shell)", // parens are allowed (matches opsavor/management's own allowlist); quotes, braces and $ are not
+	}
+	for in, want := range cases {
+		if got := SanitizeSuspendReason(in); got != want {
+			t.Errorf("SanitizeSuspendReason(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := SanitizeSuspendReason(strings.Repeat("a", 200)); len(got) != 120 {
+		t.Errorf("must be capped at 120 chars, got %d", len(got))
+	}
+}
+
+func TestSuspendReplacesTheSiteWithA503AndIsUndoneByPublishingAgain(t *testing.T) {
+	sim := newEdgeSim()
+	e := NewEdgeManager(sim, "edge")
+	ctx := context.Background()
+	if err := e.PublishSite(ctx, "acme", route, "10.0.100.21"); err != nil {
+		t.Fatal(err)
+	}
+	active := sim.files["/etc/caddy/sites/acme.caddy"]
+	reloads := sim.reloads
+
+	if err := e.Suspend(ctx, "acme", route, "non-payment"); err != nil {
+		t.Fatal(err)
+	}
+	got := sim.files["/etc/caddy/sites/acme.caddy"]
+	if strings.Contains(got, "reverse_proxy") || !strings.Contains(got, "503") || !strings.Contains(got, "non-payment") {
+		t.Fatalf("expected a 503 responder naming the reason, got:\n%s", got)
+	}
+	if !strings.HasPrefix(got, "git.example.com {") {
+		t.Fatalf("the domain must be unchanged:\n%s", got)
+	}
+	if sim.reloads != reloads+1 {
+		t.Fatalf("expected one reload, got %d", sim.reloads-reloads)
+	}
+
+	// Suspending again with the same reason is a no-op (idempotent, like PublishSite).
+	before := sim.mutations()
+	if err := e.Suspend(ctx, "acme", route, "non-payment"); err != nil {
+		t.Fatal(err)
+	}
+	if sim.mutations() != before {
+		t.Fatal("suspending with the same reason again must change nothing")
+	}
+
+	// Publishing the site normally again is how a suspension is undone.
+	if err := e.PublishSite(ctx, "acme", route, "10.0.100.21"); err != nil {
+		t.Fatal(err)
+	}
+	if sim.files["/etc/caddy/sites/acme.caddy"] != active {
+		t.Fatalf("publishing again must restore the normal site:\n%s", sim.files["/etc/caddy/sites/acme.caddy"])
+	}
+}
+
+func TestSuspendRejectsUnsafeInputAndRollsBackOnRejection(t *testing.T) {
+	sim := newEdgeSim()
+	e := NewEdgeManager(sim, "edge")
+	ctx := context.Background()
+	if err := e.Suspend(ctx, "a;b", route, "x"); err == nil {
+		t.Fatal("an unsafe site name must be refused")
+	}
+	if err := e.Suspend(ctx, "acme", config.RoutingConfig{Domain: "a b.com"}, "x"); err == nil {
+		t.Fatal("an unsafe domain must be refused")
+	}
+	if len(sim.cmds) != 0 {
+		t.Fatalf("unsafe input must be rejected before anything runs: %v", sim.cmds)
+	}
+
+	if err := e.PublishSite(ctx, "acme", route, "10.0.100.21"); err != nil {
+		t.Fatal(err)
+	}
+	good := sim.files["/etc/caddy/sites/acme.caddy"]
+	reloads := sim.reloads
+	sim.rejectWhen = "503"
+	if err := e.Suspend(ctx, "acme", route, "non-payment"); err == nil || !strings.Contains(err.Error(), "previous one was restored") {
+		t.Fatalf("got %v", err)
+	}
+	if sim.files["/etc/caddy/sites/acme.caddy"] != good || sim.reloads != reloads {
+		t.Fatal("a rejected suspend must roll back without a reload")
+	}
+}
