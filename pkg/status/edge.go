@@ -36,19 +36,20 @@ type Edge struct {
 	Warnings  []string `json:"warnings,omitempty"`
 }
 
-// collectEdge reads the edge's live Caddy config (the admin API on loopback inside the container, not a
-// parse of the Caddyfile -- it is what Caddy is running right now) and the certificates it holds.
+// collectEdge reads the edge's Caddy configuration (adapted from the Caddyfile it runs, which imports
+// the per-site files native-ops publishes) and the certificates it holds. The edge image has no wget,
+// so the config comes from `caddy adapt` rather than the admin API.
 func collectEdge(ctx context.Context, ex remote.Executor, container string) *Edge {
 	e := &Edge{Container: container, Routes: []Route{}, Certs: []Cert{}}
 	base := "incus exec " + incus.ShQuote(container) + " -- "
-	if out, err := ex.Run(ctx, base+"wget -qO- http://127.0.0.1:2019/config/"); err != nil {
+	if out, err := ex.Run(ctx, base+"caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile"); err != nil {
 		e.Warnings = append(e.Warnings, "could not read the edge config: "+err.Error())
 	} else if routes, err := parseCaddyRoutes(out); err != nil {
 		e.Warnings = append(e.Warnings, err.Error())
 	} else {
 		e.Routes = routes
 	}
-	paths, err := ex.Run(ctx, base+`sh -c 'find /data/caddy -name "*.crt" -type f 2>/dev/null'`)
+	paths, err := ex.Run(ctx, base+`sh -c 'find /root/.local/share/caddy /data/caddy -name "*.crt" -type f 2>/dev/null'`)
 	if err != nil {
 		e.Warnings = append(e.Warnings, "could not list edge certificates: "+err.Error())
 	} else {
