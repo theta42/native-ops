@@ -74,6 +74,9 @@ func main() {
 	case "token":
 		handleTokenCommand(os.Args[2:])
 
+	case "user":
+		handleUserCommand(os.Args[2:])
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", subcommand)
 		printUsage()
@@ -95,6 +98,7 @@ Remote daemon (runs on the host it manages; deployed by IaC, driven by CI over H
   status           Read-only view of the host's instances, volumes and images (--json)
   serve            Run the authenticated API + UI daemon (needs a state dir; see README)
   token create     Create an API token (also: token list, token revoke)
+  user create      Create a local UI user (also: user list, user passwd, user role, user disable)
 
 Core Commands:
   host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)

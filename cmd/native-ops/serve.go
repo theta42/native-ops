@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -107,6 +108,17 @@ func handleServeCommand(ctx context.Context, args []string) {
 	instanceProfiles := flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
 	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
 	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
+	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
+	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
+	// unprivileged user on the host could read.
+	enableAuth := flags.Bool("enable-auth", envBool("NATIVE_OPS_ENABLE_AUTH"), "Serve local sign-in and session cookies for the UI (users.json in the state dir; manage people with `native-ops user create`). Env: NATIVE_OPS_ENABLE_AUTH=1")
+	oidcIssuer := flags.String("oidc-issuer", os.Getenv("NATIVE_OPS_OIDC_ISSUER"), "OpenID Connect issuer URL (e.g. https://accounts.google.com); enables OIDC sign-in. Env: NATIVE_OPS_OIDC_ISSUER")
+	oidcClientID := flags.String("oidc-client-id", os.Getenv("NATIVE_OPS_OIDC_CLIENT_ID"), "OIDC client id. Env: NATIVE_OPS_OIDC_CLIENT_ID")
+	oidcClientSecret := flags.String("oidc-client-secret", os.Getenv("NATIVE_OPS_OIDC_CLIENT_SECRET"), "OIDC client secret. Env: NATIVE_OPS_OIDC_CLIENT_SECRET")
+	oidcRedirectURL := flags.String("oidc-redirect-url", os.Getenv("NATIVE_OPS_OIDC_REDIRECT_URL"), "OIDC redirect URL (e.g. https://native-ops.example/auth/oidc/callback). Env: NATIVE_OPS_OIDC_REDIRECT_URL")
+	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. opsavor.ai). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
+	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin. Env: NATIVE_OPS_OIDC_ROLE")
+	oidcLabel := flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
@@ -114,6 +126,9 @@ func handleServeCommand(ctx context.Context, args []string) {
 		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
 		EnableImageBuild: *enableImageBuild,
+		EnableAuth:       *enableAuth,
+		OIDC: server.OIDCSettings{Issuer: *oidcIssuer, ClientID: *oidcClientID, ClientSecret: *oidcClientSecret,
+			RedirectURL: *oidcRedirectURL, AllowedDomain: *oidcAllowedDomain, Role: server.Role(*oidcRole), Label: *oidcLabel},
 		Exec:             remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
 	})
 	if err != nil {
@@ -139,6 +154,10 @@ type daemonConfig struct {
 	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
+	// EnableAuth serves local sign-in and session cookies for the UI. OIDC (an Issuer) adds generic
+	// OpenID Connect sign-in; either implies a user store and a session signer.
+	EnableAuth bool
+	OIDC       server.OIDCSettings
 }
 
 // newDaemon builds the server. Without EnableApply the daemon can read the host and plan an
@@ -192,6 +211,32 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			opts.ImageBuild = imageBuildSource(cfg.Exec)
 		}
 	}
+	if cfg.EnableAuth || cfg.OIDC.Issuer != "" {
+		sessionKey, err := loadOrCreateKey(filepath.Join(cfg.StateDir, "session.key"))
+		if err != nil {
+			audit.Close()
+			return nil, nil, err
+		}
+		sess, err := server.NewSessions(sessionKey, 12*time.Hour, false)
+		if err != nil {
+			audit.Close()
+			return nil, nil, err
+		}
+		users, err := server.OpenUserStore(filepath.Join(cfg.StateDir, "users.json"))
+		if err != nil {
+			audit.Close()
+			return nil, nil, fmt.Errorf("users: %w", err)
+		}
+		opts.Users, opts.Sessions = users, sess
+	}
+	if cfg.OIDC.Issuer != "" {
+		oidc, err := server.NewOIDC(cfg.OIDC)
+		if err != nil {
+			audit.Close()
+			return nil, nil, err
+		}
+		opts.OIDC = oidc
+	}
 	srv, err := server.New(opts)
 	if err != nil {
 		audit.Close()
@@ -200,8 +245,24 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 	return srv, func() { audit.Close() }, nil
 }
 
-func splitList(s string) []string {
-	var out []string
+// envOr returns an environment value, or a default when it is empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// envBool reports whether an environment value is a truthy flag value.
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+func splitList(s string) []string {	var out []string
 	for _, p := range strings.Split(s, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
@@ -313,6 +374,78 @@ func handleTokenCommand(args []string) {
 		fmt.Printf("Revoked %s\n", *id)
 	default:
 		fmt.Println("Usage: native-ops token [create|list|revoke] --state-dir DIR ...")
+		os.Exit(1)
+	}
+}
+
+// handleUserCommand manages the people who may sign in to the daemon UI: local accounts with a password
+// (OIDC users are created on first sign-in). The same ladder as a token: viewer, planner, deployer, admin.
+func handleUserCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Println("Usage: native-ops user [create|list|passwd|role|disable|enable] --state-dir DIR ...")
+		os.Exit(1)
+	}
+	action := args[0]
+	flags := flag.NewFlagSet("user "+action, flag.ExitOnError)
+	stateDir := stateDirFlag(flags)
+	username := flags.String("username", "", "Username (create, passwd, role, disable, enable)")
+	name := flags.String("name", "", "Display name (create)")
+	role := flags.String("role", "viewer", "viewer, planner, deployer or admin (create, role)")
+	password := flags.String("password", "", "Password, 12-72 characters (create, passwd). If empty, one line is read from stdin")
+	_ = flags.Parse(args[1:])
+
+	if *password == "" && (action == "create" || action == "passwd") {
+		b, _ := io.ReadAll(os.Stdin)
+		*password = strings.TrimRight(string(b), "\r\n")
+	}
+	store, err := server.OpenUserStore(filepath.Join(openStateDir(*stateDir), "users.json"))
+	if err != nil {
+		log.Fatalf("users: %v", err)
+	}
+	switch action {
+	case "create":
+		u, err := store.CreateLocal(*username, *name, server.Role(*role), *password)
+		if err != nil {
+			log.Fatalf("user create: %v", err)
+		}
+		fmt.Printf("Created %s user %q\n", u.Role, u.Username)
+	case "list":
+		users, err := store.List()
+		if err != nil {
+			log.Fatalf("user list: %v", err)
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "USERNAME\tNAME\tROLE\tPROVIDER\tEMAIL\tSTATE")
+		for _, u := range users {
+			state := "active"
+			if u.Disabled {
+				state = "disabled"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", u.Username, u.Name, u.Role, u.Provider, u.Email, state)
+		}
+		_ = w.Flush()
+	case "passwd":
+		if err := store.SetPassword(*username, *password); err != nil {
+			log.Fatalf("user passwd: %v", err)
+		}
+		fmt.Printf("Password set for %q\n", *username)
+	case "role":
+		if err := store.SetRole(*username, server.Role(*role)); err != nil {
+			log.Fatalf("user role: %v", err)
+		}
+		fmt.Printf("%q is now %s\n", *username, *role)
+	case "disable":
+		if err := store.SetDisabled(*username, true); err != nil {
+			log.Fatalf("user disable: %v", err)
+		}
+		fmt.Printf("Disabled %q\n", *username)
+	case "enable":
+		if err := store.SetDisabled(*username, false); err != nil {
+			log.Fatalf("user enable: %v", err)
+		}
+		fmt.Printf("Enabled %q\n", *username)
+	default:
+		fmt.Println("Usage: native-ops user [create|list|passwd|role|disable|enable] --state-dir DIR ...")
 		os.Exit(1)
 	}
 }

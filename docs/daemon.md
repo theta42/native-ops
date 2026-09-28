@@ -232,6 +232,38 @@ set `NATIVE_OPS_BOOTSTRAP_TOKEN=nops_...` (at least 32 characters after the pref
 `/etc/native-ops/serve.env`. The daemon loads it as an in-memory `admin` token named `bootstrap`;
 it is never written to disk. Rotate it by changing the secret and restarting.
 
+## UI sign-in: local users and OIDC
+
+By default the UI takes a pasted API token (kept for the browser tab). Two sign-in methods can be turned
+on instead, so people reach the console without holding a token:
+
+- `--enable-auth` serves local sign-in: a username and password against `users.json` in the state dir,
+  managed with the CLI below. Passwords are bcrypt hashes; each user carries a role (viewer, planner,
+  deployer, admin).
+- The OIDC flags add a generic OpenID Connect sign-in: `--oidc-issuer`, `--oidc-client-id`,
+  `--oidc-client-secret`, `--oidc-redirect-url`, and optional `--oidc-allowed-domain`, `--oidc-role` and
+  `--oidc-label`. Discovery, the authorization redirect, the code exchange and the userinfo call are all
+  the daemon's; a person is matched to a local user by their verified email (created at `--oidc-role` on
+  first sight).
+
+Either way a sign-in sets an HttpOnly session cookie (HMAC-signed with a key in the state dir), and the
+UI calls the API with it. API tokens keep working unchanged, for CI and machines.
+
+Every auth/OIDC setting also has an environment form (`NATIVE_OPS_ENABLE_AUTH`, `NATIVE_OPS_OIDC_*`;
+see `native-ops serve --help`), so the OIDC client secret can live in the root-only
+`/etc/native-ops/serve.env` instead of a unit file.
+
+```
+# omit --password to read one line from stdin (so it is not in the shell history)
+echo "a long enough password" | native-ops user create --state-dir /var/lib/native-ops --username sam --role deployer --name "Sam"
+native-ops user list   --state-dir /var/lib/native-ops
+native-ops user passwd --state-dir /var/lib/native-ops --username sam       # reads the new password from stdin
+native-ops user role   --state-dir /var/lib/native-ops --username sam --role admin
+native-ops user disable --state-dir /var/lib/native-ops --username sam
+```
+
+A running daemon honours user changes immediately (it notices the file change).
+
 ## Running it
 
 `deploy/systemd/native-ops-serve.service` is the unit CI/IaC installs (hardened; state in
@@ -247,6 +279,6 @@ with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the
 
 ## Roadmap
 
-Instance update/migrate/backup as jobs; OIDC sign-in for the UI (so an admin does not paste a
-token); and a live view of a running job. The API is versioned (`/v1`) so a separate fleet manager
+Instance update/migrate/backup as jobs; a live view of a running job; and per-user API tokens
+(now that people sign in, a token could be tied to the person who made it). The API is versioned (`/v1`) so a separate fleet manager
 can depend on it.

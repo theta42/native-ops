@@ -52,6 +52,12 @@ type Options struct {
 	// ImageBuild, with Jobs, enables POST /v1/images/build. A token with a scope may use it for an
 	// image its scope allows (see InstanceOps); one without a scope may build anything.
 	ImageBuild ImageBuildFunc
+	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
+	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
+	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.
+	Users    *UserStore
+	Sessions *Sessions
+	OIDC     *OIDCConfig
 	// JobDrain is how long a shutdown waits for a running apply to finish (default 5 minutes).
 	JobDrain  time.Duration
 	Version   string
@@ -73,6 +79,12 @@ type Server struct {
 func New(opts Options) (*Server, error) {
 	if opts.Tokens == nil || opts.Status == nil {
 		return nil, errors.New("server needs a token store and a status source")
+	}
+	if (opts.Users != nil || opts.OIDC != nil) && opts.Sessions == nil {
+		return nil, errors.New("local users and OIDC sign-in need a session signer")
+	}
+	if opts.OIDC != nil && opts.Users == nil {
+		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
 	}
 	if (opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil) && opts.Jobs == nil {
 		return nil, errors.New("apply, instances and image builds need a job store: every change to the host is a job with a record")
@@ -148,6 +160,21 @@ func (s *Server) authScoped(min Role, next http.HandlerFunc) http.Handler {
 
 func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A person signed in through the UI first: the session cookie carries a username and role, and a
+		// session is never scoped, so it may call any endpoint its role allows.
+		if s.opts.Sessions != nil {
+			if username, role, ok := s.opts.Sessions.FromRequest(r); ok {
+				if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
+					h.name, h.role = username, role
+				}
+				if !role.Allows(min) {
+					writeError(w, http.StatusForbidden, "forbidden", "this account's role cannot do that")
+					return
+				}
+				next(w, r)
+				return
+			}
+		}
 		t, ok := s.opts.Tokens.Verify(bearer(r))
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="native-ops"`)
@@ -266,6 +293,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.opts.Version})
 	})
+	if s.opts.Users != nil || s.opts.OIDC != nil {
+		mux.HandleFunc("GET /api/session", s.handleSession)
+		mux.HandleFunc("POST /api/login", s.handleLogin)
+		mux.HandleFunc("POST /api/logout", s.handleLogout)
+	}
+	if s.opts.OIDC != nil {
+		mux.HandleFunc("GET /auth/oidc", s.handleOIDCStart)
+		mux.HandleFunc("GET /auth/oidc/callback", s.handleOIDCCallback)
+	}
 	mux.Handle("GET /v1/whoami", s.authScoped(RoleViewer, func(w http.ResponseWriter, r *http.Request) {
 		h, _ := r.Context().Value(actorKey{}).(*actorHolder)
 		out := map[string]any{"name": h.name, "role": h.role, "version": s.opts.Version}
