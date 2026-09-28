@@ -10,6 +10,8 @@ let loadError = "";
 let role = "";      // the signed-in token's role (viewer, planner, deployer, admin)
 let extra = null;   // data for the current Plans / Jobs page: {path, data}
 let notice = null;  // {kind, text} shown above the page after an action
+let methods = { local_signin: false, oidc: false, oidc_label: "" }; // how this daemon lets people sign in
+let authUser = null; // {username, role} when signed in with a session cookie
 
 // h("div", {class: "card"}, child, "text", ...) -> element. Strings become text nodes.
 function h(tag, attrs, ...children) {
@@ -52,13 +54,24 @@ const empty = (text) => h("div", { class: "card-body text-muted" }, text);
 const badge = (text, kind) => ({ text, cls: `badge text-bg-${kind}` });
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-async function api(path, method) {
+async function api(path, method, body) {
+  // A signed-in session cookie rides along automatically; a pasted API token is sent as a bearer.
   const token = sessionStorage.getItem(KEY);
-  const res = await fetch(path, { method: method || "GET", headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, {
+    method: method || "GET",
+    headers,
+    credentials: "same-origin",
+    cache: "no-store",
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
   if (res.status === 401) throw Object.assign(new Error("unauthorized"), { auth: true });
   if (!res.ok) throw Object.assign(new Error(`${res.status} ${(await res.json().catch(() => ({}))).error || res.statusText}`), { status: res.status });
   return res.json();
 }
+
+const signedIn = () => !!(authUser || sessionStorage.getItem(KEY));
 
 const when = (t) => (t ? new Date(t).toLocaleString() : "");
 const short = (hash) => (hash || "").slice(0, 12);
@@ -70,22 +83,55 @@ const stateBadge = (state, kinds) => badge(state, kinds[state] || "secondary");
 // ---- views -----------------------------------------------------------------
 
 function loginView(message) {
-  const token = h("input", { type: "password", class: "form-control", placeholder: "nops_…", autocomplete: "off", spellcheck: "false", "aria-label": "API token", required: true });
   const error = h("div", { class: "alert alert-danger mt-3 mb-0", role: "alert", hidden: !message }, message || "");
-  const form = h("form", { autocomplete: "off" },
-    h("div", { class: "mb-3" },
-      h("div", { class: "input-group" }, h("span", { class: "input-group-text" }, icon("key")), token)),
-    h("p", { class: "text-muted small" }, "Paste an API token. It is kept for this browser tab only."),
-    h("button", { type: "submit", class: "btn btn-info" }, "Sign in"),
-    error);
-  form.addEventListener("submit", (e) => {
+  const blocks = [];
+  const staff = methods.local_signin || methods.oidc;
+
+  if (methods.local_signin) {
+    const username = h("input", { type: "text", class: "form-control", placeholder: "username", autocomplete: "username", "aria-label": "Username", required: true });
+    const password = h("input", { type: "password", class: "form-control", placeholder: "password", autocomplete: "current-password", "aria-label": "Password", required: true });
+    const form = h("form", { autocomplete: "on" },
+      h("div", { class: "mb-2" }, h("div", { class: "input-group" }, h("span", { class: "input-group-text" }, icon("user")), username)),
+      h("div", { class: "mb-2" }, h("div", { class: "input-group" }, h("span", { class: "input-group-text" }, icon("key")), password)),
+      h("button", { type: "submit", class: "btn btn-info w-100" }, "Sign in"));
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        const out = await api("/api/login", "POST", { username: username.value.trim(), password: password.value });
+        authUser = out.user || { username: username.value.trim() };
+        password.value = "";
+        start();
+      } catch (err) {
+        loadError = err.message;
+        render();
+      }
+    });
+    blocks.push(form);
+  }
+
+  if (methods.oidc) {
+    blocks.push(h("a", { href: "/auth/oidc", class: "btn btn-outline-secondary w-100" + (methods.local_signin ? " mt-2" : "") },
+      icon("right-to-bracket", "me-1"), "Sign in with " + (methods.oidc_label || "single sign-on")));
+  }
+
+  // A pasted API token still works: a machine-style credential, or an older daemon with no sign-in.
+  const token = h("input", { type: "password", class: "form-control form-control-sm", placeholder: "nops_…", autocomplete: "off", spellcheck: "false", "aria-label": "API token" });
+  const tokenForm = h("form", { autocomplete: "off" },
+    h("div", { class: "input-group input-group-sm" }, h("span", { class: "input-group-text" }, icon("key")), token,
+      h("button", { type: "submit", class: "btn btn-outline-secondary" }, "Use token")));
+  tokenForm.addEventListener("submit", (e) => {
     e.preventDefault();
+    if (!token.value.trim()) return;
     sessionStorage.setItem(KEY, token.value.trim());
     token.value = "";
     start();
   });
+  blocks.push(h("div", { class: "mt-3 pt-3 border-top" },
+    h("p", { class: "text-muted small mb-2" }, "Or paste an API token (kept for this browser tab only)."),
+    tokenForm));
+
   return h("div", { class: "row justify-content-center" },
-    h("div", { class: "col-md-4" }, card("lock", "API Token Login", h("div", { class: "card-body" }, form))));
+    h("div", { class: "col-md-4" }, card("lock", staff ? "Sign in" : "API Token Login", h("div", { class: "card-body" }, blocks, error))));
 }
 
 function warningsCard(s) {
@@ -265,21 +311,21 @@ async function act(method, path, okText) {
     await api(path, method);
     notice = { kind: "success", text: okText };
   } catch (e) {
-    if (e.auth) return signOut("That token was not accepted.");
+    if (e.auth) return signOut("Your sign-in is no longer valid.");
     notice = { kind: "danger", text: e.message };
   }
   await refresh();
 }
 
 function render() {
-  const signedIn = !!sessionStorage.getItem(KEY);
-  document.getElementById("top-nav").hidden = !signedIn;
-  document.getElementById("signout").hidden = !signedIn;
+  const signedInNow = signedIn();
+  document.getElementById("top-nav").hidden = !signedInNow;
+  document.getElementById("signout").hidden = !signedInNow;
   const route = currentRoute();
   for (const a of document.querySelectorAll(".top-nav a")) {
     a.classList.toggle("active", a.getAttribute("href") === "#" + route.nav);
   }
-  if (!signedIn) return view.replaceChildren(h("div", { class: "mt-4" }, loginView(loadError)));
+  if (!signedInNow) return view.replaceChildren(h("div", { class: "mt-4" }, loginView(loadError)));
 
   const parts = [];
   if (loadError) parts.push(h("div", { class: "alert alert-warning", role: "alert" }, loadError));
@@ -305,18 +351,31 @@ async function refresh() {
     else snapshot = await api("/v1/status");
     loadError = "";
   } catch (e) {
-    if (e.auth) return signOut("That token was not accepted.");
+    if (e.auth) return signOut("Your sign-in is no longer valid.");
     loadError = `Could not refresh: ${e.message}`;
   }
   render();
 }
 
-function start() {
+async function start() {
   loadError = "";
   snapshot = null;
   extra = null;
   notice = null;
+  // A failed OIDC sign-in comes back as ?error=...; show it once and drop it from the URL.
+  const authError = new URLSearchParams(location.search).get("error");
+  if (authError) {
+    loadError = authError;
+    history.replaceState(null, "", location.hash || "#/");
+  }
+  // How this daemon lets people sign in, and who we already are (a session cookie rides along).
+  try {
+    const s = await fetch("/api/session", { cache: "no-store", credentials: "same-origin" }).then((r) => r.json());
+    methods = s;
+    authUser = s.user || null;
+  } catch { /* an older daemon has no /api/session: token sign-in only */ }
   render();
+  if (!signedIn()) return;
   api("/v1/whoami").then((w) => {
     role = w.role;
     document.getElementById("who-text").textContent = `${w.name} (${w.role})`;
@@ -333,6 +392,8 @@ function start() {
 
 function signOut(message) {
   sessionStorage.removeItem(KEY);
+  authUser = null;
+  if (methods.local_signin || methods.oidc) api("/api/logout", "POST").catch(() => {});
   clearInterval(timer);
   snapshot = null;
   extra = null;
@@ -358,4 +419,5 @@ fetch("/healthz", { cache: "no-store" }).then((r) => r.json()).then((j) => {
   if (j.version) document.getElementById("version").textContent = `native-ops ${j.version}`;
 }).catch(() => {});
 
-if (sessionStorage.getItem(KEY)) start(); else render();
+// start() reads /api/session and shows the sign-in view when there is no session or token.
+start();
