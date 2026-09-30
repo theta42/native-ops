@@ -159,9 +159,18 @@ func TestImageBuildRejectsUnsafeInputBeforeReceivingAnything(t *testing.T) {
 
 func TestImageBuildScopedTokenOnlyBuildsWhatItsScopeAllows(t *testing.T) {
 	rig := newImageRig(t)
+	// The build runs as a job in its own goroutine, so wait for the allowed build to actually reach
+	// the builder before the refused one: otherwise the call count below races the goroutine (and, on
+	// a slow runner, is still 0 when the refused request has already been answered).
+	rig.b.started = make(chan struct{}, 1)
 	code, body := rig.build(t, rig.scoped, "?app=platform&ref=main", goodTree(t))
 	if code != 202 {
 		t.Fatalf("a scoped token building an allowed image: %d %s", code, body)
+	}
+	select {
+	case <-rig.b.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the allowed build never reached the builder")
 	}
 	code, body = rig.build(t, rig.scoped, "?app=gitea&ref=main", goodTree(t))
 	if code != 403 {
