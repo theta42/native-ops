@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/theta42/native-ops/pkg/backup"
@@ -456,16 +458,6 @@ func handleDNSCommand(ctx context.Context, args []string) {
 		log.Fatalf("Load fleet config: %v", err)
 	}
 
-	dom := *domain
-	if dom == "" {
-		dom = fleet.Domain
-	}
-
-	records := []provider.DNSRecord{
-		{Type: "A", Name: "@", Value: *targetIP},
-		{Type: "A", Name: "*", Value: *targetIP},
-	}
-
 	var dnsProv provider.DNSProvider
 	if fleet.DNSProvider == "digitalocean" || fleet.DNSProvider == "do" {
 		do, err := digitalocean.New("")
@@ -481,10 +473,45 @@ func handleDNSCommand(ctx context.Context, args []string) {
 		dnsProv = p
 	}
 
-	if err := dnsProv.SyncRecords(ctx, dom, records); err != nil {
-		log.Fatalf("DNS sync failed: %v", err)
+	// The computed apex + wildcard A for one domain, when a target IP is given (the original behaviour).
+	dom := *domain
+	if dom == "" {
+		dom = fleet.Domain
 	}
-	fmt.Printf("DNS records synced for %s (apex and wildcard -> %s)\n", dom, *targetIP)
+	if *targetIP != "" && dom != "" {
+		records := []provider.DNSRecord{
+			{Type: "A", Name: "@", Value: *targetIP},
+			{Type: "A", Name: "*", Value: *targetIP},
+		}
+		if err := dnsProv.SyncRecords(ctx, dom, records); err != nil {
+			log.Fatalf("DNS sync failed: %v", err)
+		}
+		fmt.Printf("DNS records synced for %s (apex and wildcard -> %s)\n", dom, *targetIP)
+	}
+
+	// Records declared in fleet.yml (`dns_records:`), grouped by zone. A sync only creates or updates;
+	// it never deletes a record it was not told about.
+	byZone, err := fleet.DNSRecordsByZone()
+	if err != nil {
+		log.Fatalf("dns_records: %v", err)
+	}
+	zones := make([]string, 0, len(byZone))
+	for z := range byZone {
+		zones = append(zones, z)
+	}
+	sort.Strings(zones)
+	for _, zone := range zones {
+		var records []provider.DNSRecord
+		var names []string
+		for _, r := range byZone[zone] {
+			records = append(records, provider.DNSRecord{Type: r.Type, Name: r.Name, Value: r.Value, TTL: r.TTL, Priority: r.Priority})
+			names = append(names, fmt.Sprintf("%s %s", r.Type, r.Name))
+		}
+		if err := dnsProv.SyncRecords(ctx, zone, records); err != nil {
+			log.Fatalf("DNS sync for %s failed: %v", zone, err)
+		}
+		fmt.Printf("DNS records synced for %s: %s\n", zone, strings.Join(names, ", "))
+	}
 }
 
 func loadBackupStore(configDir string) (*backup.Manager, error) {

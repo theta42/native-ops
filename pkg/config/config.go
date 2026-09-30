@@ -20,6 +20,39 @@ type FleetConfig struct {
 	Providers   ProvidersConfig       `yaml:"providers"`
 	Hosts       map[string]HostConfig `yaml:"hosts"`
 	Backup      *BackupConfig         `yaml:"backup,omitempty"`
+	// DNSRecords are records kept in sync by `dns sync` (and reconcile): arbitrary A/AAAA/CNAME/MX/TXT
+	// beyond the computed apex/wildcard A. Each names its own zone, so a fleet that spans zones (and
+	// leaves `domain` empty) can still declare records — e.g. an MX for an intake domain.
+	DNSRecords []DNSRecordConfig `yaml:"dns_records,omitempty"`
+}
+
+// DNSRecordConfig is one record declared in fleet.yml. Name is zone-relative ("@", "*", "inbound");
+// Value is the record's data (a hostname for MX/CNAME, an address for A/AAAA, text for TXT); Priority
+// applies to MX. TTL is optional (the provider defaults it).
+type DNSRecordConfig struct {
+	Zone     string `yaml:"zone,omitempty"` // the zone; empty falls back to fleet.domain
+	Type     string `yaml:"type"`
+	Name     string `yaml:"name"`
+	Value    string `yaml:"value"`
+	TTL      int    `yaml:"ttl,omitempty"`
+	Priority int    `yaml:"priority,omitempty"`
+}
+
+// DNSRecordsByZone groups the declared records by zone (fleet.domain when a record omits it). It errors
+// when a record has no zone at all, so a typo cannot silently sync into the wrong place.
+func (f *FleetConfig) DNSRecordsByZone() (map[string][]DNSRecordConfig, error) {
+	out := map[string][]DNSRecordConfig{}
+	for _, r := range f.DNSRecords {
+		zone := strings.TrimSpace(r.Zone)
+		if zone == "" {
+			zone = strings.TrimSpace(f.Domain)
+		}
+		if zone == "" {
+			return nil, fmt.Errorf("dns record %s %s has no zone and fleet.domain is empty", r.Type, r.Name)
+		}
+		out[zone] = append(out[zone], r)
+	}
+	return out, nil
 }
 
 // BackupConfig configures off-host volume backups to any S3-compatible
