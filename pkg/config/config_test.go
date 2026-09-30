@@ -203,3 +203,26 @@ func TestPortForwardDeviceProps(t *testing.T) {
 		}
 	}
 }
+
+func TestDNSRecordsByZone(t *testing.T) {
+	f := &FleetConfig{
+		Domain: "example.com",
+		DNSRecords: []DNSRecordConfig{
+			{Type: "MX", Name: "inbound", Value: "inbound.example.com.", Priority: 10}, // zone falls back to fleet.domain
+			{Zone: "opsavor.work", Type: "MX", Name: "inbound", Value: "inbound.opsavor.work.", Priority: 10},
+		},
+	}
+	by, err := f.DNSRecordsByZone()
+	if err != nil {
+		t.Fatalf("DNSRecordsByZone: %v", err)
+	}
+	if len(by["example.com"]) != 1 || len(by["opsavor.work"]) != 1 {
+		t.Fatalf("unexpected zones: %+v", by)
+	}
+	if by["opsavor.work"][0].Priority != 10 {
+		t.Errorf("priority not carried: %+v", by["opsavor.work"][0])
+	}
+	if _, err := (&FleetConfig{DNSRecords: []DNSRecordConfig{{Type: "MX", Name: "inbound", Value: "x."}}}).DNSRecordsByZone(); err == nil {
+		t.Fatal("a record with no zone and no fleet.domain must be refused")
+	}
+}

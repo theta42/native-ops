@@ -227,6 +227,15 @@ providers:
   proxmox:
     endpoint: https://pve.example.com:8006
     node: pve-01
+
+# Records kept in sync by `native-ops dns sync` (create or update, never delete),
+# beyond the computed apex + wildcard A. Each names its own zone.
+dns_records:
+  - zone: example.com
+    type: MX
+    name: inbound          # inbound.example.com
+    value: inbound.example.com.   # the mail host
+    priority: 10
 ```
 
 ### `services/gitea/service.yml`
