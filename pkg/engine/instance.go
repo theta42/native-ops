@@ -131,6 +131,13 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		}
 	}
 
+	// 4b. Publish the raw host ports the template declares (rare: the edge carries HTTP; this is for a
+	// protocol it cannot, e.g. git-over-SSH). Runs on a resume too, so a forward added to the manifest
+	// reaches an instance that already exists.
+	if _, err := ensureForwards(ctx, m.incus, p.Name, p.Template.Forwards); err != nil {
+		return "", err
+	}
+
 	// 5. Build and converge env (declared keys are set, other keys are preserved)
 	env := make(map[string]string)
 	for k, v := range p.Template.EnvTemplate {

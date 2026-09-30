@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -151,6 +152,71 @@ type RoutingConfig struct {
 	ExtraDirectives []string `yaml:"extra_directives,omitempty"`
 }
 
+// PortForward is a host->instance proxy device: a raw TCP/UDP port published on the host straight into
+// the container, for a protocol the edge cannot carry (git-over-SSH; a service terminating its own
+// mail). It is the declarative form of `incus config device add <instance> <name> proxy ...`, so an
+// immutable replace re-creates it instead of it living only in a one-time script. `listen` is the host
+// side, `connect` the instance side; each is "tcp:ADDR:PORT" or "ADDR:PORT" (the protocol then comes
+// from `protocol`).
+type PortForward struct {
+	Name     string `yaml:"name"`               // device name, e.g. "ssh-git"
+	Listen   string `yaml:"listen"`             // e.g. "tcp:0.0.0.0:2222"
+	Connect  string `yaml:"connect"`            // e.g. "tcp:127.0.0.1:2222"
+	Protocol string `yaml:"protocol,omitempty"` // tcp (default) or udp
+}
+
+var (
+	deviceNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	proxyAddrRe  = regexp.MustCompile(`^[A-Za-z0-9_.:\[\]/-]+$`)
+)
+
+// DeviceProps renders a forward as the Incus proxy-device properties it maps to (`type`, `listen`,
+// `connect`), normalizing each address to carry its protocol and refusing anything a shell could
+// mistake. It is pure, so a manifest can be validated without a host.
+func (f PortForward) DeviceProps() (map[string]string, error) {
+	if !deviceNameRe.MatchString(f.Name) {
+		return nil, fmt.Errorf("forward has no usable name (%q)", f.Name)
+	}
+	protocol := strings.ToLower(f.Protocol)
+	if protocol == "" {
+		protocol = "tcp"
+	}
+	if protocol != "tcp" && protocol != "udp" {
+		return nil, fmt.Errorf("forward %s: protocol must be tcp or udp, not %q", f.Name, f.Protocol)
+	}
+	listen, err := normalizeProxyAddr(f.Listen, protocol)
+	if err != nil {
+		return nil, fmt.Errorf("forward %s listen: %w", f.Name, err)
+	}
+	connect, err := normalizeProxyAddr(f.Connect, protocol)
+	if err != nil {
+		return nil, fmt.Errorf("forward %s connect: %w", f.Name, err)
+	}
+	return map[string]string{"type": "proxy", "listen": listen, "connect": connect}, nil
+}
+
+// normalizeProxyAddr prefixes addr with protocol unless it already names one ("tcp:"/"udp:").
+func normalizeProxyAddr(addr, protocol string) (string, error) {
+	if addr == "" {
+		return "", fmt.Errorf("an address is required")
+	}
+	first := addr
+	if i := strings.Index(addr, ":"); i >= 0 {
+		first = addr[:i]
+	}
+	switch strings.ToLower(first) {
+	case "tcp", "udp":
+	case "":
+		return "", fmt.Errorf("invalid address %q", addr)
+	default:
+		addr = protocol + ":" + addr
+	}
+	if !proxyAddrRe.MatchString(addr) {
+		return "", fmt.Errorf("invalid address %q", addr)
+	}
+	return addr, nil
+}
+
 // ServiceConfig defines a static infrastructure service (e.g. gitea, plane, edge).
 type ServiceConfig struct {
 	Name        string            `yaml:"name"`
@@ -163,6 +229,7 @@ type ServiceConfig struct {
 	Limits      map[string]string `yaml:"limits,omitempty"` // e.g. limits.cpu: 2
 	HealthCheck HealthCheckConfig `yaml:"healthcheck,omitempty"`
 	Routing     *RoutingConfig    `yaml:"routing,omitempty"`
+	Forwards    []PortForward     `yaml:"forwards,omitempty"`
 	Hooks       ServiceHooks      `yaml:"hooks,omitempty"`
 }
 
@@ -184,8 +251,9 @@ type TemplateConfig struct {
 	HealthCheck    HealthCheckConfig `yaml:"healthcheck,omitempty"`
 	RoutingPattern string            `yaml:"routing_pattern,omitempty"` // e.g. "{slug}.example.com"
 	// RoutingDirectives are extra Caddy directives for the route (for example "import strip-forged-identity").
-	RoutingDirectives []string     `yaml:"routing_directives,omitempty"`
-	Hooks             ServiceHooks `yaml:"hooks,omitempty"`
+	RoutingDirectives []string      `yaml:"routing_directives,omitempty"`
+	Forwards          []PortForward `yaml:"forwards,omitempty"`
+	Hooks             ServiceHooks  `yaml:"hooks,omitempty"`
 }
 
 // HostSpec defines the parameters to create or resize a host VM / Droplet.

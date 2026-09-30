@@ -60,6 +60,10 @@ healthcheck:
 routing:
   domain: git.example.com
   upstream_port: 3000
+forwards:
+  - name: ssh-git
+    listen: tcp:0.0.0.0:2222
+    connect: tcp:127.0.0.1:2222
 `
 	svcPath := filepath.Join(tmpDir, "service.yml")
 	if err := os.WriteFile(svcPath, []byte(svcYAML), 0644); err != nil {
@@ -79,6 +83,9 @@ routing:
 	}
 	if svc.Routing.Domain != "git.example.com" {
 		t.Errorf("expected routing domain 'git.example.com', got '%s'", svc.Routing.Domain)
+	}
+	if len(svc.Forwards) != 1 || svc.Forwards[0].Name != "ssh-git" || svc.Forwards[0].Listen != "tcp:0.0.0.0:2222" {
+		t.Errorf("unexpected forwards: %+v", svc.Forwards)
 	}
 }
 
@@ -167,5 +174,28 @@ func TestManifestPathsCannotLeaveTheConfigDirectory(t *testing.T) {
 	os.WriteFile(f, []byte("name: web\nimage: x\nenv_file: env\n"), 0o644)
 	if _, err := LoadServiceConfig(f); err != nil {
 		t.Fatalf("an env_file inside is fine: %v", err)
+	}
+}
+
+func TestPortForwardDeviceProps(t *testing.T) {
+	props, err := (PortForward{Name: "ssh-git", Listen: "0.0.0.0:2222", Connect: "127.0.0.1:2222"}).DeviceProps()
+	if err != nil {
+		t.Fatalf("DeviceProps: %v", err)
+	}
+	if props["type"] != "proxy" || props["listen"] != "tcp:0.0.0.0:2222" || props["connect"] != "tcp:127.0.0.1:2222" {
+		t.Errorf("unexpected props: %+v", props)
+	}
+	if p, err := (PortForward{Name: "dns", Protocol: "udp", Listen: "0.0.0.0:53", Connect: "127.0.0.1:53"}).DeviceProps(); err != nil || p["listen"] != "udp:0.0.0.0:53" {
+		t.Errorf("udp forward: %v %+v", err, p)
+	}
+	for _, bad := range []PortForward{
+		{Name: "bad name", Listen: "0.0.0.0:1", Connect: "127.0.0.1:1"},
+		{Name: "x", Listen: "0.0.0.0:1; rm -rf /", Connect: "127.0.0.1:1"},
+		{Name: "x", Protocol: "sctp", Listen: "0.0.0.0:1", Connect: "127.0.0.1:1"},
+		{Name: "x", Listen: "", Connect: "127.0.0.1:1"},
+	} {
+		if _, err := bad.DeviceProps(); err == nil {
+			t.Errorf("expected %+v to be refused", bad)
+		}
 	}
 }

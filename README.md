@@ -250,6 +250,12 @@ healthcheck:
 routing:
   domain: git.example.com
   upstream_port: 3000
+# Raw host ports into the container, for a protocol the edge cannot carry
+# (git-over-SSH). Converged on every deploy, so an immutable replace keeps them.
+forwards:
+  - name: ssh-git
+    listen: tcp:0.0.0.0:2222    # host side
+    connect: tcp:127.0.0.1:2222 # instance side
 ```
 
 ### `templates/platform/template.yml`
