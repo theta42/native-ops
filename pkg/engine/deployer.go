@@ -313,7 +313,7 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 	// Publish the raw host ports the service declares (a protocol the edge cannot carry, e.g.
 	// git-over-SSH).
 	for _, fwd := range svc.Forwards {
-		d.log("    Publishing host port %s (%s -> %s)...\n", fwd.Name, fwd.Listen, fwd.Connect)
+		d.log("    Publishing host port %s (%s -> %s)...\n", fwd.Name, fwd.Listen, fwd.Target)
 	}
 	if _, err := ensureForwards(ctx, d.incus, svc.Name, svc.Forwards); err != nil {
 		return err

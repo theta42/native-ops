@@ -45,7 +45,7 @@ func (f *forwardExec) Close() error                                             
 func TestEnsureForwardsAddsMissingDevice(t *testing.T) {
 	f := &forwardExec{devices: map[string]map[string]string{}}
 	changed, err := ensureForwards(context.Background(), incus.NewClient(f), "gitea", []config.PortForward{
-		{Name: "ssh-git", Listen: "0.0.0.0:2222", Connect: "127.0.0.1:2222"},
+		{Name: "ssh-git", Listen: "0.0.0.0:2222", Target: "2222"},
 	})
 	if err != nil {
 		t.Fatalf("ensureForwards: %v", err)
@@ -65,7 +65,7 @@ func TestEnsureForwardsLeavesMatchingDeviceAlone(t *testing.T) {
 		"ssh-git": {"type": "proxy", "listen": "tcp:0.0.0.0:2222", "connect": "tcp:127.0.0.1:2222"},
 	}}
 	changed, err := ensureForwards(context.Background(), incus.NewClient(f), "gitea", []config.PortForward{
-		{Name: "ssh-git", Listen: "tcp:0.0.0.0:2222", Connect: "tcp:127.0.0.1:2222"},
+		{Name: "ssh-git", Listen: "0.0.0.0:2222", Target: "2222"},
 	})
 	if err != nil {
 		t.Fatalf("ensureForwards: %v", err)
@@ -83,7 +83,7 @@ func TestEnsureForwardsConvergesDriftedDevice(t *testing.T) {
 		"ssh-git": {"type": "proxy", "listen": "tcp:0.0.0.0:2233", "connect": "tcp:127.0.0.1:2222"},
 	}}
 	changed, err := ensureForwards(context.Background(), incus.NewClient(f), "gitea", []config.PortForward{
-		{Name: "ssh-git", Listen: "0.0.0.0:2222", Connect: "127.0.0.1:2222"},
+		{Name: "ssh-git", Listen: "0.0.0.0:2222", Target: "2222"},
 	})
 	if err != nil {
 		t.Fatalf("ensureForwards: %v", err)
