@@ -310,6 +310,15 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		}
 	}
 
+	// Publish the raw host ports the service declares (a protocol the edge cannot carry, e.g.
+	// git-over-SSH).
+	for _, fwd := range svc.Forwards {
+		d.log("    Publishing host port %s (%s -> %s)...\n", fwd.Name, fwd.Listen, fwd.Target)
+	}
+	if _, err := ensureForwards(ctx, d.incus, svc.Name, svc.Forwards); err != nil {
+		return err
+	}
+
 	if svc.Hooks.ContainerInit != "" {
 		d.log("    Running container_init hook for %s...\n", svc.Name)
 		if err := d.runContainerHook(ctx, svc.Name, hookScript(configDir, svc.Name, svc.Hooks.ContainerInit)); err != nil {
@@ -535,6 +544,15 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 				return err
 			}
 		}
+	}
+
+	// Re-publish the declared host ports, so a forward added to the manifest (or one lost with a
+	// replaced container) is created without a rebuild.
+	if fwChanged, err := ensureForwards(ctx, d.incus, svc.Name, svc.Forwards); err != nil {
+		return err
+	} else if fwChanged {
+		d.log("    Published host ports for %s\n", svc.Name)
+		changed = true
 	}
 
 	if err := d.publishRoute(ctx, svc, ""); err != nil {
