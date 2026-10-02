@@ -101,7 +101,8 @@ Usage:
 
 GitOps Commands:
   validate         Validate manifests and show dry-run plan (used in PRs)
-  reconcile        End-to-end GitOps cluster reconciliation (Level 0 + DNS + Level 1)
+  reconcile        Provision the fleet's hosts, sync DNS and prepare Incus (services: via the daemon;
+                   --deploy-services deploys them directly, bypassing approval)
 
 Remote daemon (runs on the host it manages; deployed by IaC, driven by CI over HTTPS):
   status           Read-only view of the host's instances, volumes and images (--json)
@@ -142,10 +143,12 @@ Core Commands:
 func handleValidateCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("validate", flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	deployServices := flags.Bool("deploy-services", false, "Also deploy every service directly over SSH (break-glass: bypasses the daemon's plan approval, host lock and job record). Normally services go through `native-ops remote plan` / `apply`")
 	_ = flags.Parse(args)
 
 	exec := remote.NewLocalExecutor()
 	rec := engine.NewReconciler(*configDir, exec)
+	rec.DeployServices = *deployServices
 
 	summary, err := rec.Validate(ctx)
 	if err != nil {
@@ -163,10 +166,12 @@ func handleValidateCommand(ctx context.Context, args []string) {
 func handleReconcileCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("reconcile", flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	deployServices := flags.Bool("deploy-services", false, "Also deploy every service directly over SSH (break-glass: bypasses the daemon's plan approval, host lock and job record). Normally services go through `native-ops remote plan` / `apply`")
 	_ = flags.Parse(args)
 
 	exec := remote.NewLocalExecutor()
 	rec := engine.NewReconciler(*configDir, exec)
+	rec.DeployServices = *deployServices
 
 	if err := rec.Reconcile(ctx); err != nil {
 		log.Fatalf("Reconciliation failed: %v", err)
