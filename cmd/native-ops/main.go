@@ -21,6 +21,7 @@ import (
 	"github.com/theta42/native-ops/pkg/provider/plugin"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/s3"
+	"github.com/theta42/native-ops/pkg/server"
 )
 
 var Version = "v1.0.0"
@@ -183,6 +184,10 @@ func handleHostCommand(ctx context.Context, args []string) {
 		name := flags.String("name", "", "Host name")
 		size := flags.String("size", "s-4vcpu-8gb", "Host size slug or specs")
 		region := flags.String("region", "nyc1", "Provider region")
+		daemonVersion := flags.String("daemon-version", "", "Install this native-ops release as the host's daemon from cloud-init (e.g. v1.54.0); needs --daemon-sha256 and a bootstrap token")
+		daemonSHA := flags.String("daemon-sha256", "", "SHA-256 of the release's linux tarball (from its checksums.txt)")
+		daemonArch := flags.String("daemon-arch", "amd64", "Architecture of the daemon release: amd64 or arm64")
+		daemonFlags := flags.String("daemon-flags", "", "Extra `native-ops serve` flags for the daemon, e.g. '--enable-apply --enable-edge-apply'")
 		_ = flags.Parse(args[1:])
 
 		if *name == "" {
@@ -196,9 +201,31 @@ func handleHostCommand(ctx context.Context, args []string) {
 			Region:   *region,
 		}
 
+		_, pub, generated := engine.LoadSSHCredentials()
+		if *daemonVersion != "" {
+			// The token stays with the caller (a CI secret); the host only learns its hash.
+			sum := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
+			if tok := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"); tok != "" {
+				if !server.ValidSecretFormat(tok) {
+					log.Fatal("Error: NATIVE_OPS_BOOTSTRAP_TOKEN must look like nops_ followed by at least 32 characters")
+				}
+				sum = server.HashSecret(tok)
+			}
+			if sum == "" {
+				log.Fatal("Error: --daemon-version needs NATIVE_OPS_BOOTSTRAP_TOKEN (or NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256) in the environment: the admin token CI will use to set the daemon up")
+			}
+			ud, err := engine.GenerateCloudInitUserDataWith(pub, &engine.DaemonInstall{
+				Version: *daemonVersion, SHA256: strings.ToLower(*daemonSHA), Arch: *daemonArch,
+				BootstrapTokenSHA256: strings.ToLower(sum), ServeFlags: *daemonFlags,
+			})
+			if err != nil {
+				log.Fatalf("Error: %v", err)
+			}
+			spec.UserData = ud
+		}
+
 		// Register the operator's SSH key first, so the host can be logged in to. A key
 		// generated on the fly is refused: it would be lost when this command exits.
-		_, pub, generated := engine.LoadSSHCredentials()
 		if err := hm.PrepareAccess(ctx, &spec, pub, generated, false); err != nil {
 			log.Fatalf("Host creation failed: %v", err)
 		}
@@ -209,6 +236,9 @@ func handleHostCommand(ctx context.Context, args []string) {
 		}
 		fmt.Printf("Created host %s (%s) at IP: %s\n", host.Name, host.ID, host.PublicIP)
 		fmt.Printf("Log in with the private key whose public half was registered: ssh root@%s\n", host.PublicIP)
+		if *daemonVersion != "" {
+			fmt.Printf("The native-ops daemon %s is being installed by cloud-init; it listens on 127.0.0.1:8686 (put the edge in front of it) and accepts the bootstrap token.\n", *daemonVersion)
+		}
 
 	case "destroy":
 		providerName := flags.String("provider", "digitalocean", "Provider (digitalocean, proxmox)")

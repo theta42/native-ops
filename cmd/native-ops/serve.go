@@ -149,10 +149,12 @@ func handleServeCommand(ctx context.Context, args []string) {
 		EnableAuth:       *enableAuth,
 		OIDC: server.OIDCSettings{Issuer: *oidcIssuer, ClientID: *oidcClientID, ClientSecret: *oidcClientSecret,
 			RedirectURL: *oidcRedirectURL, AllowedDomain: *oidcAllowedDomain, Role: server.Role(*oidcRole), Label: *oidcLabel},
-		EdgeContainer: *edgeContainer,
-		DNS:           dnsProv,
-		DNSDomains:    splitList(*dnsDomains),
-		Exec:             remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
+		EdgeContainer:        *edgeContainer,
+		DNS:                  dnsProv,
+		DNSDomains:           splitList(*dnsDomains),
+		Exec:                 remote.NewLocalExecutor(),
+		BootstrapToken:       os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
+		BootstrapTokenSHA256: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256"),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -178,6 +180,7 @@ type daemonConfig struct {
 	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
+	BootstrapTokenSHA256 string // the hex SHA-256 of the bootstrap token, for a host whose env may be read by others (user-data)
 	// EnableAuth serves local sign-in and session cookies for the UI. OIDC (an Issuer) adds generic
 	// OpenID Connect sign-in; either implies a user store and a session signer.
 	EnableAuth bool
@@ -201,6 +204,11 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			return nil, nil, fmt.Errorf("NATIVE_OPS_BOOTSTRAP_TOKEN: %w", err)
 		}
 		log.Printf("bootstrap admin token loaded from NATIVE_OPS_BOOTSTRAP_TOKEN")
+	} else if cfg.BootstrapTokenSHA256 != "" {
+		if err := tokens.SetBootstrapHash(cfg.BootstrapTokenSHA256); err != nil {
+			return nil, nil, fmt.Errorf("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256: %w", err)
+		}
+		log.Printf("bootstrap admin token loaded from NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
 	}
 	audit, err := server.OpenAudit(filepath.Join(cfg.StateDir, "audit.log"))
 	if err != nil {
@@ -223,7 +231,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) {
 			return status.CollectFull(ctx, cfg.Exec, status.Options{Pool: cfg.Pool, EdgeContainer: cfg.EdgeContainer, DNS: cfg.DNS, DNSDomains: cfg.DNSDomains})
 		},
-		Plan:   planSource(cfg.Exec, key),
+		Plan: planSource(cfg.Exec, key),
 	}
 	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
@@ -299,7 +307,8 @@ func envBool(key string) bool {
 	return false
 }
 
-func splitList(s string) []string {	var out []string
+func splitList(s string) []string {
+	var out []string
 	for _, p := range strings.Split(s, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
