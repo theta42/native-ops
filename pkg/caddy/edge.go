@@ -138,6 +138,55 @@ func (e *EdgeManager) EnsureBaseCaddyfile(ctx context.Context) error {
 	return e.incus.PushFile(ctx, e.edgeContainer, caddyfilePath, BaseCaddyfile(e.Email), "0644")
 }
 
+// SyncCaddyfile makes the edge's main Caddyfile exactly content: it creates one
+// when the edge has none, replaces one that differs, and does nothing when the
+// file already matches. It is how the edge's routes and TLS are applied from the
+// configuration repo, rather than by a shell on the host.
+//
+// content must import the sites directory (published instance routes live
+// there), and it is validated before the reload. If Caddy rejects it -- at
+// validation or at reload -- the previous Caddyfile is put back, so a bad file
+// can never take the edge down. changed reports whether the edge was touched.
+func (e *EdgeManager) SyncCaddyfile(ctx context.Context, content string) (changed bool, err error) {
+	if strings.TrimSpace(content) == "" {
+		return false, fmt.Errorf("refusing to apply an empty Caddyfile")
+	}
+	if !strings.Contains(content, "import "+sitesDir) {
+		return false, fmt.Errorf("the Caddyfile does not import %s/*.caddy, so published sites would never be served; add that import line", sitesDir)
+	}
+	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, caddyfilePath)
+	if err != nil {
+		return false, err
+	}
+	if hadPrev && prev == content {
+		return false, nil
+	}
+	if err := e.incus.PushFile(ctx, e.edgeContainer, caddyfilePath, content, "0644"); err != nil {
+		return false, fmt.Errorf("write %s to %s: %w", caddyfilePath, e.edgeContainer, err)
+	}
+	if err := e.validate(ctx); err != nil {
+		e.restoreCaddyfile(ctx, prev, hadPrev)
+		return false, fmt.Errorf("caddy rejected the new Caddyfile; the previous one was restored: %w", err)
+	}
+	if err := e.Reload(ctx); err != nil {
+		e.restoreCaddyfile(ctx, prev, hadPrev)
+		return false, fmt.Errorf("reloading caddy failed; the previous Caddyfile was restored: %w", err)
+	}
+	return true, nil
+}
+
+// restoreCaddyfile puts back the previous main Caddyfile (or removes the file
+// when there was none) after a sync Caddy rejected, so the edge is never left
+// holding a config that did not load.
+func (e *EdgeManager) restoreCaddyfile(ctx context.Context, prev string, hadPrev bool) {
+	if hadPrev {
+		_ = e.incus.PushFile(ctx, e.edgeContainer, caddyfilePath, prev, "0644")
+		_ = e.Reload(ctx)
+		return
+	}
+	_, _ = e.exec.Run(ctx, fmt.Sprintf("incus exec %s -- rm -f %s", incus.ShQuote(e.edgeContainer), incus.ShQuote(caddyfilePath)))
+}
+
 func (e *EdgeManager) validate(ctx context.Context) error {
 	cmd := fmt.Sprintf("incus exec %s -- caddy validate --config %s --adapter caddyfile", incus.ShQuote(e.edgeContainer), caddyfilePath)
 	if _, err := e.exec.Run(ctx, cmd); err != nil {

@@ -110,6 +110,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	instanceProfiles := flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
 	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
 	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
+	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Serve POST /v1/edge/apply: apply the config repo's edge/Caddyfile to the edge container (validated, with rollback). Changes the host, so it runs as a job")
 	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
 	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
 	// unprivileged user on the host could read.
@@ -144,6 +145,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
 		EnableImageBuild: *enableImageBuild,
+		EnableEdgeApply:  *enableEdgeApply,
 		EnableAuth:       *enableAuth,
 		OIDC: server.OIDCSettings{Issuer: *oidcIssuer, ClientID: *oidcClientID, ClientSecret: *oidcClientSecret,
 			RedirectURL: *oidcRedirectURL, AllowedDomain: *oidcAllowedDomain, Role: server.Role(*oidcRole), Label: *oidcLabel},
@@ -172,6 +174,7 @@ type daemonConfig struct {
 	EnableInstances      bool
 	InstancePolicy       engine.InstancePolicy
 	EnableImageBuild     bool
+	EnableEdgeApply      bool
 	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
@@ -222,7 +225,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		},
 		Plan:   planSource(cfg.Exec, key),
 	}
-	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild {
+	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
 		if err != nil {
 			audit.Close()
@@ -237,6 +240,9 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		if cfg.EnableImageBuild {
 			opts.ImageBuild = imageBuildSource(cfg.Exec)
+		}
+		if cfg.EnableEdgeApply {
+			opts.EdgeApply = edgeApplySource(cfg.Exec, cfg.EdgeContainer)
 		}
 	}
 	if cfg.EnableAuth || cfg.OIDC.Issuer != "" {
@@ -322,6 +328,15 @@ func applySource(exec remote.Executor) server.ApplyFunc {
 func imageBuildSource(exec remote.Executor) server.ImageBuildFunc {
 	return func(ctx context.Context, dir, app, ref string, logf func(string, ...any)) error {
 		return engine.BuildImage(ctx, exec, dir, app, ref, logf)
+	}
+}
+
+// edgeApplySource is what POST /v1/edge/apply applies with: the uploaded tree's
+// edge/Caddyfile to the edge container, validated and reloaded with rollback.
+func edgeApplySource(exec remote.Executor, edgeContainer string) server.EdgeApplyFunc {
+	return func(ctx context.Context, dir string, logf func(string, ...any)) error {
+		logf("applying edge config from %s", dir)
+		return engine.ApplyEdgeConfig(ctx, exec, dir, edgeContainer)
 	}
 }
 

@@ -52,6 +52,10 @@ type Options struct {
 	// ImageBuild, with Jobs, enables POST /v1/images/build. A token with a scope may use it for an
 	// image its scope allows (see InstanceOps); one without a scope may build anything.
 	ImageBuild ImageBuildFunc
+	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
+	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
+	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
+	EdgeApply EdgeApplyFunc
 	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
 	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
 	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.
@@ -86,14 +90,14 @@ func New(opts Options) (*Server, error) {
 	if opts.OIDC != nil && opts.Users == nil {
 		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
 	}
-	if (opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil) && opts.Jobs == nil {
-		return nil, errors.New("apply, instances and image builds need a job store: every change to the host is a job with a record")
+	if (opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil) && opts.Jobs == nil {
+		return nil, errors.New("apply, instances, image builds and edge applies need a job store: every change to the host is a job with a record")
 	}
 	if opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil) {
 		return nil, errors.New("apply needs a plan source and a plan store (approvals) to check the plan against")
 	}
-	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil && opts.ImageBuild == nil {
-		return nil, errors.New("a job store is only useful with apply, instances or image builds")
+	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil && opts.ImageBuild == nil && opts.EdgeApply == nil {
+		return nil, errors.New("a job store is only useful with apply, instances, image builds or edge applies")
 	}
 	if opts.JobDrain <= 0 {
 		opts.JobDrain = 5 * time.Minute
@@ -346,6 +350,9 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.ImageBuild != nil {
 		mux.Handle("POST /v1/images/build", s.authScoped(RoleDeployer, s.handleImageBuild))
+	}
+	if s.opts.EdgeApply != nil {
+		mux.Handle("POST /v1/edge/apply", s.auth(RoleDeployer, s.handleEdgeApply))
 	}
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)
