@@ -448,6 +448,9 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
   recipe (`scripts/` + `images/`) an admin approved; a scoped token can touch only its own instances.
 - **Maintenance is CI-scheduled.** Backups, retention and DNS sync are daemon jobs a scheduled
   pipeline starts (`native-ops remote backup --prune`, `dns-sync`).
+- **Credentials are entered in git, kept on the host.** The daemon's own credentials (DNS token, backup
+  keys, OIDC secret) go into the git server's secret store; CI pushes them to the daemon
+  (`native-ops remote secret-sync`), which keeps them on the host. Nobody logs in to put them there.
 
 See [docs/daemon.md](docs/daemon.md).
 

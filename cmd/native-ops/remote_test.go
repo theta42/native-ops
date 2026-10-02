@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -190,5 +191,30 @@ func TestRemoteSecretSyncPushesTheNamedVariables(t *testing.T) {
 	}
 	if _, ok := store.Get("BACKUP_S3_SECRET_KEY"); ok {
 		t.Fatal("an empty variable must not be pushed")
+	}
+}
+
+func TestEveryServeFlagIsInTheConfigurationReference(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "daemon.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(src), "func handleServeCommand")
+	end := strings.Index(string(src)[start:], "\n}\n")
+	body := string(src)[start : start+end]
+	re := regexp.MustCompile(`flags\.(?:String|Bool|Int|Duration)\("([a-z-]+)"`)
+	flags := re.FindAllStringSubmatch(body, -1)
+	flags = append(flags, []string{"", "state-dir"})
+	if len(flags) < 20 {
+		t.Fatalf("found only %d serve flags; the test's pattern is out of date", len(flags))
+	}
+	for _, m := range flags {
+		if !strings.Contains(string(doc), "| `--"+m[1]+"` |") {
+			t.Errorf("--%s is not in docs/daemon.md's configuration reference", m[1])
+		}
 	}
 }

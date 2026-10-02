@@ -24,8 +24,8 @@ jobs:
           tar -xzf native-ops.tgz
           install -D -m 0755 "native-ops_${NATIVE_OPS_VERSION}_linux_amd64" "$HOME/.local/bin/native-ops"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      # Needs the daemon started with --enable-backup / --enable-dns-sync, and the object store's
-      # and DNS provider's keys in its environment (/etc/native-ops/serve.env), not here.
+      # Needs the daemon started with --enable-backup / --enable-dns-sync, and the credentials and pins
+      # synced to it from the git server's secrets (native-ops remote secret-sync; see docs/daemon.md).
       - name: Back up volumes and apply retention
         env:
           NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_DEPLOY_TOKEN }}

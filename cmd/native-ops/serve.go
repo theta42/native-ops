@@ -90,7 +90,7 @@ func printStatus(s *status.Snapshot) {
 }
 
 func stateDirFlag(flags *flag.FlagSet) *string {
-	return flags.String("state-dir", "/var/lib/native-ops", "Directory for the daemon's tokens and audit log")
+	return flags.String("state-dir", "/var/lib/native-ops", "Directory for the daemon's state: tokens, users, secrets, plans, jobs, recipes, keys and the audit log")
 }
 
 func openStateDir(dir string) string {
@@ -107,30 +107,30 @@ func handleServeCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := flags.String("addr", "127.0.0.1:8686", "Listen address (put TLS in front of it, e.g. the Caddy edge)")
 	pool := flags.String("pool", "default", "Storage pool holding the data volumes")
-	enableApply := flags.Bool("enable-apply", false, "Serve POST /v1/apply and /v1/jobs (off by default: without it the daemon can read and plan, never change). An apply also needs an admin's approval of the plan")
+	enableApply := flags.Bool("enable-apply", false, "Serve POST /v1/apply (off by default: without it the daemon can read and plan, never change). An apply also needs an admin's approval of the plan")
 	approvalTTL := flags.Duration("approval-ttl", time.Hour, "How long an admin's approval of a plan lasts")
 	enableInstances := flags.Bool("enable-instances", false, "Serve the tenant-instance endpoints (PUT/DELETE /v1/instances/{name}); a token with a scope may use only these")
 	instanceProfiles := flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
 	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
 	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
-	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as fleet.yml's backup section in the uploaded tree says. The object store's keys come from the daemon's environment (BACKUP_S3_ACCESS_KEY, BACKUP_S3_SECRET_KEY or the names fleet.yml gives)")
-	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded tree's fleet.yml dns_records through the built-in provider (DO_API_TOKEN in the daemon's environment). Script plugins are not run from an upload")
+	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as the uploaded fleet.yml's backup section says, only to the destination pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT/_BUCKET). The keys and pins come from the secret store (synced from the git server), else the environment")
+	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded fleet.yml's dns_records in the allowed zones (--dns-domains or NATIVE_OPS_DNS_ZONES) through the built-in provider (DO_API_TOKEN from the secret store, else the environment). Script plugins are not run from an upload")
 	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "app-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
 	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Serve POST /v1/edge/apply: apply the config repo's edge/Caddyfile to the edge container (validated, with rollback). Changes the host, so it runs as a job")
 	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
 	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
 	// unprivileged user on the host could read.
-	enableAuth := flags.Bool("enable-auth", envBool("NATIVE_OPS_ENABLE_AUTH"), "Serve local sign-in and session cookies for the UI (users.json in the state dir; manage people with `native-ops user create`). Env: NATIVE_OPS_ENABLE_AUTH=1")
+	enableAuth := flags.Bool("enable-auth", envBool("NATIVE_OPS_ENABLE_AUTH"), "Serve local sign-in and session cookies for the UI (users.json in the state dir; manage people with /v1/users or 'native-ops user'). Env: NATIVE_OPS_ENABLE_AUTH=1")
 	oidcIssuer := flags.String("oidc-issuer", os.Getenv("NATIVE_OPS_OIDC_ISSUER"), "OpenID Connect issuer URL (e.g. https://accounts.google.com); enables OIDC sign-in. Env: NATIVE_OPS_OIDC_ISSUER")
 	oidcClientID := flags.String("oidc-client-id", os.Getenv("NATIVE_OPS_OIDC_CLIENT_ID"), "OIDC client id. Env: NATIVE_OPS_OIDC_CLIENT_ID")
-	oidcClientSecret := flags.String("oidc-client-secret", os.Getenv("NATIVE_OPS_OIDC_CLIENT_SECRET"), "OIDC client secret. Env: NATIVE_OPS_OIDC_CLIENT_SECRET")
+	oidcClientSecret := flags.String("oidc-client-secret", os.Getenv("NATIVE_OPS_OIDC_CLIENT_SECRET"), "OIDC client secret; better synced to the secret store as NATIVE_OPS_OIDC_CLIENT_SECRET (read at each sign-in). Env: NATIVE_OPS_OIDC_CLIENT_SECRET")
 	oidcRedirectURL := flags.String("oidc-redirect-url", os.Getenv("NATIVE_OPS_OIDC_REDIRECT_URL"), "OIDC redirect URL (e.g. https://native-ops.example/auth/oidc/callback). Env: NATIVE_OPS_OIDC_REDIRECT_URL")
 	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. example.com). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
 	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin. Env: NATIVE_OPS_OIDC_ROLE")
 	oidcLabel := flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
 	edgeContainer := flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
-	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from, e.g. digitalocean (needs DO_API_TOKEN in the environment). Env: NATIVE_OPS_DNS_PROVIDER")
-	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for, e.g. 'example.com,example.net'. Env: NATIVE_OPS_DNS_DOMAINS")
+	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from for the status page, e.g. digitalocean (DO_API_TOKEN from the secret store, else the environment). Env: NATIVE_OPS_DNS_PROVIDER")
+	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for, and that a DNS sync may change, e.g. 'example.com,example.net'. Env: NATIVE_OPS_DNS_DOMAINS")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
