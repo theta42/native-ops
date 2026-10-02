@@ -20,7 +20,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		out["oidc_label"] = s.opts.OIDC.Label
 	}
 	if s.opts.Sessions != nil {
-		if username, role, ok := s.opts.Sessions.FromRequest(r); ok {
+		if username, role, ok := s.currentSession(r); ok {
 			out["user"] = map[string]any{"username": username, "role": role}
 		}
 	}

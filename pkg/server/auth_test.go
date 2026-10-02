@@ -250,6 +250,35 @@ func TestLoginSetsACookieAndTheAPIHonoursIt(t *testing.T) {
 		t.Fatalf("whoami body: %v", out)
 	}
 
+	// The cookie follows the user store, not the role it was issued with: a demotion takes effect at
+	// once, and a disabled user is signed out on their next request.
+	whoami := func() (int, map[string]any) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/whoami", nil)
+		req.AddCookie(cookie)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		var m map[string]any
+		_ = json.NewDecoder(res.Body).Decode(&m)
+		return res.StatusCode, m
+	}
+	if err := users.SetRole("sam", RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if code, m := whoami(); code != http.StatusOK || m["role"] != "viewer" {
+		t.Fatalf("after a demotion the session must carry the new role: %d %v", code, m)
+	}
+	if err := users.SetDisabled("sam", true); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := whoami(); code != http.StatusUnauthorized {
+		t.Fatalf("a disabled user's session must stop working at once: %d", code)
+	}
+	_ = users.SetDisabled("sam", false)
+	_ = users.SetRole("sam", RoleDeployer)
+
 	// A request with no cookie and no token is still refused.
 	anon, _ := http.Get(ts.URL + "/v1/whoami")
 	if anon.StatusCode != http.StatusUnauthorized {
