@@ -25,6 +25,9 @@ source "$REPO_DIR/scripts/lib.sh"
 
 PREFIX="${NATIVE_OPS_IMAGE_PREFIX:-app-}"
 TMP_CT="build-${IMAGE_NAME}-$$"
+# Whatever happens below -- a failing build step under `set -e`, an interrupt -- the build container
+# goes away: a failed build used to leave it running, holding memory, until someone deleted it by hand.
+trap 'incus delete "$TMP_CT" --force >/dev/null 2>&1 || true' EXIT
 ALIAS="${PREFIX}${IMAGE_NAME}"
 [ -n "$REF" ] && ALIAS="${ALIAS}:${REF}"
 
