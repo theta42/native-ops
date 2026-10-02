@@ -41,6 +41,8 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   secret-sync [--prune] NAME...   push these environment variables to the daemon's secret store, e.g.
                                   from the git server's secrets; --prune removes every other one (admin)
   secret-list                     the names in the daemon's secret store, never the values (admin)
+  daemon-upgrade --version v --sha256 s
+                                  upgrade the daemon to a pinned release and wait until it runs it (admin)
   token-create --name n --role r [--names g --images g --domains g]   (admin; no upload)
 
 Common flags: --url (NATIVE_OPS_URL), --token-env (default NATIVE_OPS_TOKEN), --config-dir (.),
@@ -76,6 +78,8 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	names := flags.String("names", "", "token-create: instance name globs, comma separated (a scoped token)")
 	images := flags.String("images", "", "token-create: image globs, comma separated")
 	domains := flags.String("domains", "", "token-create: domain globs, comma separated")
+	upVersion := flags.String("version", "", "daemon-upgrade: the release tag, e.g. v1.56.0")
+	upSHA := flags.String("sha256", "", "daemon-upgrade: the SHA-256 of native-ops_<version>_linux_<arch>.tar.gz, from the release's checksums.txt")
 	prune2 := flags.Bool("prune-secrets", false, "secret-sync: remove every secret on the daemon not named here (also --prune)")
 	_ = flags.Parse(args[1:])
 
@@ -172,6 +176,8 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 			fatalf("the daemon answered %d: %s", code, raw)
 		}
 		fmt.Printf("secrets synced: %d sent, changed: %s, removed: %s\n", len(set), listOrNone(out.Changed), listOrNone(out.Removed))
+	case "daemon-upgrade":
+		os.Exit(c.daemonUpgrade(ctx, *upVersion, strings.ToLower(*upSHA)))
 	case "secret-list":
 		var out struct {
 			Secrets []struct {
@@ -427,4 +433,53 @@ func listOrNone(l []string) string {
 		return "none"
 	}
 	return strings.Join(l, ", ")
+}
+
+// daemonUpgrade asks the daemon to upgrade itself, waits for the install job, then waits for /healthz to
+// report the new version (the daemon restarts after the job). If the old version comes back instead,
+// the unit's guard rolled a binary back that could not stay up, and this says so.
+func (c *remoteClient) daemonUpgrade(ctx context.Context, version, sha string) int {
+	if version == "" || sha == "" {
+		fatalf("daemon-upgrade needs --version and --sha256 (from the release's checksums.txt)")
+	}
+	var out struct {
+		Job struct {
+			ID string `json:"id"`
+		} `json:"job"`
+		From string `json:"from"`
+	}
+	if code, raw := c.json(ctx, "POST", "/v1/daemon/upgrade", map[string]string{"version": version, "sha256": sha}, &out); code != http.StatusAccepted {
+		fatalf("the daemon answered %d: %s", code, raw)
+	}
+	fmt.Printf("upgrading the daemon from %s to %s (job %s)\n", out.From, version, out.Job.ID)
+	if rc := c.wait(ctx, out.Job.ID); rc != 0 {
+		return rc
+	}
+	// The guard gives a new binary a few starts before it restores the old one, so wait long enough to
+	// see either outcome, and report the version that is actually running.
+	deadline := time.Now().Add(3 * time.Minute)
+	last := ""
+	for time.Now().Before(deadline) {
+		var h struct {
+			Version string `json:"version"`
+		}
+		if code, _ := c.json(ctx, "GET", "/healthz", nil, &h); code == http.StatusOK {
+			if h.Version == version {
+				fmt.Printf("the daemon is running %s\n", version)
+				return 0
+			}
+			last = h.Version
+		}
+		select {
+		case <-ctx.Done():
+			return 1
+		case <-time.After(3 * time.Second):
+		}
+	}
+	if last == out.From {
+		fmt.Fprintf(os.Stderr, "the daemon is still on %s: the new binary did not stay up and was rolled back (see journalctl -u native-ops-serve)\n", last)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "the daemon did not report %s within 3 minutes\n", version)
+	return 1
 }

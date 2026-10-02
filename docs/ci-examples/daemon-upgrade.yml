@@ -1,0 +1,36 @@
+name: Upgrade the daemon
+# Moves the host's daemon to a pinned release. It needs an admin token, so it runs in a protected
+# environment. The checksum is the release's checksums.txt line for native-ops_<version>_linux_amd64.tar.gz.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The release, e.g. v1.56.0
+        required: true
+      sha256:
+        description: SHA-256 of native-ops_<version>_linux_amd64.tar.gz (from checksums.txt)
+        required: true
+
+env:
+  NATIVE_OPS_URL: https://native-ops.example.com
+  NATIVE_OPS_VERSION: vX.Y.Z
+  NATIVE_OPS_SHA256: "<sha256 of the linux_amd64 tarball>"
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    environment: bootstrap
+    steps:
+      - name: Install native-ops (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --tlsv1.2 -o native-ops.tgz \
+            "https://github.com/theta42/native-ops/releases/download/${NATIVE_OPS_VERSION}/native-ops_${NATIVE_OPS_VERSION}_linux_amd64.tar.gz"
+          echo "${NATIVE_OPS_SHA256}  native-ops.tgz" | sha256sum -c -
+          tar -xzf native-ops.tgz
+          install -D -m 0755 "native-ops_${NATIVE_OPS_VERSION}_linux_amd64" "$HOME/.local/bin/native-ops"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Upgrade and wait for the new version to answer
+        env:
+          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_BOOTSTRAP_TOKEN }}
+        run: native-ops remote daemon-upgrade --version "${{ inputs.version }}" --sha256 "${{ inputs.sha256 }}"

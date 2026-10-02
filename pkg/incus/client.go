@@ -308,25 +308,59 @@ func (c *Client) EnsureVolumeAttached(ctx context.Context, containerName, pool, 
 	return c.AttachVolume(ctx, containerName, pool, volumeName, mountPath, shifted)
 }
 
-// VolumeAttachment reports whether the volume is already attached at mountPath. When it is
-// not, clash is the existing device that holds the name this attachment would use (nil when
-// the name is free), which is what makes attaching an error rather than an addition.
+// VolumeAttachment reports whether the volume is already attached at mountPath. When it is not, clash
+// is an existing device that makes attaching it an error rather than an addition (nil when attaching is
+// safe), with its device name under the key "_name":
+//   - another disk is already mounted at mountPath: mounting this volume there would hide that disk's
+//     data from the instance (a manifest naming the wrong volume for data that is in use);
+//   - this volume is already attached at another path: a second attachment means two mounts of one
+//     volume (#10);
+//   - a device already has the name this attachment would use.
 func (s *InstanceState) VolumeAttachment(pool, volumeName, mountPath string) (attached bool, clash map[string]string) {
 	for _, d := range s.Devices {
 		if d["type"] == "disk" && d["pool"] == pool && d["source"] == volumeName && d["path"] == mountPath {
 			return true, nil
 		}
 	}
+	for _, name := range s.DeviceNames() {
+		d := s.Devices[name]
+		if d["type"] != "disk" || d["source"] == "" {
+			continue
+		}
+		if d["path"] == mountPath || (d["source"] == volumeName && d["pool"] == pool) {
+			return false, withName(d, name)
+		}
+	}
 	if d, taken := s.Devices[volumeDeviceName(mountPath)]; taken {
-		return false, d
+		return false, withName(d, volumeDeviceName(mountPath))
 	}
 	return false, nil
 }
 
-// VolumeClashError is the error for a device that already has the name an attachment needs.
+func withName(d map[string]string, name string) map[string]string {
+	c := make(map[string]string, len(d)+1)
+	for k, v := range d {
+		c[k] = v
+	}
+	c["_name"] = name
+	return c
+}
+
+// VolumeClashError is the error for an attachment VolumeAttachment found unsafe: it says what is there
+// and why attaching would be wrong.
 func VolumeClashError(containerName, volumeName, mountPath string, clash map[string]string) error {
+	name := clash["_name"]
+	if name == "" {
+		name = volumeDeviceName(mountPath)
+	}
+	switch {
+	case clash["path"] == mountPath && clash["source"] != volumeName:
+		return fmt.Errorf("%s already has volume %s mounted at %s (device %q); mounting %s there would hide that data from it: if %s is where the data is, name it in the manifest", containerName, clash["source"], mountPath, name, volumeName, clash["source"])
+	case clash["source"] == volumeName && clash["path"] != mountPath:
+		return fmt.Errorf("volume %s is already attached to %s at %s (device %q), not at %s: change the manifest's path, or move the mount by hand; it is never attached twice", volumeName, containerName, clash["path"], name, mountPath)
+	}
 	return fmt.Errorf("device %q on %s already exists (source=%s path=%s) and does not match volume %s at %s",
-		volumeDeviceName(mountPath), containerName, clash["source"], clash["path"], volumeName, mountPath)
+		name, containerName, clash["source"], clash["path"], volumeName, mountPath)
 }
 
 // VolumeExists reports whether a custom storage volume exists. Only "not found" means absent;

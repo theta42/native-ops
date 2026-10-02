@@ -109,10 +109,12 @@ func (d *DaemonInstall) runcmd() []string {
 		"incus profile show default >/dev/null 2>&1 || incus admin init --auto",
 		"id native-ops >/dev/null 2>&1 || useradd --system --home-dir /var/lib/native-ops --shell /usr/sbin/nologin native-ops",
 		"usermod -aG incus-admin native-ops",
+		// The binary lives in the state directory, owned by the daemon, so it can upgrade itself.
+		"install -d -o native-ops -g native-ops -m 0700 /var/lib/native-ops /var/lib/native-ops/bin",
 		fmt.Sprintf("curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/native-ops.tgz '%s'", url),
 		fmt.Sprintf("echo '%s  /tmp/native-ops.tgz' | sha256sum -c -", d.SHA256),
 		"tar -xzf /tmp/native-ops.tgz -C /tmp",
-		fmt.Sprintf("install -m 0755 '/tmp/%s' /usr/local/bin/native-ops", name),
+		fmt.Sprintf("install -o native-ops -g native-ops -m 0755 '/tmp/%s' /var/lib/native-ops/bin/native-ops", name),
 		fmt.Sprintf("rm -f /tmp/native-ops.tgz '/tmp/%s'", name),
 		"systemctl daemon-reload",
 		"systemctl enable --now native-ops-serve",

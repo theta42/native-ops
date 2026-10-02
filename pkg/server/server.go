@@ -61,6 +61,10 @@ type Options struct {
 	// Secrets, when set, enables /v1/secrets: the daemon's own credentials, pushed from the git
 	// server's secret store by CI (see secrets.go).
 	Secrets *SecretStore
+	// Upgrade and Restart, with Jobs, enable POST /v1/daemon/upgrade (admin): the daemon replaces its
+	// own binary with a pinned release and restarts on it (see upgrade.go and pkg/selfupdate).
+	Upgrade UpgradeFunc
+	Restart RestartFunc
 	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
 	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
 	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
@@ -106,7 +110,10 @@ func New(opts Options) (*Server, error) {
 		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
 	}
 	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil ||
-		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil
+		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil || opts.Upgrade != nil
+	if opts.Upgrade != nil && opts.Restart == nil {
+		return nil, errors.New("a daemon upgrade needs a way to restart the daemon")
+	}
 	if changes && opts.Jobs == nil {
 		return nil, errors.New("apply, instances, image builds, edge applies, backups and DNS syncs need a job store: every change to the host is a job with a record")
 	}
@@ -404,6 +411,9 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.EdgeApply != nil {
 		mux.Handle("POST /v1/edge/apply", s.auth(RoleDeployer, s.handleEdgeApply))
+	}
+	if s.opts.Upgrade != nil {
+		mux.Handle("POST /v1/daemon/upgrade", s.auth(RoleAdmin, s.handleDaemonUpgrade))
 	}
 	if s.opts.Backup != nil {
 		mux.Handle("POST /v1/backups", s.auth(RoleDeployer, s.handleBackup))
