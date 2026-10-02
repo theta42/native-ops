@@ -61,6 +61,9 @@ func main() {
 	case "image":
 		handleImageCommand(ctx, os.Args[2:])
 
+	case "edge":
+		handleEdgeCommand(ctx, os.Args[2:])
+
 	case "preview":
 		handlePreviewCommand(ctx, os.Args[2:])
 
@@ -120,6 +123,7 @@ Core Commands:
   backup restore   Restore a volume from a stored backup
   backup prune     Apply retention to a volume's stored backups
   image build      Build + publish an app image from a git ref (conf recipe)
+  edge apply       Apply the config repo's edge/Caddyfile to the edge container (validated, with rollback)
   preview launch   Deploy an ephemeral preview from a template + ref
   preview list     List active previews (with TTL)
   preview destroy  Tear down a preview (container + volume + route)
