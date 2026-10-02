@@ -118,7 +118,7 @@ func TestEnsureVolumeAttachedIsIdempotent(t *testing.T) {
 	// Same device name, different volume: refuse rather than swap data underneath the service.
 	ex = &stubExec{out: attachedYAML}
 	err := NewClient(ex).EnsureVolumeAttached(ctx, "web", "default", "other-vol", "/app/.data", true)
-	if err == nil || !strings.Contains(err.Error(), "does not match") || len(ex.cmds) != 1 {
+	if err == nil || !strings.Contains(err.Error(), "would hide that data") || len(ex.cmds) != 1 {
 		t.Fatalf("got %v / %v", err, ex.cmds)
 	}
 }

@@ -247,6 +247,38 @@ func TestPlanFlagsWhatApplyWouldRefuse(t *testing.T) {
 		}
 	})
 
+	t.Run("another volume is already mounted where the manifest puts its volume", func(t *testing.T) {
+		// The fleet-manager case: the data is on a volume the manifest does not name, mounted under a
+		// device name native-ops did not choose. Attaching the manifest's volume there would hide it.
+		sim, d, svc := deployedGitea(t)
+		dev := sim.ctrs["gitea"].devices["var-lib-gitea"]
+		delete(sim.ctrs["gitea"].devices, "var-lib-gitea")
+		dev["source"] = "gitea-real-data"
+		sim.ctrs["gitea"].devices["data"] = dev
+		p := plan(t, sim, svc)
+		if p.Action != ActionBlocked || len(p.Blockers) != 1 || !strings.Contains(p.Blockers[0], "would hide that data") || !strings.Contains(p.Blockers[0], "gitea-real-data") {
+			t.Fatalf("want a blocker naming the volume that holds the data, got %+v", p)
+		}
+		if err := d.DeployService(ctx, svc, t.TempDir()); err == nil {
+			t.Fatal("apply must refuse too")
+		}
+	})
+
+	t.Run("the volume is already attached at another path (#10)", func(t *testing.T) {
+		sim, d, svc := deployedGitea(t)
+		dev := sim.ctrs["gitea"].devices["var-lib-gitea"]
+		delete(sim.ctrs["gitea"].devices, "var-lib-gitea")
+		dev["path"] = "/data"
+		sim.ctrs["gitea"].devices["data"] = dev
+		p := plan(t, sim, svc)
+		if p.Action != ActionBlocked || len(p.Blockers) != 1 || !strings.Contains(p.Blockers[0], "already attached") || !strings.Contains(p.Blockers[0], "/data") {
+			t.Fatalf("want a blocker naming both paths, got %+v", p)
+		}
+		if err := d.DeployService(ctx, svc, t.TempDir()); err == nil {
+			t.Fatal("apply must refuse too, never attach a second time")
+		}
+	})
+
 	t.Run("the edge does not import the sites directory", func(t *testing.T) {
 		sim, d, svc := deployedGitea(t)
 		sim.ctrs["edge"].files["/etc/caddy/Caddyfile"] = "# hand written, no import\n"
