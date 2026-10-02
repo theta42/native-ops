@@ -126,3 +126,23 @@ func TestBuildImageActuallyNeutralizesTheInjection(t *testing.T) {
 		t.Fatalf("the ref should reach the script as one literal argument, got: %s", out)
 	}
 }
+
+func TestBuildImagePrefixedTellsTheRecipeItsPrefix(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "scripts", "build-image.sh"), []byte("echo\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ex := &fakeExec{}
+	if err := BuildImagePrefixed(context.Background(), ex, dir, "platform", "main", "acme-", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.cmds) != 1 || !strings.HasPrefix(ex.cmds[0], "NATIVE_OPS_IMAGE_PREFIX='acme-' bash ") {
+		t.Fatalf("command: %q", ex.cmds)
+	}
+	if err := BuildImagePrefixed(context.Background(), ex, dir, "platform", "main", "x'; rm -rf /", nil); err == nil {
+		t.Fatal("an unsafe prefix must be refused")
+	}
+}

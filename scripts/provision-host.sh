@@ -49,7 +49,7 @@ for profile_file in "$REPO_DIR"/incus/profiles/*.yml; do
 done
 
 # OCI remotes for services run as pre-built images rather than built from
-# source (e.g. Plane — see scripts/deploy-plane.sh). docker.io is the
+# source. docker.io is the
 # default registry; quay.io is needed too since some images (MinIO, as of
 # this writing) have moved off Docker Hub entirely.
 echo "[provision] Adding OCI remotes..."
@@ -63,10 +63,13 @@ ufw default allow outgoing
 ufw allow 22/tcp comment "SSH"
 ufw allow 80/tcp comment "HTTP"
 ufw allow 443/tcp comment "HTTPS"
-# git-over-ssh into the gitea container (Incus proxy device on gitea
-# itself, added by deploy-gitea.sh) — a deliberate exception to "public
-# traffic only through edge", since ssh isn't something Caddy can proxy.
-ufw allow 2222/tcp comment "Gitea SSH"
+# Extra public TCP ports for protocols the edge cannot carry (e.g. git-over-ssh
+# into a Gitea container through an Incus proxy device): a deliberate exception
+# to "public traffic only through the edge". Space-separated, e.g. "2222".
+for port in ${EXTRA_TCP_PORTS:-}; do
+  case "$port" in *[!0-9]*|"") echo "EXTRA_TCP_PORTS: '$port' is not a port" >&2; exit 1 ;; esac
+  ufw allow "$port/tcp" comment "extra (EXTRA_TCP_PORTS)"
+done
 # 8443 for Incus API (multi-host phase). Commented out for single-node.
 # ufw allow 8443/tcp comment "Incus API"
 ufw --force enable
@@ -109,5 +112,6 @@ echo "[provision] Host provisioning complete."
 echo ""
 echo "Next steps:"
 echo "  1. Verify: incus info"
-echo "  2. Build base image: ./scripts/build-image.sh base"
-echo "  3. Launch edge + manager: ./scripts/deploy-manager.sh"
+echo "  2. Build the base image: ./scripts/build-image.sh base"
+echo "  3. Install the native-ops daemon (deploy/systemd) and drive the host from CI:"
+echo "     see docs/daemon.md (or create hosts with: native-ops host create --daemon-version ...)"

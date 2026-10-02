@@ -124,12 +124,12 @@ func handleServeCommand(ctx context.Context, args []string) {
 	oidcClientID := flags.String("oidc-client-id", os.Getenv("NATIVE_OPS_OIDC_CLIENT_ID"), "OIDC client id. Env: NATIVE_OPS_OIDC_CLIENT_ID")
 	oidcClientSecret := flags.String("oidc-client-secret", os.Getenv("NATIVE_OPS_OIDC_CLIENT_SECRET"), "OIDC client secret. Env: NATIVE_OPS_OIDC_CLIENT_SECRET")
 	oidcRedirectURL := flags.String("oidc-redirect-url", os.Getenv("NATIVE_OPS_OIDC_REDIRECT_URL"), "OIDC redirect URL (e.g. https://native-ops.example/auth/oidc/callback). Env: NATIVE_OPS_OIDC_REDIRECT_URL")
-	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. opsavor.ai). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
+	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. example.com). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
 	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin. Env: NATIVE_OPS_OIDC_ROLE")
 	oidcLabel := flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
 	edgeContainer := flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
 	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from, e.g. digitalocean (needs DO_API_TOKEN in the environment). Env: NATIVE_OPS_DNS_PROVIDER")
-	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for, e.g. 'opsavor.app,opsavor.work'. Env: NATIVE_OPS_DNS_DOMAINS")
+	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for, e.g. 'example.com,example.net'. Env: NATIVE_OPS_DNS_DOMAINS")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
@@ -265,7 +265,11 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			}
 			opts.Recipes = recipes
 			opts.ImagePrefix = cfg.ImagePrefix
-			opts.ImageBuild = imageBuildSource(cfg.Exec)
+			if !engine.ValidImagePrefix(cfg.ImagePrefix) {
+				audit.Close()
+				return nil, nil, fmt.Errorf("--image-prefix %q: lowercase letters, digits, dots and dashes", cfg.ImagePrefix)
+			}
+			opts.ImageBuild = imageBuildSource(cfg.Exec, cfg.ImagePrefix)
 		}
 		if cfg.EnableBackup {
 			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool), restoreSource(cfg.Exec, cfg.Pool)
@@ -361,9 +365,9 @@ func applySource(exec remote.Executor) server.ApplyFunc {
 }
 
 // imageBuildSource is what POST /v1/images/build builds with.
-func imageBuildSource(exec remote.Executor) server.ImageBuildFunc {
+func imageBuildSource(exec remote.Executor, prefix string) server.ImageBuildFunc {
 	return func(ctx context.Context, dir, app, ref string, logf func(string, ...any)) error {
-		return engine.BuildImage(ctx, exec, dir, app, ref, logf)
+		return engine.BuildImagePrefixed(ctx, exec, dir, app, ref, prefix, logf)
 	}
 }
 
@@ -496,8 +500,8 @@ func handleTokenCommand(args []string) {
 	name := flags.String("name", "", "Token name (create)")
 	role := flags.String("role", "viewer", "viewer, planner, deployer or admin (create)")
 	names := flags.String("names", "", "Limit the token to tenant instances with these names, as globs, comma separated, e.g. 'demo-*,rest-*' (create; needs --images, and the deployer role)")
-	images := flags.String("images", "", "The images such a token may launch, as globs, e.g. 'opsavor-platform:*' (create)")
-	domains := flags.String("domains", "", "The domains such a token may publish a route for, as globs, e.g. '*.opsavor.app' (create)")
+	images := flags.String("images", "", "The images such a token may launch, as globs, e.g. 'app-platform:*' (create)")
+	domains := flags.String("domains", "", "The domains such a token may publish a route for, as globs, e.g. '*.example.com' (create)")
 	id := flags.String("id", "", "Token id (revoke)")
 	_ = flags.Parse(args[1:])
 

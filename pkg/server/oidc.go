@@ -23,7 +23,7 @@ type OIDCSettings struct {
 	ClientID      string
 	ClientSecret  string
 	RedirectURL   string
-	AllowedDomain string // every email must be at this domain (e.g. opsavor.ai); empty allows any
+	AllowedDomain string // every email must be at this domain (e.g. example.com); empty allows any
 	Role          Role   // the role a newly seen user is created with
 	Scopes        []string
 	Label         string // what the sign-in button says, e.g. "Google Workspace"

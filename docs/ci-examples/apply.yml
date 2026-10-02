@@ -1,0 +1,35 @@
+name: Apply
+# Apply the plan an admin approved. Run it by hand with the hash from the plan comment, or chain it to
+# a merge and let it fail with "not_approved" until the approval is given.
+on:
+  workflow_dispatch:
+    inputs:
+      hash:
+        description: the plan hash that was approved
+        required: true
+
+env:
+  NATIVE_OPS_URL: https://native-ops.example.com
+  NATIVE_OPS_VERSION: vX.Y.Z
+  NATIVE_OPS_SHA256: "<sha256 of the linux_amd64 tarball>"
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native-ops (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --tlsv1.2 -o native-ops.tgz \
+            "https://github.com/theta42/native-ops/releases/download/${NATIVE_OPS_VERSION}/native-ops_${NATIVE_OPS_VERSION}_linux_amd64.tar.gz"
+          echo "${NATIVE_OPS_SHA256}  native-ops.tgz" | sha256sum -c -
+          tar -xzf native-ops.tgz
+          install -D -m 0755 "native-ops_${NATIVE_OPS_VERSION}_linux_amd64" "$HOME/.local/bin/native-ops"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Apply the approved plan
+        env:
+          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_DEPLOY_TOKEN }}   # a deployer token
+        # Refused (and nothing changes) if the host or the tree moved since the plan, or if the plan
+        # was not approved; waits for the job and prints its log.
+        run: native-ops remote apply --config-dir . --expect "${{ inputs.hash }}"

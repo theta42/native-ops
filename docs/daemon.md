@@ -1,18 +1,21 @@
 # The native-ops daemon
 
-`native-ops serve` is an optional daemon that runs **on the host it manages** and exposes an
-authenticated HTTP API plus a small web UI. It exists so that a deployment can be driven
-entirely from CI over HTTPS with an API token:
+`native-ops serve` is the daemon that runs **on each host it manages** and exposes an
+authenticated HTTP API plus a small web UI. It is how a fleet is operated: git is the source of
+truth, CI is the only control path, and the daemon is what CI talks to.
 
-- Nobody installs anything locally to operate a fleet. There is no client to install.
+- Nobody installs or runs a control app on their own machine. CI runs `native-ops remote ...`
+  (or plain `curl`) against the daemon's HTTPS API with a token.
 - CI never needs an SSH key or a runner on the host.
-- The **CLI stays the source of truth** and keeps working without the daemon. The daemon adds
-  what the CLI cannot: API tokens, an audit log, and (next) job history and locking.
+- The daemon adds what a script on a runner cannot: API tokens with roles and scopes, plan
+  approval, one change at a time on a host, job records and an audit log.
+- The same engine is in the CLI, so `native-ops apply`, `backup`, `dns sync` and the rest still
+  work when run on the host itself -- for a host with no daemon yet, or to repair one.
 
-The daemon itself is installed and updated by IaC/CI, like everything else. It is not something
-a person sets up by hand.
+The daemon is installed by cloud-init when `native-ops host create --daemon-version ...` creates
+the host, or by your IaC. It is not something a person sets up by hand.
 
-## What it does today (read-only)
+## Endpoints
 
 | Endpoint | Auth | |
 |---|---|---|
@@ -23,7 +26,14 @@ a person sets up by hand.
 | `GET /v1/plans`, `GET /v1/plans/{hash}` | viewer | the plans that were made, and where each stands (pending, approved, used, expired, blocked) |
 | `POST /v1/plans/{hash}/approve`, `DELETE /v1/plans/{hash}/approval` | admin | approve one apply of exactly this plan, or take the approval back |
 | `POST /v1/apply` | deployer | apply an **approved** plan, as a job (only with `--enable-apply`) |
-| `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | jobs (apply and instance changes) and their outcome; the log is shown to deployers and admins only |
+| `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | jobs and their outcome; the log is shown to deployers and admins only. A scoped token sees only jobs it started and jobs about instances its scope allows |
+| `POST /v1/edge/apply` | deployer | apply the uploaded tree's `edge/Caddyfile` to the edge container (validated, rolled back if Caddy rejects it), as a job (only with `--enable-edge-apply`) |
+| `POST /v1/backups?volume=&prune=1` | deployer | back up one volume, or every volume `fleet.yml` allows, then optionally apply retention, as a job (only with `--enable-backup`) |
+| `POST /v1/backups/restore?volume=&from=&as=&force=1` | admin | restore a volume in place (keeping a copy of the current one) or as a new volume, as a job (only with `--enable-backup`) |
+| `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (only with `--enable-dns-sync`) |
+| `GET/POST /v1/tokens`, `DELETE /v1/tokens/{id}` | admin | list, create (the secret is returned once) and revoke API tokens |
+| `GET/POST /v1/users`, `PATCH /v1/users/{username}` | admin | list and create local users; change a role, disable, or set a password (with `--enable-auth` or OIDC) |
+| `GET /v1/images/recipes`, `POST /v1/images/recipes/{digest}/approve`, `DELETE .../approval` | admin | the image recipes builds were asked for, and approving or withdrawing one (with `--enable-image-build`) |
 | `PUT /v1/instances/{name}`, `POST /v1/instances/{name}/update`, `DELETE /v1/instances/{name}` | deployer | create, move to another image, or remove a tenant instance, as a job (only with `--enable-instances`) |
 | `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
 | `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
@@ -39,7 +49,7 @@ Beyond the Incus inventory the snapshot carries the host's own **metrics** (load
 pool's disk, uptime), the **edge's routes** (each hostname and the upstreams it points at) and
 **certificates** (names, issuer, expiry), and the **DNS records** in configured zones. The daemon reads
 the edge's live Caddy config and certificate store through Incus (`--edge-container`, default `edge`),
-and lists DNS through a provider (`--dns-provider digitalocean --dns-domains opsavor.app,opsavor.work`,
+and lists DNS through a provider (`--dns-provider digitalocean --dns-domains example.com,example.net`,
 using `DO_API_TOKEN`). `native-ops status` includes the metrics; the daemon adds the edge and DNS when
 they are configured.
 
@@ -179,17 +189,17 @@ created and removed while the product runs) are managed by a system that knows a
 this API, without holding a key to the host. Off unless the daemon is started with `--enable-instances`.
 
 ```bash
-# a token that can only ever manage demo-*/rest-* instances, from one image family, on one zone
-native-ops token create --state-dir /var/lib/native-ops --name fleet-manager --role deployer \
-    --names 'demo-*,rest-*' --images 'opsavor-platform:*' --domains '*.opsavor.app'
+# a token that can only ever manage demo-*/cust-* instances, from one image family, on one zone
+native-ops remote token-create --name fleet-manager --role deployer \
+    --names 'demo-*,cust-*' --images 'acme-app:*' --domains '*.acme.example'
 
-curl -X PUT "$URL/v1/instances/demo-multi" -H "Authorization: Bearer $TOKEN" -d '{
-  "template": "platform", "image": "opsavor-platform:latest",
+curl -X PUT "$URL/v1/instances/demo-one" -H "Authorization: Bearer $TOKEN" -d '{
+  "template": "app", "image": "acme-app:latest",
   "limits": {"limits.cpu": "1", "limits.memory": "1GB"},
-  "volumes": [{"name": "demo-multi-data", "path": "/app/.data", "owner": "platform"}],
-  "service": "platform", "env": {"OPSAVOR_SEED": "multi", "PORT": "8787"},
+  "volumes": [{"name": "demo-one-data", "path": "/app/.data", "owner": "app"}],
+  "service": "app", "env": {"APP_MODE": "demo", "PORT": "8787"},
   "health": {"path": "/health", "port": 8787},
-  "domain": "demo-multi.opsavor.app", "route_directives": ["import strip-forged-identity"]
+  "domain": "demo-one.acme.example", "route_directives": ["import strip-forged-identity"]
 }'                                          # 202 and a job; poll GET /v1/jobs/{id}
 ```
 
@@ -225,20 +235,74 @@ What stops a fleet manager, or anyone holding its token, from doing more than th
   is free. Each change is a job with a record; tenant secrets in `env` never appear in a job log, the audit log
   or any answer.
 
+## Image builds and recipe approval
+
+`POST /v1/images/build?app=<app>&ref=<ref>` builds `<prefix><app>:<ref>` from the uploaded tree's
+recipe: it runs `scripts/build-image.sh <app> <ref>`, which builds in a throwaway container and
+publishes the image. Off unless the daemon has `--enable-image-build`; `--image-prefix` is what the
+recipe names images before `<app>` (default `opsavor-`, kept for existing daemons), and a scoped
+token's `--images` globs are checked against that name.
+
+That script runs **on the host, as the daemon's user**, so whoever writes it can run anything there.
+The daemon therefore builds only from a recipe an admin has approved: the digest of every file under
+`scripts/` and `images/` in the upload. An unapproved recipe is refused with
+`403 recipe_not_approved` and the digest; an admin approves it once:
+
+```bash
+native-ops image recipe-digest --config-dir .                # the digest of a checkout
+native-ops remote recipe-approve --config-dir .              # admin token: approve that digest
+```
+
+The approval is per recipe, not per build: a release pipeline building a new ref from an unchanged
+recipe needs nothing, while any change to a build script waits for an admin -- the same rule an apply
+follows for its plan. **After upgrading a daemon to a version with this check, approve the current
+recipe once**, or the next build is refused.
+
 ## Tokens and bootstrapping
 
-```
-native-ops token create --state-dir /var/lib/native-ops --name ci-plan --role planner
-native-ops token list   --state-dir /var/lib/native-ops
-native-ops token revoke --state-dir /var/lib/native-ops --id <id>
+Tokens are managed over the API by an admin, so nobody needs a shell on the host:
+
+```bash
+export NATIVE_OPS_TOKEN=$BOOTSTRAP_TOKEN    # or any admin token
+native-ops remote token-create --name ci-plan --role planner          # prints the secret, once
+native-ops remote token-create --name ci-release --role deployer --names 'app-*' --images 'acme-app:*'
+curl -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens"     # list
+curl -X DELETE -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens/<id>"
 ```
 
-A running daemon honours tokens created this way immediately (it notices the file change).
+The first admin credential is provisioned with the host, as a secret CI already holds:
 
-To avoid running any command on the host, IaC/CI can provision the first credential as a secret:
-set `NATIVE_OPS_BOOTSTRAP_TOKEN=nops_...` (at least 32 characters after the prefix) in
-`/etc/native-ops/serve.env`. The daemon loads it as an in-memory `admin` token named `bootstrap`;
-it is never written to disk. Rotate it by changing the secret and restarting.
+- `native-ops host create ... --daemon-version vX.Y.Z --daemon-sha256 <sha>` with
+  `NATIVE_OPS_BOOTSTRAP_TOKEN=nops_...` in the environment writes **only the token's SHA-256** into
+  the host's cloud-init (`NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256` in `/etc/native-ops/serve.env`). User-data
+  can be read back from the provider's metadata service by anything on the host that reaches it,
+  containers included, so the token itself never goes there.
+- With your own IaC, set `NATIVE_OPS_BOOTSTRAP_TOKEN=nops_...` (at least 32 characters after the
+  prefix), or its hex SHA-256 as `NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256`, in `/etc/native-ops/serve.env`.
+
+The daemon loads it as an in-memory `admin` token named `bootstrap`; it is never written to disk.
+Rotate it by changing the secret and restarting. On the host itself, `native-ops token create|list|revoke
+--state-dir /var/lib/native-ops` works on the same file, and a running daemon notices the change.
+
+## Backups, retention and DNS from CI
+
+The recurring work is a daemon job that a **scheduled pipeline** starts; the pipeline's schedule is
+the schedule, so the daemon needs none of its own.
+
+```bash
+native-ops remote backup --prune                 # every volume fleet.yml's backup section allows
+native-ops remote backup --volume gitea-data     # one volume
+native-ops remote dns-sync                        # fleet.yml's dns_records (create or update only)
+native-ops remote restore --volume gitea-data --as gitea-drill    # admin: a restore drill
+```
+
+`fleet.yml` in the upload says what to do; the credentials stay with the daemon, in its environment:
+the object store's keys (`BACKUP_S3_ACCESS_KEY`/`BACKUP_S3_SECRET_KEY`, or the names `fleet.yml`
+gives) and the DNS provider's (`DO_API_TOKEN`). Through the daemon DNS is synced only with a built-in
+provider: a script plugin from an upload would let a deployer token run code on the host without an
+approved plan (run `native-ops dns sync` on the host for a plugin). An in-place restore stops the
+containers that mount the volume (`force=1`), copies the current volume aside to
+`<volume>-pre-restore-<time>` first, and always starts the containers again.
 
 ## UI sign-in: local users and OIDC
 
@@ -256,6 +320,15 @@ on instead, so people reach the console without holding a token:
 
 Either way a sign-in sets an HttpOnly session cookie (HMAC-signed with a key in the state dir), and the
 UI calls the API with it. API tokens keep working unchanged, for CI and machines.
+
+- A session is checked against the user store on every request: disabling, removing or demoting a
+  user takes effect at once, not when the cookie expires.
+- After 5 failed sign-ins in a row for one username, further attempts for it are refused (`429`,
+  `Retry-After`) for 30 seconds, doubling up to 15 minutes; a success clears it.
+- The OIDC flow uses PKCE (S256). Without `--oidc-allowed-domain` the daemon warns at startup: with a
+  public identity provider, anyone it vouches for may sign in.
+- Admins can manage users over the API too (`/v1/users`), and cannot demote or disable the account
+  they are signed in with.
 
 Every auth/OIDC setting also has an environment form (`NATIVE_OPS_ENABLE_AUTH`, `NATIVE_OPS_OIDC_*`;
 see `native-ops serve --help`), so the OIDC client secret can live in the root-only
@@ -285,8 +358,19 @@ useradd --system --home-dir /var/lib/native-ops --shell /usr/sbin/nologin -G inc
 Then route it through the edge, e.g. a Caddy site `native-ops.example.com { reverse_proxy 10.0.100.1:8686 }`
 with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the host.
 
+## SSH, for the paths that still use it
+
+The daemon itself needs no SSH. `host create`/`reconcile` (bringing a new host up) and
+`instance migrate` do. Set `NATIVE_OPS_SSH_KNOWN_HOSTS=<file>` wherever they run: a host's key is then
+checked against the file, a changed key is refused, and a host seen for the first time is recorded (or
+refused too, with `NATIVE_OPS_SSH_STRICT=1`). Unset, host keys are not checked and a warning says so.
+
+`reconcile` provisions hosts, syncs DNS and prepares Incus; it deploys services only with
+`--deploy-services`, a break-glass path that skips the plan approval, the host lock and the job
+record. Normally services reach a host through an approved apply.
+
 ## Roadmap
 
-Instance update/migrate/backup as jobs; a live view of a running job; and per-user API tokens
-(now that people sign in, a token could be tied to the person who made it). The API is versioned (`/v1`) so a separate fleet manager
-can depend on it.
+Multi-host targeting (services mapped to hosts in `fleet.yml`, and `native-ops remote` fanning a plan
+or apply out to each host's daemon); instance migrate and previews as jobs; a live view of a running
+job; and per-user API tokens. The API is versioned (`/v1`) so a separate fleet manager can depend on it.

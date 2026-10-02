@@ -14,9 +14,9 @@
   - **Level 1 (Incus & Edge Workloads)**: Declarative service deployments, template-driven dynamic tenant instances, storage volume management (`security.shifted=true`), cgroup live resizing, and automated health checks.
   - **Level 2 (Workload Mobility)**: Cross-host container and volume migration (`native-ops instance migrate`) across cloud providers and on-prem nodes.
 - **Pluggable DNS Architecture**: Native DigitalOcean DNS support + extensible Python/Bash script plugins (`providers/dns/*.py`) defined in user configuration repos.
-- **100% Runner-Driven Control Plane**: Runs inside CI/CD runners (GitHub Actions, Gitea Actions) or operator workstations. No long-running host daemons required.
+- **Git + CI is the only control path**: nobody installs or runs a control app on their own machine. A pull request plans, an admin approves the exact plan, and the merge applies it -- all from CI (GitHub Actions, Gitea Actions) talking over HTTPS to the **native-ops daemon that runs on each host**. CI never holds an SSH key.
 - **Immutable Container Lifecycle**: Rebuild and replace, never live patch. Automated volume snapshotting before updates.
-- **Zero Host Runtime Dependencies**: Single static Go binary.
+- **One static Go binary**: the same binary is the daemon on the host and the client in CI (`native-ops remote ...`).
 
 ---
 
@@ -24,31 +24,44 @@
 
 ```mermaid
 flowchart TD
-    subgraph ControlPlane ["Control Plane (CI Runner / Operator CLI)"]
-        NO["native-ops (Go CLI)"]
-        CONF["native-ops-conf (Manifests & IaC)"]
+    subgraph Git ["Git (the source of truth)"]
+        CONF["native-ops-conf\n(fleet.yml, services, templates, edge, recipes)"]
+    end
+
+    subgraph CI ["CI runner (GitHub / Gitea Actions)"]
+        CLI["native-ops remote\nplan / apply / edge-apply / backup / dns-sync"]
     end
 
     subgraph L0 ["Level 0: Cloud & Hypervisor Providers"]
-        DO["DigitalOcean API\n(Droplets, DNS, VPC)"]
-        PVE["Proxmox VE REST API\n(KVM, LXC, Storage)"]
+        DO["DigitalOcean API"]
+        PVE["Proxmox VE API"]
     end
 
-    subgraph L1 ["Level 1: Target Hosts (Incus Fleet)"]
-        HOST["Incus Host Node"]
+    subgraph L1 ["Level 1: each Incus host"]
+        D["native-ops daemon\n(tokens, plan approval, jobs, audit)"]
         EDGE["Edge Proxy (Caddy)"]
         CONTAINERS["Container Workloads"]
         VOLUMES["Persistent Storage Volumes"]
     end
 
-    CONF --> NO
-    NO -->|Provision / Destroy VMs| DO
-    NO -->|Provision / Destroy VMs| PVE
-    NO -->|Deploy & Migrate via SSH / Remote| HOST
-    HOST --> EDGE
-    HOST --> CONTAINERS
-    HOST --> VOLUMES
+    ADMIN(["Admin\n(approves plans in the UI or API)"])
+
+    CONF --> CLI
+    CLI -->|"HTTPS + API token\n(uploads the checked-out tree)"| D
+    CLI -->|"host create / reconcile\n(provision + bootstrap only)"| DO
+    CLI --> PVE
+    ADMIN --> D
+    D --> EDGE
+    D --> CONTAINERS
+    D --> VOLUMES
 ```
+
+**How a change reaches a host.** The host runs `native-ops serve` (installed by cloud-init when the
+host is created, or by your IaC). CI uploads the tree it checked out; the daemon plans it against
+the host and answers with a hash; an admin approves that hash; CI applies it, and the daemon runs the
+apply as a job with a record. The daemon holds the host's credentials (Incus, the object store, the
+DNS provider); CI holds only scoped API tokens. See [docs/daemon.md](docs/daemon.md) and the example
+pipelines in [docs/ci-examples](docs/ci-examples).
 
 ---
 
@@ -73,6 +86,10 @@ Usage:
   native-ops <command> [options]
 
 Commands:
+  remote           Drive a host's daemon from CI: plan, apply, edge-apply, backup, restore,
+                   dns-sync, wait, token-create, recipe-approve
+  serve            Run the daemon on a host (API + UI)
+  reconcile        Provision the fleet's hosts, sync DNS and prepare Incus
   host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)
   host destroy     Tear down a host VM
   host list        List active hosts for a provider
@@ -115,10 +132,15 @@ native-ops host create \
   --size 4c-8192mb
 ```
 
-#### 3. Declaratively Apply Cluster Services
+#### 3. Declaratively Apply Cluster Services (from CI, through the daemon)
 ```bash
-native-ops apply --config-dir /path/to/native-ops-conf
+export NATIVE_OPS_URL=https://native-ops.example.com NATIVE_OPS_TOKEN=...   # CI secrets
+native-ops remote plan --config-dir .            # prints the plan and its hash
+# an admin approves that hash (UI, or POST /v1/plans/<hash>/approve), then:
+native-ops remote apply --config-dir . --expect <hash>
 ```
+`native-ops apply --config-dir .` still applies directly when run on the host itself, for a host
+with no daemon yet.
 
 #### 4. Launch a Dynamic Template Instance
 ```bash
@@ -377,10 +399,20 @@ volumes with their snapshot freshness, images, and anything an operator should l
 instance, a data mount that is a host path rather than a volume, a volume with no recent snapshot).
 It reports config key *names* only, never values.
 
-`native-ops serve` runs the same view, and what follows, as an authenticated API and web UI
-**on the host itself**, so a fleet can be driven from CI with an API token and nothing is installed
-locally. It is installed by IaC/CI, and the CLI keeps working without it. See
-[docs/daemon.md](docs/daemon.md).
+`native-ops serve` is the daemon each host runs: the same view, plus everything CI drives, as an
+authenticated API and web UI **on the host itself**. It is how a fleet is operated: CI calls it with
+API tokens (`native-ops remote ...`), and nobody installs anything locally or logs in to a host.
+
+- **Setting a host up without logging in.** `native-ops host create --daemon-version vX.Y.Z
+  --daemon-sha256 <sha>` has cloud-init install and start the daemon, with only the SHA-256 of a
+  bootstrap admin token (`NATIVE_OPS_BOOTSTRAP_TOKEN` in the caller's environment). CI then creates
+  every other token over the API: `native-ops remote token-create --name ci-plan --role planner`.
+- **Changes are gated.** An apply runs only a plan an admin approved; an image build runs only a
+  recipe (`scripts/` + `images/`) an admin approved; a scoped token can touch only its own instances.
+- **Maintenance is CI-scheduled.** Backups, retention and DNS sync are daemon jobs a scheduled
+  pipeline starts (`native-ops remote backup --prune`, `dns-sync`).
+
+See [docs/daemon.md](docs/daemon.md).
 
 ---
 
