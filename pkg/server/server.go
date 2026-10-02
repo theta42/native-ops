@@ -339,6 +339,14 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, snap)
 	}))
+	mux.Handle("GET /v1/tokens", s.auth(RoleAdmin, s.handleTokenList))
+	mux.Handle("POST /v1/tokens", s.auth(RoleAdmin, s.handleTokenCreate))
+	mux.Handle("DELETE /v1/tokens/{id}", s.auth(RoleAdmin, s.handleTokenRevoke))
+	if s.opts.Users != nil {
+		mux.Handle("GET /v1/users", s.auth(RoleAdmin, s.handleUserList))
+		mux.Handle("POST /v1/users", s.auth(RoleAdmin, s.handleUserCreate))
+		mux.Handle("PATCH /v1/users/{username}", s.auth(RoleAdmin, s.handleUserUpdate))
+	}
 	if s.opts.Plan != nil {
 		mux.Handle("POST /v1/plan", s.auth(RolePlanner, s.handlePlan))
 	}
