@@ -42,6 +42,21 @@ func ValidImageRef(ref string) bool {
 //
 // Usage: native-ops image build <app> <ref> --config-dir <native-ops-conf>
 func BuildImage(ctx context.Context, exec remote.Executor, configDir, app, ref string, logf func(string, ...any)) error {
+	return BuildImagePrefixed(ctx, exec, configDir, app, ref, "", logf)
+}
+
+var imagePrefixRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,30}$`)
+
+// ValidImagePrefix reports whether p can be put before an image name (empty is allowed).
+func ValidImagePrefix(p string) bool { return p == "" || imagePrefixRe.MatchString(p) }
+
+// BuildImagePrefixed is BuildImage that tells the recipe which prefix to name the image with
+// (NATIVE_OPS_IMAGE_PREFIX in its environment), so the daemon's --image-prefix, which a scoped token is
+// checked against, and the name the recipe publishes agree. A recipe that names images itself ignores it.
+func BuildImagePrefixed(ctx context.Context, exec remote.Executor, configDir, app, ref, prefix string, logf func(string, ...any)) error {
+	if !ValidImagePrefix(prefix) {
+		return fmt.Errorf("%q is not a valid image prefix (lowercase letters, digits, dots and dashes)", prefix)
+	}
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -62,6 +77,9 @@ func BuildImage(ctx context.Context, exec remote.Executor, configDir, app, ref s
 	// command built for a shell gets the same quoting here regardless, the way the rest of this
 	// codebase always does (see pkg/incus.ShQuote's other callers).
 	cmd := fmt.Sprintf("bash %s %s %s", incus.ShQuote(script), incus.ShQuote(app), incus.ShQuote(ref))
+	if prefix != "" {
+		cmd = "NATIVE_OPS_IMAGE_PREFIX=" + incus.ShQuote(prefix) + " " + cmd
+	}
 	logf("building %s@%s...\n", app, ref)
 	out, err := exec.Run(ctx, cmd)
 	if err != nil {
