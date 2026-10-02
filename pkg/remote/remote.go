@@ -81,12 +81,16 @@ func NewSSHExecutor(host string, port int, user string, privateKeyPEM []byte) (*
 		return nil, fmt.Errorf("parse SSH private key: %w", err)
 	}
 
+	hostKeys, err := hostKeyCallback()
+	if err != nil {
+		return nil, err
+	}
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // in CI/automated fleet provisioning
+		HostKeyCallback: hostKeys, // see hostkeys.go
 		Timeout:         15 * time.Second,
 	}
 
