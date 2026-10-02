@@ -108,9 +108,15 @@ func (b *BackupConfig) S3PathStyle() bool { return b.PathStyle == nil || *b.Path
 // Credentials resolves the S3 key pair from the configured environment
 // variables. Secrets are read from the environment only, never from git.
 func (b *BackupConfig) Credentials() (access, secret string, err error) {
+	return b.CredentialsFrom(os.Getenv)
+}
+
+// CredentialsFrom is Credentials reading the named values with get (the daemon's secret store, which
+// falls back to the environment).
+func (b *BackupConfig) CredentialsFrom(get func(string) string) (access, secret string, err error) {
 	b.ApplyDefaults()
-	access = os.Getenv(b.AccessKeyEnv)
-	secret = os.Getenv(b.SecretKeyEnv)
+	access = get(b.AccessKeyEnv)
+	secret = get(b.SecretKeyEnv)
 	if access == "" || secret == "" {
 		return "", "", fmt.Errorf("missing S3 credentials: set %s and %s", b.AccessKeyEnv, b.SecretKeyEnv)
 	}

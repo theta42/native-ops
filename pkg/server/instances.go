@@ -63,7 +63,12 @@ func checkScope(scope *Scope, name, image, domain string) string {
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	body := http.MaxBytesReader(w, r.Body, maxInstanceBody)
+	return readJSONLimit(w, r, v, maxInstanceBody)
+}
+
+// readJSONLimit is readJSON with a body limit of its own.
+func readJSONLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	body := http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {

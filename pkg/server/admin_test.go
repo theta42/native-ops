@@ -20,6 +20,8 @@ type adminRig struct {
 	tokens                  *TokenStore
 	users                   *UserStore
 	admin, deployer, scoped string
+	srv                     *Server
+	auditPath               string
 }
 
 func newAdminRig(t *testing.T) *adminRig {
@@ -43,10 +45,19 @@ func newAdminRig(t *testing.T) *adminRig {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rig.srv, rig.auditPath = s, filepath.Join(dir, "audit.log")
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	rig.url = ts.URL
 	return rig
+}
+
+// reload serves the rig's server again, after a test changed its options.
+func (a *adminRig) reload(t *testing.T) {
+	t.Helper()
+	ts := httptest.NewServer(a.srv.Handler())
+	t.Cleanup(ts.Close)
+	a.url = ts.URL
 }
 
 func (a *adminRig) call(t *testing.T, method, path, token string, body any, cookies ...*http.Cookie) (int, map[string]any, *http.Response) {

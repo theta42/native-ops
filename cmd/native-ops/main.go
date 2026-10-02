@@ -580,11 +580,15 @@ func loadBackupStoreWith(configDir string, exec remote.Executor) (*backup.Manage
 	if fleet.Backup == nil {
 		return nil, fmt.Errorf("no 'backup:' section in %s/fleet.yml", configDir)
 	}
-	cfg := fleet.Backup
+	return backupManagerFor(fleet.Backup, exec, os.Getenv)
+}
+
+// backupManagerFor builds a backup manager for a backup section, reading the keys with get.
+func backupManagerFor(cfg *config.BackupConfig, exec remote.Executor, get func(string) string) (*backup.Manager, error) {
 	if err := cfg.ValidateForBackup(); err != nil {
 		return nil, err
 	}
-	access, secret, err := cfg.Credentials()
+	access, secret, err := cfg.CredentialsFrom(get)
 	if err != nil {
 		return nil, err
 	}

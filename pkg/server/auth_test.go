@@ -304,3 +304,19 @@ func TestLoginSetsACookieAndTheAPIHonoursIt(t *testing.T) {
 		t.Fatalf("session methods: %v", sm)
 	}
 }
+
+func TestOIDCReadsALaterSyncedClientSecretAtSignIn(t *testing.T) {
+	idp := fakeIdP(t, map[string]any{"email": "a@example.com", "email_verified": true})
+	secret := ""
+	cfg, err := NewOIDC(OIDCSettings{Issuer: idp.URL, ClientID: "c", RedirectURL: idp.URL + "/cb", ClientSecretFrom: func() string { return secret }})
+	if err != nil {
+		t.Fatalf("OIDC must start without a secret when it can be read later: %v", err)
+	}
+	if _, err := cfg.Exchange(context.Background(), "good", "the-verifier"); err == nil || !strings.Contains(err.Error(), "NATIVE_OPS_OIDC_CLIENT_SECRET") {
+		t.Fatalf("no secret yet must say what to sync: %v", err)
+	}
+	secret = "synced"
+	if _, err := cfg.Exchange(context.Background(), "good", "the-verifier"); err != nil {
+		t.Fatalf("a secret synced after start must be used: %v", err)
+	}
+}

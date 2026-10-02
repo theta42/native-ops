@@ -27,6 +27,9 @@ type OIDCSettings struct {
 	Role          Role   // the role a newly seen user is created with
 	Scopes        []string
 	Label         string // what the sign-in button says, e.g. "Google Workspace"
+	// ClientSecretFrom, when set and ClientSecret is empty, is asked for the client secret at each
+	// sign-in, so a secret pushed to the daemon later (PUT /v1/secrets) works without a restart.
+	ClientSecretFrom func() string `json:"-"`
 }
 
 // OIDCConfig is a configured client: the settings plus the discovery cache.
@@ -48,7 +51,7 @@ type oidcProvider struct {
 
 // NewOIDC validates settings and returns a client ready to use.
 func NewOIDC(s OIDCSettings) (*OIDCConfig, error) {
-	if strings.TrimSpace(s.Issuer) == "" || s.ClientID == "" || s.ClientSecret == "" || s.RedirectURL == "" {
+	if strings.TrimSpace(s.Issuer) == "" || s.ClientID == "" || (s.ClientSecret == "" && s.ClientSecretFrom == nil) || s.RedirectURL == "" {
 		return nil, errors.New("OIDC needs an issuer, client id, client secret and redirect url")
 	}
 	if !ValidRole(s.Role) {
@@ -129,12 +132,19 @@ func (o *OIDCConfig) Exchange(ctx context.Context, code, verifier string) (strin
 	if err != nil {
 		return "", err
 	}
+	secret := o.ClientSecret
+	if secret == "" && o.ClientSecretFrom != nil {
+		secret = o.ClientSecretFrom()
+	}
+	if secret == "" {
+		return "", errors.New("the OIDC client secret is not set on this daemon (sync NATIVE_OPS_OIDC_CLIENT_SECRET)")
+	}
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
 		"redirect_uri":  {o.RedirectURL},
 		"client_id":     {o.ClientID},
-		"client_secret": {o.ClientSecret},
+		"client_secret": {secret},
 	}
 	if verifier != "" {
 		form.Set("code_verifier", verifier)
