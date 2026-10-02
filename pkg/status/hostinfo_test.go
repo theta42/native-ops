@@ -93,9 +93,9 @@ func TestParseCert(t *testing.T) {
 
 func TestCollectEdgeReadsRoutesAndCerts(t *testing.T) {
 	f := &fakeExec{out: map[string]string{
-		"caddy adapt":        caddyConfig,
+		"caddy adapt":                   caddyConfig,
 		"find /root/.local/share/caddy": "/data/caddy/certificates/acme/x/example.com.crt\n",
-		"example.com.crt": testCertPEM(t),
+		"example.com.crt":               testCertPEM(t),
 	}}
 	e := collectEdge(context.Background(), f, "edge")
 	if len(e.Routes) != 2 || e.Routes[0].Host != "*.opsavor.work" {
@@ -109,7 +109,10 @@ func TestCollectEdgeReadsRoutesAndCerts(t *testing.T) {
 	}
 }
 
-type fakeDNS struct{ records map[string][]provider.DNSRecord; failOn string }
+type fakeDNS struct {
+	records map[string][]provider.DNSRecord
+	failOn  string
+}
 
 func (f fakeDNS) Name() string { return "fake" }
 func (f fakeDNS) SyncRecords(context.Context, string, []provider.DNSRecord) error {
@@ -150,7 +153,7 @@ func TestCollectFullIncludesMetricsEdgeDNS(t *testing.T) {
 		"cat /proc/meminfo": "MemTotal: 1000 kB\nMemAvailable: 400 kB\n",
 		"cat /proc/uptime":  "500.0 1000.0\n",
 		"df -Pk":            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 100 40 60 40% /\n",
-		"caddy adapt":           caddyConfig, "find /root/.local/share/caddy": "/root/.local/share/caddy/certificates/x/example.com.crt\n", "example.com.crt": testCertPEM(t),
+		"caddy adapt":       caddyConfig, "find /root/.local/share/caddy": "/root/.local/share/caddy/certificates/x/example.com.crt\n", "example.com.crt": testCertPEM(t),
 	}}
 	p := fakeDNS{records: map[string][]provider.DNSRecord{"opsavor.app": {{Type: "A", Name: "@", Value: "1.2.3.4"}}}}
 	s, err := CollectFull(context.Background(), f, Options{Pool: "default", EdgeContainer: "edge", DNS: p, DNSDomains: []string{"opsavor.app"}})
