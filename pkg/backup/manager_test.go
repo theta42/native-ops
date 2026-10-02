@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"regexp"
@@ -18,13 +19,18 @@ import (
 type fakeExec struct {
 	cmds       []string
 	exportBody []byte
+	instances  string // what `incus list --format json` answers (default: none)
+	failOn     string // a command containing this fails
 }
 
 func (f *fakeExec) Run(_ context.Context, command string) (string, error) {
 	f.cmds = append(f.cmds, command)
+	if f.failOn != "" && strings.Contains(command, f.failOn) {
+		return "", errors.New("Error: simulated failure")
+	}
 	switch {
 	case strings.Contains(command, "storage volume export"):
-		if m := regexp.MustCompile(`(\S+\.tar\.gz)`).FindStringSubmatch(command); m != nil {
+		if m := regexp.MustCompile(`'?([^'\s]+\.tar\.gz)`).FindStringSubmatch(command); m != nil {
 			if err := os.WriteFile(m[1], f.exportBody, 0o644); err != nil {
 				return "", err
 			}
@@ -32,6 +38,9 @@ func (f *fakeExec) Run(_ context.Context, command string) (string, error) {
 	case strings.Contains(command, "storage volume list"):
 		return `[{"name":"rest-sicily-data","type":"custom"},{"name":"gitea-data","type":"custom"}]`, nil
 	case strings.HasPrefix(command, "incus list"):
+		if f.instances != "" {
+			return f.instances, nil
+		}
 		return `[]`, nil
 	}
 	return "", nil
@@ -200,5 +209,83 @@ func TestParseObjectTime(t *testing.T) {
 	}
 	if _, ok := parseObjectTime("p/vol/latest.json"); ok {
 		t.Fatal("manifest should not parse as a timed object")
+	}
+}
+
+func inPlaceRig(t *testing.T, exec *fakeExec) *Manager {
+	t.Helper()
+	store := newFakeStore()
+	body := []byte("payload")
+	store.objects["incus/vol/20260101T000000Z.tar.gz"] = body
+	sum := sha256.Sum256(body)
+	store.objects["incus/vol/latest.json"] = []byte(`{"volume":"vol","key":"incus/vol/20260101T000000Z.tar.gz","sha256":"` + hex.EncodeToString(sum[:]) + `"}`)
+	exec.instances = `[{"name":"web","devices":{"data":{"type":"disk","source":"vol"}}}]`
+	mgr := New(exec, store, testCfg())
+	mgr.now = func() time.Time { return time.Date(2026, 10, 2, 9, 30, 0, 0, time.UTC) }
+	return mgr
+}
+
+func (f *fakeExec) index(sub string) int {
+	for i, c := range f.cmds {
+		if strings.Contains(c, sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestRestoreInPlaceCopiesTheVolumeAsideBeforeDeletingIt(t *testing.T) {
+	exec := &fakeExec{}
+	mgr := inPlaceRig(t, exec)
+	if err := mgr.Restore(context.Background(), RestoreOptions{Volume: "vol", Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	stop := exec.index("incus stop 'web'")
+	cp := exec.index("incus storage volume copy 'default/vol' 'default/vol-pre-restore-20261002t093000' --volume-only")
+	del := exec.index("incus storage volume delete 'default' 'vol'")
+	imp := exec.index("incus storage volume import 'default'")
+	start := exec.index("incus start 'web'")
+	if stop < 0 || cp < stop || del < cp || imp < del || start < imp {
+		t.Fatalf("want stop, copy aside, delete, import, start in that order: %q", exec.cmds)
+	}
+	if exec.has("snapshot create") {
+		t.Fatal("a snapshot of the volume is deleted with it; it is no recovery point")
+	}
+}
+
+func TestRestoreInPlaceFailedImportKeepsTheCopyAndRestartsContainers(t *testing.T) {
+	exec := &fakeExec{failOn: "storage volume import"}
+	mgr := inPlaceRig(t, exec)
+	err := mgr.Restore(context.Background(), RestoreOptions{Volume: "vol", Force: true})
+	if err == nil || !strings.Contains(err.Error(), "vol-pre-restore-20261002t093000") {
+		t.Fatalf("the error must name the volume that holds the data: %v", err)
+	}
+	if exec.has("storage volume delete 'default' 'vol-pre-restore") {
+		t.Fatal("the copy must never be deleted")
+	}
+	if exec.index("incus start 'web'") < 0 {
+		t.Fatal("containers stopped for the restore must be started again")
+	}
+}
+
+func TestRestoreInPlaceRefusesWithoutACopy(t *testing.T) {
+	exec := &fakeExec{failOn: "storage volume copy"}
+	mgr := inPlaceRig(t, exec)
+	if err := mgr.Restore(context.Background(), RestoreOptions{Volume: "vol", Force: true}); err == nil {
+		t.Fatal("a restore that could not copy the volume aside must fail")
+	}
+	if exec.has("storage volume delete") {
+		t.Fatal("nothing may be deleted without a copy")
+	}
+	if exec.index("incus start 'web'") < 0 {
+		t.Fatal("containers stopped for the restore must be started again")
+	}
+}
+
+func TestPreRestoreNameFitsIncus(t *testing.T) {
+	now := time.Date(2026, 10, 2, 9, 30, 0, 0, time.UTC)
+	n := preRestoreName(strings.Repeat("a", 70), now)
+	if len(n) > 63 || !strings.HasSuffix(n, "-pre-restore-20261002t093000") {
+		t.Fatalf("name %q (len %d)", n, len(n))
 	}
 }

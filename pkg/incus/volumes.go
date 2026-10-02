@@ -24,7 +24,7 @@ func (c *Client) DeleteVolumeSnapshot(ctx context.Context, pool, volume, snapsho
 	if pool == "" {
 		pool = "default"
 	}
-	_, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume snapshot delete %s %s %s", pool, volume, snapshot))
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume snapshot delete %s %s %s", ShQuote(pool), ShQuote(volume), ShQuote(snapshot)))
 	if err != nil {
 		return fmt.Errorf("delete snapshot %s/%s@%s: %w", pool, volume, snapshot, err)
 	}
@@ -39,7 +39,7 @@ func (c *Client) ExportVolumeSnapshot(ctx context.Context, pool, volumeRef, targ
 		pool = "default"
 	}
 	_, err := c.exec.Run(ctx, fmt.Sprintf(
-		"incus storage volume export %s %s %s --volume-only", pool, volumeRef, targetFile))
+		"incus storage volume export %s %s %s --volume-only", ShQuote(pool), ShQuote(volumeRef), ShQuote(targetFile)))
 	if err != nil {
 		return fmt.Errorf("export %s/%s: %w", pool, volumeRef, err)
 	}
@@ -52,9 +52,26 @@ func (c *Client) ImportVolume(ctx context.Context, pool, backupFile, newName str
 		pool = "default"
 	}
 	_, err := c.exec.Run(ctx, fmt.Sprintf(
-		"incus storage volume import %s %s %s", pool, backupFile, newName))
+		"incus storage volume import %s %s %s", ShQuote(pool), ShQuote(backupFile), ShQuote(newName)))
 	if err != nil {
 		return fmt.Errorf("import %s as %s: %w", backupFile, newName, err)
+	}
+	return nil
+}
+
+// DuplicateVolume copies a custom volume to a new volume in the same pool (data only, no snapshots).
+// The copy is independent of the source: deleting the source, with its snapshots, leaves it intact.
+func (c *Client) DuplicateVolume(ctx context.Context, pool, volume, copyName string) error {
+	if pool == "" {
+		pool = "default"
+	}
+	if !ValidName(pool) || !ValidName(volume) || !ValidName(copyName) {
+		return fmt.Errorf("invalid pool/volume names %q/%q -> %q", pool, volume, copyName)
+	}
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume copy %s %s --volume-only",
+		ShQuote(pool+"/"+volume), ShQuote(pool+"/"+copyName)))
+	if err != nil {
+		return fmt.Errorf("copy volume %s/%s to %s: %w", pool, volume, copyName, err)
 	}
 	return nil
 }
@@ -79,7 +96,7 @@ func (c *Client) ListCustomVolumes(ctx context.Context, pool string) ([]string, 
 	if pool == "" {
 		pool = "default"
 	}
-	out, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume list %s --format json", pool))
+	out, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume list %s --format json", ShQuote(pool)))
 	if err != nil {
 		return nil, fmt.Errorf("list volumes in %s: %w", pool, err)
 	}
@@ -130,7 +147,7 @@ func (c *Client) VolumeDependents(ctx context.Context, volume string) ([]string,
 
 // StopContainer stops an instance, ignoring an already-stopped state.
 func (c *Client) StopContainer(ctx context.Context, name string) error {
-	_, err := c.exec.Run(ctx, fmt.Sprintf("incus stop %s", name))
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus stop %s", ShQuote(name)))
 	if err != nil && !strings.Contains(err.Error(), "already stopped") {
 		return fmt.Errorf("stop %s: %w", name, err)
 	}
@@ -139,7 +156,7 @@ func (c *Client) StopContainer(ctx context.Context, name string) error {
 
 // StartContainer starts an instance, ignoring an already-running state.
 func (c *Client) StartContainer(ctx context.Context, name string) error {
-	_, err := c.exec.Run(ctx, fmt.Sprintf("incus start %s", name))
+	_, err := c.exec.Run(ctx, fmt.Sprintf("incus start %s", ShQuote(name)))
 	if err != nil && !strings.Contains(err.Error(), "already running") {
 		return fmt.Errorf("start %s: %w", name, err)
 	}
