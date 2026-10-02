@@ -76,6 +76,7 @@ type Server struct {
 	cachedAt time.Time
 
 	planSlots chan struct{}
+	logins    *loginThrottle
 	applyMu   sync.Mutex // one apply at a time on this host
 	jobsWG    sync.WaitGroup
 }
@@ -105,7 +106,7 @@ func New(opts Options) (*Server, error) {
 	if opts.StatusTTL <= 0 {
 		opts.StatusTTL = 5 * time.Second
 	}
-	return &Server{opts: opts, planSlots: make(chan struct{}, maxConcurrentPlans)}, nil
+	return &Server{opts: opts, planSlots: make(chan struct{}, maxConcurrentPlans), logins: newLoginThrottle()}, nil
 }
 
 type actorHolder struct {

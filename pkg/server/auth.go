@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
 const oidcStateCookie = "nops_oidc_state"
@@ -40,13 +41,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
+	if wait := s.logins.Wait(body.Username); wait > 0 {
+		s.setActor(r, body.Username)
+		auditDetail(r, "sign-in refused: too many failed attempts")
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too_many_attempts", "too many failed sign-ins for this account; wait a little and try again")
+		return
+	}
 	u, err := s.opts.Users.Authenticate(body.Username, body.Password)
 	if err != nil {
+		s.logins.Fail(body.Username)
 		s.setActor(r, body.Username)
 		auditDetail(r, "sign-in failed")
 		writeError(w, http.StatusUnauthorized, "bad_login", "wrong username or password")
 		return
 	}
+	s.logins.Succeed(body.Username)
 	s.opts.Sessions.SetCookie(w, r, s.opts.Sessions.Issue(u.Username, u.Role))
 	_ = s.opts.Users.TouchLogin(u.Username)
 	s.setActor(r, u.Username)

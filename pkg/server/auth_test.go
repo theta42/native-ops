@@ -222,6 +222,13 @@ func TestLoginSetsACookieAndTheAPIHonoursIt(t *testing.T) {
 	if res := post(`{"username":"sam","password":"the wrong password"}`); res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("bad password: %d", res.StatusCode)
 	}
+	// Repeated failures for one account are refused for a while, even with the right password.
+	for i := 0; i <= throttleFree; i++ {
+		post(`{"username":"mallory","password":"guess guess guess"}`)
+	}
+	if res := post(`{"username":"mallory","password":"guess guess guess"}`); res.StatusCode != http.StatusTooManyRequests || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("a guessed-at account must be throttled: %d", res.StatusCode)
+	}
 	res := post(`{"username":"sam","password":"a long enough password"}`)
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("login: %d", res.StatusCode)
