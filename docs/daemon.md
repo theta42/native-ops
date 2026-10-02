@@ -170,7 +170,9 @@ curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succe
   the end of the job.
 
 The UI (`/`) has a Plans page (each plan, what it would do, who asked, and an Approve or Withdraw
-button for admins) and, when apply is on, a Jobs page with each job's outcome and log.
+button for admins), a Jobs page with each job's outcome and log whenever anything that changes the
+host is enabled, and, for admins on a daemon that builds images, a Recipes page to approve or withdraw
+image recipes.
 
 An apply runs `incus` as the daemon's user (which is in `incus-admin`, so it can do to instances
 whatever a deployer's manifest says) and host hooks (`pre_deploy`, `post_deploy`) as that user,
@@ -240,13 +242,16 @@ What stops a fleet manager, or anyone holding its token, from doing more than th
 `POST /v1/images/build?app=<app>&ref=<ref>` builds `<prefix><app>:<ref>` from the uploaded tree's
 recipe: it runs `scripts/build-image.sh <app> <ref>`, which builds in a throwaway container and
 publishes the image. Off unless the daemon has `--enable-image-build`; `--image-prefix` is what the
-recipe names images before `<app>` (default `opsavor-`, kept for existing daemons), and a scoped
-token's `--images` globs are checked against that name.
+recipe names images before `<app>` (default `app-`, the starter recipe's default), and a scoped
+token's `--images` globs are checked against that name. The daemon runs the recipe with
+`NATIVE_OPS_IMAGE_PREFIX` set to it, so a recipe that reads it always agrees; one that names images
+itself must be matched by setting `--image-prefix` (or `NATIVE_OPS_IMAGE_PREFIX` in
+`/etc/native-ops/serve.env`) to what it produces.
 
 That script runs **on the host, as the daemon's user**, so whoever writes it can run anything there.
 The daemon therefore builds only from a recipe an admin has approved: the digest of every file under
 `scripts/` and `images/` in the upload. An unapproved recipe is refused with
-`403 recipe_not_approved` and the digest; an admin approves it once:
+`403 recipe_not_approved` and the digest; an admin approves it once, on the UI's Recipes page or:
 
 ```bash
 native-ops image recipe-digest --config-dir .                # the digest of a checkout

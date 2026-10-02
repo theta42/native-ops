@@ -79,6 +79,7 @@ const summary = (c) => Object.entries(c || {}).filter(([, n]) => n).map(([k, n])
 const PLAN_STATE = { pending: "warning", approved: "success", used: "secondary", expired: "dark", blocked: "danger", nothing: "light" };
 const JOB_STATE = { running: "primary", succeeded: "success", failed: "danger", interrupted: "warning" };
 const stateBadge = (state, kinds) => badge(state, kinds[state] || "secondary");
+const RECIPE_STATE = { approved: "success", waiting: "warning" };
 
 // ---- views -----------------------------------------------------------------
 
@@ -292,18 +293,58 @@ function planView(p) {
       h("a", { href: "#/plans", class: "btn btn-sm btn-outline-secondary" }, icon("arrow-left", "me-1"), "All plans")));
 }
 
+// ---- image recipes ------------------------------------------------------------
+
+// An image build runs the uploaded recipe (scripts/ and images/) on the host, so the daemon builds only
+// from a recipe an admin approved. This page lists the recipes builds were asked for.
+function recipesView(d) {
+  const rows = (d.recipes || []).map((r) => {
+    const approved = !!r.approved_at;
+    const buttons = [];
+    if (role === "admin") {
+      const b = approved
+        ? h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("ban", "me-1"), "Withdraw")
+        : h("button", { type: "button", class: "btn btn-sm btn-success" }, icon("check", "me-1"), "Approve");
+      b.addEventListener("click", () => approved
+        ? act("DELETE", `/v1/images/recipes/${r.digest}/approval`, "Approval withdrawn: builds from this recipe are refused again.")
+        : act("POST", `/v1/images/recipes/${r.digest}/approve`, "Approved: builds from this recipe may run, for any ref."));
+      buttons.push(b);
+    }
+    return [
+      when(r.last_seen),
+      r.last_actor || "",
+      r.last_app || "",
+      r.last_sha ? r.last_sha.slice(0, 8) : "",
+      stateBadge(approved ? "approved" : "waiting", RECIPE_STATE),
+      approved ? `${r.approved_by}, ${when(r.approved_at)}` : "",
+      h("code", { title: r.digest }, short(r.digest)),
+      h("span", {}, buttons),
+    ];
+  });
+  return card("hammer", "Image recipes",
+    h("div", {},
+      h("div", { class: "card-body pb-0" }, h("p", { class: "text-muted small mb-2" },
+        "A build runs the uploaded scripts/ and images/ on this host, so it runs only from a recipe an admin approved. " +
+        "One approval covers every ref built from the same recipe; any change to a build script is a new recipe.")),
+      rows.length
+        ? table(["Last asked", "By", "App", "Commit", "State", "Approved", "Recipe", ""], rows)
+        : empty("No build has been asked for yet.")),
+    h("span", { class: "badge text-bg-secondary" }, rows.length));
+}
+
 function jobsView(d) {
-  if (d.disabled) return card("list-check", "Jobs", empty("Apply is not enabled on this daemon (it was started without --enable-apply), so there are no jobs."));
+  if (d.disabled) return card("list-check", "Jobs", empty("Nothing that changes the host is enabled on this daemon, so there are no jobs."));
   const rows = (d.jobs || []).map((j) => [
     when(j.created),
     stateBadge(j.status, JOB_STATE),
     j.actor,
     j.sha ? j.sha.slice(0, 8) : "",
-    h("a", { href: "#/plans/" + j.plan_hash }, short(j.plan_hash)),
+    [j.kind || "apply", j.service].filter(Boolean).join(" "),
+    j.plan_hash ? h("a", { href: "#/plans/" + j.plan_hash }, short(j.plan_hash)) : "",
     h("a", { href: "#/jobs/" + j.id }, j.id),
   ]);
   return card("list-check", "Jobs",
-    rows.length ? table(["Started", "Status", "By", "Commit", "Plan", "Job"], rows) : empty("No apply has run yet."),
+    rows.length ? table(["Started", "Status", "By", "Commit", "What", "Plan", "Job"], rows) : empty("No job has run yet."),
     h("span", { class: "badge text-bg-secondary" }, rows.length));
 }
 
@@ -313,8 +354,9 @@ function jobView(j) {
       ["Status", stateBadge(j.status, JOB_STATE)],
       ["Started by", j.actor],
       ["Commit", j.sha],
-      ["Service", j.service],
-      ["Plan", h("a", { href: "#/plans/" + j.plan_hash }, short(j.plan_hash))],
+      ["Kind", j.kind],
+      ["Subject", j.service],
+      ["Plan", j.plan_hash ? h("a", { href: "#/plans/" + j.plan_hash }, short(j.plan_hash)) : ""],
       ["Started", when(j.created)],
       ["Finished", when(j.finished)],
       ["Error", j.error],
@@ -330,6 +372,7 @@ const pages = [
   { re: /^\/plans\/([0-9a-f]{64})$/, nav: "/plans", load: (m) => api("/v1/plans/" + m[1]), render: planView },
   { re: /^\/jobs$/, nav: "/jobs", load: () => api("/v1/jobs").catch((e) => { if (e.status === 404) return { disabled: true }; throw e; }), render: jobsView },
   { re: /^\/jobs\/(j-[0-9]+-[0-9a-f]{8})$/, nav: "/jobs", load: (m) => api("/v1/jobs/" + m[1]), render: jobView },
+  { re: /^\/recipes$/, nav: "/recipes", load: () => api("/v1/images/recipes"), render: recipesView },
 ];
 
 const routes = { "/": overviewView, "/instances": instancesView, "/volumes": volumesView, "/network": networkView };
@@ -417,6 +460,8 @@ async function start() {
   if (!signedIn()) return;
   api("/v1/whoami").then((w) => {
     role = w.role;
+    // Recipes are an admin's page, and only on a daemon that builds images.
+    if (role === "admin") api("/v1/images/recipes").then(() => { document.getElementById("nav-recipes").hidden = false; }).catch(() => {});
     document.getElementById("who-text").textContent = `${w.name} (${w.role})`;
     document.getElementById("who").hidden = false;
     render();
@@ -441,6 +486,7 @@ function signOut(message) {
   loadError = message || "";
   document.getElementById("nav-plans").hidden = true;
   document.getElementById("nav-jobs").hidden = true;
+  document.getElementById("nav-recipes").hidden = true;
   document.getElementById("who").hidden = true;
   document.getElementById("who-text").textContent = "";
   render();
@@ -450,7 +496,7 @@ document.getElementById("signout").addEventListener("click", () => signOut());
 window.addEventListener("hashchange", () => {
   notice = null;
   render();
-  if (sessionStorage.getItem(KEY) && currentRoute().page) refresh();
+  if (signedIn() && currentRoute().page) refresh();
 });
 
 // The footer shows the daemon's version; /healthz is open and carries nothing else.
