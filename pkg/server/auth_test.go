@@ -126,7 +126,8 @@ func fakeIdP(t *testing.T, userinfo map[string]any) *httptest.Server {
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		if r.Form.Get("code") != "good" {
+		// The code was issued for the challenge of "the-verifier" (see TestOIDCGenericFlowAndChecks).
+		if r.Form.Get("code") != "good" || r.Form.Get("code_verifier") != "the-verifier" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -155,22 +156,26 @@ func TestOIDCGenericFlowAndChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	authURL, err := cfg.AuthorizeURL(ctx, "state123")
+	authURL, err := cfg.AuthorizeURL(ctx, "state123", PKCEChallenge("the-verifier"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	redirect := url.QueryEscape(idp.URL + "/auth/oidc/callback")
-	for _, want := range []string{"client_id=cid", "state=state123", "response_type=code", "redirect_uri=" + redirect} {
+	for _, want := range []string{"client_id=cid", "state=state123", "response_type=code", "redirect_uri=" + redirect,
+		"code_challenge_method=S256", "code_challenge=" + PKCEChallenge("the-verifier")} {
 		if !strings.Contains(authURL, want) {
 			t.Fatalf("authorize url missing %q: %s", want, authURL)
 		}
 	}
-	at, err := cfg.Exchange(ctx, "good")
+	at, err := cfg.Exchange(ctx, "good", "the-verifier")
 	if err != nil || at != "at-123" {
 		t.Fatalf("exchange: %v", err)
 	}
-	if _, err := cfg.Exchange(ctx, "bad"); err == nil {
+	if _, err := cfg.Exchange(ctx, "bad", "the-verifier"); err == nil {
 		t.Fatal("a bad code was exchanged")
+	}
+	if _, err := cfg.Exchange(ctx, "good", "another-verifier"); err == nil {
+		t.Fatal("a code was exchanged without its PKCE verifier")
 	}
 	id, err := cfg.Identity(ctx, at)
 	if err != nil || id.Email != "will@opsavor.ai" || id.Name != "Will" {

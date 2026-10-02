@@ -270,6 +270,9 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			return nil, nil, err
 		}
 		opts.OIDC = oidc
+		if cfg.OIDC.AllowedDomain == "" {
+			log.Printf("warning: OIDC sign-in has no --oidc-allowed-domain: anyone the identity provider vouches for may sign in, as %s", oidc.Role)
+		}
 	}
 	srv, err := server.New(opts)
 	if err != nil {
