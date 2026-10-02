@@ -64,6 +64,14 @@ func (r *Reconciler) Validate(ctx context.Context) (*PlanSummary, error) {
 		return nil, fmt.Errorf("load fleet.yml: %w", err)
 	}
 
+	if d := fleet.Daemon; d != nil {
+		// The token is not needed to check the rest; a placeholder hash stands in for it.
+		di := &DaemonInstall{Version: d.Version, SHA256: strings.ToLower(d.SHA256), Arch: d.Arch,
+			BootstrapTokenSHA256: strings.Repeat("0", 64), ServeFlags: d.Flags}
+		if err := di.Validate(); err != nil {
+			return nil, fmt.Errorf("fleet.yml daemon: %w", err)
+		}
+	}
 	summary := &PlanSummary{
 		FleetName:   fleet.Name,
 		Domain:      fleet.Domain,
@@ -279,6 +287,19 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					Size:     fleet.Providers.DigitalOcean.DefaultSize,
 					Region:   fleet.Providers.DigitalOcean.Region,
 				}
+				// fleet.yml's daemon section: the new host installs the daemon from its cloud-init.
+				if fleet.Daemon != nil {
+					di, err := DaemonInstallFor(fleet.Daemon)
+					if err != nil {
+						return fmt.Errorf("provision host %s: daemon: %w", hostName, err)
+					}
+					ud, err := GenerateCloudInitUserDataWith(pubKeyStr, di)
+					if err != nil {
+						return fmt.Errorf("provision host %s: %w", hostName, err)
+					}
+					spec.UserData = ud
+					log.Printf("    The host's cloud-init installs the native-ops daemon %s\n", fleet.Daemon.Version)
+				}
 				// A throwaway key is acceptable here: this run uses it to SSH in. But a failure to
 				// register the key must stop the run BEFORE a droplet nobody can log in to is created.
 				if err := r.hostMgr.PrepareAccess(ctx, &spec, pubKeyStr, generatedKey, true); err != nil {
@@ -406,6 +427,15 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}
 		}
 
+		// The edge's own config (edge/Caddyfile) last, so the routes it adds -- the daemon's included, on a
+		// first bootstrap -- point at services that now exist. Normally this is POST /v1/edge/apply.
+		if _, err := os.Stat(filepath.Join(r.configDir, "edge", "Caddyfile")); err == nil {
+			log.Printf("==> [GitOps] Applying edge/Caddyfile to the edge container\n")
+			if err := ApplyEdgeConfig(ctx, activeExec, r.configDir, "edge"); err != nil {
+				return fmt.Errorf("apply edge/Caddyfile: %w", err)
+			}
+		}
+
 		diagEdge, _ := activeExec.Run(ctx, "sleep 10; echo '--- TAIL 40 CADDY LOG ---'; incus exec edge -- tail -n 40 /var/log/caddy.log || true")
 		log.Printf("==> [GitOps] Edge container diagnostics:\n%s\n", diagEdge)
 	}
@@ -416,4 +446,3 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	log.Printf("==> [GitOps] Full fleet reconciliation completed successfully!\n")
 	return nil
 }
-

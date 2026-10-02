@@ -1,10 +1,17 @@
 package engine
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/theta42/native-ops/pkg/config"
 )
 
 func testInstall() *DaemonInstall {
@@ -81,5 +88,44 @@ func TestDaemonInstallRejectsUnsafeValues(t *testing.T) {
 		if _, err := GenerateCloudInitUserDataWith("k", d); err == nil {
 			t.Errorf("%s: an unsafe value was accepted", name)
 		}
+	}
+}
+
+func TestDaemonInstallForTakesTheTokenFromTheEnvironmentAsAHash(t *testing.T) {
+	d := &config.DaemonConfig{Version: "v1.60.0", SHA256: strings.Repeat("A", 64), Flags: "--enable-apply"}
+	t.Setenv("NATIVE_OPS_BOOTSTRAP_TOKEN", "")
+	t.Setenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256", "")
+	if _, err := DaemonInstallFor(d); err == nil {
+		t.Fatal("no bootstrap token in the environment must be an error")
+	}
+	tok := "nops_" + strings.Repeat("e", 64)
+	t.Setenv("NATIVE_OPS_BOOTSTRAP_TOKEN", tok)
+	di, err := DaemonInstallFor(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(tok))
+	if di.BootstrapTokenSHA256 != hex.EncodeToString(sum[:]) || di.SHA256 != strings.Repeat("a", 64) || di.ServeFlags != "--enable-apply" {
+		t.Fatalf("install: %+v", di)
+	}
+	if got, _ := DaemonInstallFor(nil); got != nil {
+		t.Fatal("no daemon section, no install")
+	}
+}
+
+func TestValidateChecksTheDaemonSection(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) {
+		if err := os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("name: f\ndaemon:\n  version: v1.60.0\n  sha256: " + strings.Repeat("a", 64) + "\n")
+	if _, err := NewReconciler(dir, nil).Validate(context.Background()); err != nil {
+		t.Fatalf("a good daemon section: %v", err)
+	}
+	write("name: f\ndaemon:\n  version: latest\n  sha256: x\n")
+	if _, err := NewReconciler(dir, nil).Validate(context.Background()); err == nil {
+		t.Fatal("a daemon section without a pinned version and checksum must not validate")
 	}
 }

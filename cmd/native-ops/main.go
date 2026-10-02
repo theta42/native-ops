@@ -21,7 +21,6 @@ import (
 	"github.com/theta42/native-ops/pkg/provider/plugin"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/s3"
-	"github.com/theta42/native-ops/pkg/server"
 )
 
 var Version = "v1.0.0"
@@ -93,27 +92,29 @@ func main() {
 	}
 }
 
-func printUsage() {
-	fmt.Println(`native-ops - Generic Incus & Cloud Fleet Orchestration Engine (theta42)
+// usageText is the command list, printed by `native-ops` with no arguments. README.md carries a copy
+// (TestREADMECarriesTheUsage keeps them the same).
+const usageText = `native-ops - Generic Incus & Cloud Fleet Orchestration Engine (theta42)
 
 Usage:
   native-ops <command> [options]
 
 GitOps Commands:
-  validate         Validate manifests and show dry-run plan (used in PRs)
+  validate         Check the manifests parse and are consistent (no host access; used in PRs)
   reconcile        Provision the fleet's hosts, sync DNS and prepare Incus (services: via the daemon;
                    --deploy-services deploys them directly, bypassing approval)
 
-Remote daemon (runs on the host it manages; deployed by IaC, driven by CI over HTTPS):
+The daemon (runs on each host; CI drives it over HTTPS):
   status           Read-only view of the host's instances, volumes and images (--json)
   serve            Run the authenticated API + UI daemon (needs a state dir; see README)
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
   remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
-                   token-create (uploads the checked-out tree; NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
+                   token-create, recipe-approve (uploads the checked-out tree; NATIVE_OPS_URL,
+                   NATIVE_OPS_TOKEN)
 
 Core Commands:
-  host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)
+  host create      Provision a new cloud host (DigitalOcean; Proxmox is experimental)
   host destroy     Tear down a host VM
   host list        List active hosts for a provider
   plan             Show what apply would change, without changing anything
@@ -136,8 +137,11 @@ Core Commands:
   preview list     List active previews (with TTL)
   preview destroy  Tear down a preview (container + volume + route)
   preview gc       Destroy expired previews
-  dns sync         Sync DNS records using configured provider or python plugin
-  version          Print version information`)
+  dns sync         Sync DNS records through the configured provider or a script plugin
+  version          Print version information`
+
+func printUsage() {
+	fmt.Println(usageText)
 }
 
 func handleValidateCommand(ctx context.Context, args []string) {
@@ -215,20 +219,11 @@ func handleHostCommand(ctx context.Context, args []string) {
 		_, pub, generated := engine.LoadSSHCredentials()
 		if *daemonVersion != "" {
 			// The token stays with the caller (a CI secret); the host only learns its hash.
-			sum := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
-			if tok := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"); tok != "" {
-				if !server.ValidSecretFormat(tok) {
-					log.Fatal("Error: NATIVE_OPS_BOOTSTRAP_TOKEN must look like nops_ followed by at least 32 characters")
-				}
-				sum = server.HashSecret(tok)
+			di, err := engine.DaemonInstallFor(&config.DaemonConfig{Version: *daemonVersion, SHA256: *daemonSHA, Arch: *daemonArch, Flags: *daemonFlags})
+			if err != nil {
+				log.Fatalf("Error: %v", err)
 			}
-			if sum == "" {
-				log.Fatal("Error: --daemon-version needs NATIVE_OPS_BOOTSTRAP_TOKEN (or NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256) in the environment: the admin token CI will use to set the daemon up")
-			}
-			ud, err := engine.GenerateCloudInitUserDataWith(pub, &engine.DaemonInstall{
-				Version: *daemonVersion, SHA256: strings.ToLower(*daemonSHA), Arch: *daemonArch,
-				BootstrapTokenSHA256: strings.ToLower(sum), ServeFlags: *daemonFlags,
-			})
+			ud, err := engine.GenerateCloudInitUserDataWith(pub, di)
 			if err != nil {
 				log.Fatalf("Error: %v", err)
 			}

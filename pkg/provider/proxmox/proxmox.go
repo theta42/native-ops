@@ -122,15 +122,15 @@ func (c *Client) request(ctx context.Context, method, path string, bodyIn any, b
 }
 
 type pveVM struct {
-	VMID      int     `json:"vmid"`
-	Name      string  `json:"name"`
-	Status    string  `json:"status"` // "running", "stopped"
-	CPUs      int     `json:"cpus"`
-	MaxMem    int64   `json:"maxmem"`
-	MaxDisk   int64   `json:"maxdisk"`
-	NetIn     int64   `json:"netin"`
-	NetOut    int64   `json:"netout"`
-	Uptime    int64   `json:"uptime"`
+	VMID    int    `json:"vmid"`
+	Name    string `json:"name"`
+	Status  string `json:"status"` // "running", "stopped"
+	CPUs    int    `json:"cpus"`
+	MaxMem  int64  `json:"maxmem"`
+	MaxDisk int64  `json:"maxdisk"`
+	NetIn   int64  `json:"netin"`
+	NetOut  int64  `json:"netout"`
+	Uptime  int64  `json:"uptime"`
 }
 
 func (c *Client) toHost(vm *pveVM) *provider.Host {
@@ -154,30 +154,42 @@ func (c *Client) toHost(vm *pveVM) *provider.Host {
 }
 
 func (c *Client) CreateHost(ctx context.Context, spec config.HostSpec) (*provider.Host, error) {
-	// Allocate next VMID or parse from spec
-	var nextID int
-	if err := c.request(ctx, http.MethodGet, "/cluster/nextid", nil, &nextID); err != nil {
+	// The next free VMID. The API answers it as a string ("105"); accept a number too.
+	var rawID json.RawMessage
+	if err := c.request(ctx, http.MethodGet, "/cluster/nextid", nil, &rawID); err != nil {
 		return nil, fmt.Errorf("get next VMID: %w", err)
 	}
+	nextID, err := strconv.Atoi(strings.Trim(string(rawID), `"`))
+	if err != nil {
+		return nil, fmt.Errorf("get next VMID: unexpected answer %s", rawID)
+	}
 
-	cores := spec.Cores
+	// Cores and memory from the spec, else from a size such as "4c-8192mb", else 2 cores and 4 GB.
+	cores, memMB := spec.Cores, spec.MemoryMB
+	if sc, sm := parseSize(spec.Size); cores <= 0 || memMB <= 0 {
+		if cores <= 0 {
+			cores = sc
+		}
+		if memMB <= 0 {
+			memMB = sm
+		}
+	}
 	if cores <= 0 {
 		cores = 2
 	}
-	memMB := spec.MemoryMB
 	if memMB <= 0 {
 		memMB = 4096
 	}
 
 	payload := map[string]any{
-		"vmid":    nextID,
-		"name":    spec.Name,
-		"cores":   cores,
-		"memory":  memMB,
-		"net0":    "virtio,bridge=vmbr0,firewall=1",
-		"scsihw":  "virtio-scsi-pci",
-		"ostype":  "l26",
-		"agent":   "1",
+		"vmid":   nextID,
+		"name":   spec.Name,
+		"cores":  cores,
+		"memory": memMB,
+		"net0":   "virtio,bridge=vmbr0,firewall=1",
+		"scsihw": "virtio-scsi-pci",
+		"ostype": "l26",
+		"agent":  "1",
 	}
 
 	path := fmt.Sprintf("/nodes/%s/qemu", c.node)
@@ -230,18 +242,7 @@ func (c *Client) ResizeHost(ctx context.Context, hostID string, newSize string) 
 		return fmt.Errorf("invalid VMID: %s", hostID)
 	}
 
-	// Parse size e.g. "4c-8192mb" or "4"
-	var cores int
-	var memMB int
-	if strings.Contains(newSize, "c") {
-		parts := strings.Split(newSize, "-")
-		cores, _ = strconv.Atoi(strings.TrimSuffix(parts[0], "c"))
-		if len(parts) > 1 {
-			memMB, _ = strconv.Atoi(strings.TrimSuffix(parts[1], "mb"))
-		}
-	} else {
-		cores, _ = strconv.Atoi(newSize)
-	}
+	cores, memMB := parseSize(newSize)
 
 	payload := map[string]any{}
 	if cores > 0 {
@@ -277,4 +278,23 @@ func (c *Client) DestroyHost(ctx context.Context, hostID string) error {
 	}
 
 	return nil
+}
+
+// parseSize reads a size such as "4c-8192mb" (cores and memory in MB) or "4" (cores only). A part it
+// cannot read is 0.
+func parseSize(size string) (cores, memMB int) {
+	size = strings.ToLower(strings.TrimSpace(size))
+	if size == "" {
+		return 0, 0
+	}
+	if !strings.Contains(size, "c") {
+		cores, _ = strconv.Atoi(size)
+		return cores, 0
+	}
+	parts := strings.SplitN(size, "-", 2)
+	cores, _ = strconv.Atoi(strings.TrimSuffix(parts[0], "c"))
+	if len(parts) > 1 {
+		memMB, _ = strconv.Atoi(strings.TrimSuffix(parts[1], "mb"))
+	}
+	return cores, memMB
 }

@@ -14,11 +14,11 @@ import (
 
 // ContainerState represents the parsed JSON state of an Incus container.
 type ContainerState struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"` // "Running", "Stopped", "Frozen"
-	IPv4    string `json:"ipv4,omitempty"`
-	CPU     string `json:"cpu,omitempty"`
-	Memory  string `json:"memory,omitempty"`
+	Name    string    `json:"name"`
+	Status  string    `json:"status"` // "Running", "Stopped", "Frozen"
+	IPv4    string    `json:"ipv4,omitempty"`
+	CPU     string    `json:"cpu,omitempty"`
+	Memory  string    `json:"memory,omitempty"`
 	Created time.Time `json:"created_at"`
 }
 

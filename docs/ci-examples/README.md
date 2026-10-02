@@ -1,6 +1,9 @@
 # Example pipelines
 
-Copy these into your config repository (`.github/workflows/` or `.gitea/workflows/`) and adjust the
+The complete, maintained set lives in the starter config repository,
+[theta42/native-ops-conf](https://github.com/theta42/native-ops-conf) (including Bootstrap and
+Release an app); fork that to start. These are the minimal versions, to copy into an existing config
+repository (`.github/workflows/` or `.gitea/workflows/`) and adjust the
 URL and the pinned version. Each one installs the pinned, checksum-verified `native-ops` binary and
 talks to the daemon with `native-ops remote`; none of them holds an SSH key or a cloud credential.
 

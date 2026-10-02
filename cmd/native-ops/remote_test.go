@@ -80,3 +80,13 @@ func TestWaitFollowsAJobToItsEnd(t *testing.T) {
 		t.Fatalf("polled %d times", polls.Load())
 	}
 }
+
+func TestREADMECarriesTheUsage(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(readme), usageText) {
+		t.Fatal("README.md's CLI Usage block must be exactly usageText (copy `native-ops` with no arguments into it)")
+	}
+}

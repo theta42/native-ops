@@ -40,7 +40,7 @@ func (f *forwardExec) RunWithInput(context.Context, string, io.Reader) (string, 
 	return "", nil
 }
 func (f *forwardExec) WriteFile(context.Context, string, []byte, os.FileMode) error { return nil }
-func (f *forwardExec) Close() error                                                  { return nil }
+func (f *forwardExec) Close() error                                                 { return nil }
 
 func TestEnsureForwardsAddsMissingDevice(t *testing.T) {
 	f := &forwardExec{devices: map[string]map[string]string{}}
