@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/theta42/native-ops/pkg/provider"
 	"github.com/theta42/native-ops/pkg/provider/digitalocean"
 	"github.com/theta42/native-ops/pkg/remote"
+	"github.com/theta42/native-ops/pkg/selfupdate"
 	"github.com/theta42/native-ops/pkg/server"
 	"github.com/theta42/native-ops/pkg/status"
 )
@@ -139,8 +141,15 @@ func handleServeCommand(ctx context.Context, args []string) {
 	default:
 		log.Fatalf("unknown --dns-provider %q", *dnsProviderFlag)
 	}
+	// A daemon whose binary is in <state-dir>/bin can upgrade itself (POST /v1/daemon/upgrade): the job
+	// swaps the binary, and Restart ends this process with exitRestart so systemd starts the new one.
+	restartCtx, restartNow := context.WithCancel(context.Background())
+	var restarting atomic.Bool
+	binDir := filepath.Join(openStateDir(*stateDir), "bin")
 	srv, closeFn, err := newDaemon(daemonConfig{
-		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
+		SelfUpgradeDir: managedBinDir(binDir),
+		Restart:        func() { restarting.Store(true); restartNow() },
+		Addr:           *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
 		EnableImageBuild: *enableImageBuild,
 		ImagePrefix:      *imagePrefix,
@@ -164,11 +173,34 @@ func handleServeCommand(ctx context.Context, args []string) {
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v)", Version, *addr, *stateDir, *enableApply)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { <-restartCtx.Done(); cancel() }()
+	if managedBinDir(binDir) != "" {
+		go selfupdate.Commit(ctx, binDir, log.Printf)
+	}
+	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v, self-upgrade: %v)", Version, *addr, *stateDir, *enableApply, managedBinDir(binDir) != "")
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+	if restarting.Load() {
+		log.Printf("stopped to restart on the upgraded binary")
+		closeFn()
+		os.Exit(exitRestart)
+	}
 	log.Printf("stopped")
+}
+
+// exitRestart is the exit status after a self-upgrade: not 0, so that the unit's Restart=on-failure
+// starts the new binary.
+const exitRestart = 75
+
+// managedBinDir is dir when the running binary is the one in it (the daemon may replace it), else "".
+func managedBinDir(dir string) string {
+	if selfupdate.Managed(dir) {
+		return dir
+	}
+	return ""
 }
 
 type daemonConfig struct {
@@ -183,7 +215,13 @@ type daemonConfig struct {
 	EnableDNSSync        bool
 	// DNSProviderName ("digitalocean") lists DNS records for the status page with the provider's token
 	// read through the secret store at each listing; DNS, when set, is used instead (tests).
-	DNSProviderName      string
+	DNSProviderName string
+	// SelfUpgradeDir, when set, is the directory of the running binary, and the daemon serves
+	// POST /v1/daemon/upgrade; Restart ends the process so systemd starts the upgraded binary.
+	SelfUpgradeDir string
+	Restart        func()
+	// ReleaseBase overrides where upgrades are downloaded from (tests).
+	ReleaseBase          string
 	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
@@ -249,7 +287,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Plan:    planSource(cfg.Exec, key),
 		Secrets: secrets,
 	}
-	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply || cfg.EnableBackup || cfg.EnableDNSSync {
+	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply || cfg.EnableBackup || cfg.EnableDNSSync || cfg.SelfUpgradeDir != "" {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
 		if err != nil {
 			audit.Close()
@@ -275,6 +313,10 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 				return nil, nil, fmt.Errorf("--image-prefix %q: lowercase letters, digits, dots and dashes", cfg.ImagePrefix)
 			}
 			opts.ImageBuild = imageBuildSource(cfg.Exec, cfg.ImagePrefix)
+		}
+		if cfg.SelfUpgradeDir != "" {
+			up := &selfupdate.Updater{Dir: cfg.SelfUpgradeDir, ReleaseBase: cfg.ReleaseBase}
+			opts.Upgrade, opts.Restart = up.Install, cfg.Restart
 		}
 		if cfg.EnableBackup {
 			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup), restoreSource(cfg.Exec, cfg.Pool, lookup)

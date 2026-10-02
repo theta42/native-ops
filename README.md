@@ -96,8 +96,8 @@ The daemon (runs on each host; CI drives it over HTTPS):
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
   remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
-                   token-create, recipe-approve, secret-sync (uploads the checked-out tree;
-                   NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
+                   token-create, recipe-approve, secret-sync, daemon-upgrade (uploads the
+                   checked-out tree; NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
 
 Core Commands:
   host create      Provision a new cloud host (DigitalOcean; Proxmox is experimental)
@@ -448,6 +448,9 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
   recipe (`scripts/` + `images/`) an admin approved; a scoped token can touch only its own instances.
 - **Maintenance is CI-scheduled.** Backups, retention and DNS sync are daemon jobs a scheduled
   pipeline starts (`native-ops remote backup --prune`, `dns-sync`).
+- **The daemon upgrades itself from CI.** `native-ops remote daemon-upgrade --version ... --sha256 ...`:
+  checksum-pinned, swapped in with the previous binary kept, and rolled back by the unit if the new one
+  cannot stay up.
 - **Credentials are entered in git, kept on the host.** The daemon's own credentials (DNS token, backup
   keys, OIDC secret) go into the git server's secret store; CI pushes them to the daemon
   (`native-ops remote secret-sync`), which keeps them on the host. Nobody logs in to put them there.

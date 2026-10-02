@@ -34,6 +34,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/backups?volume=&prune=1` | deployer | back up one volume, or every volume `fleet.yml` allows, then optionally apply retention, as a job (only with `--enable-backup`) |
 | `POST /v1/backups/restore?volume=&from=&as=&force=1` | admin | restore a volume in place (keeping a copy of the current one) or as a new volume, as a job (only with `--enable-backup`) |
 | `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (only with `--enable-dns-sync`) |
+| `POST /v1/daemon/upgrade` | admin | upgrade this daemon to a pinned release (`{version, sha256}`), as a job; it then restarts on the new binary (when the binary is in `<state-dir>/bin`) |
 | `GET/PUT /v1/secrets`, `DELETE /v1/secrets/{name}` | admin | the daemon's own credentials, pushed from the git server's secret store; names only are ever returned |
 | `GET/POST /v1/tokens`, `DELETE /v1/tokens/{id}` | admin | list, create (the secret is returned once) and revoke API tokens |
 | `GET/POST /v1/users`, `PATCH /v1/users/{username}` | admin | list and create local users; change a role, disable, or set a password (with `--enable-auth` or OIDC) |
@@ -441,6 +442,41 @@ useradd --system --home-dir /var/lib/native-ops --shell /usr/sbin/nologin -G inc
 Then route it through the edge, e.g. a Caddy site `native-ops.example.com { reverse_proxy 10.0.100.1:8686 }`
 with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the host.
 
+### Upgrading the daemon (from CI)
+
+The daemon upgrades itself, so nobody logs in to the host for that either:
+
+```bash
+NATIVE_OPS_TOKEN=$ADMIN_TOKEN native-ops remote daemon-upgrade --version v1.56.0 --sha256 <from checksums.txt>
+```
+
+1. `POST /v1/daemon/upgrade` (admin) starts a job, taking the host lock like any change.
+2. The job downloads `native-ops_<version>_linux_<arch>.tar.gz` from the releases, checks it against
+   the pinned SHA-256, unpacks it and runs it once: it must report the version asked for. Any failure
+   leaves everything as it was.
+3. It keeps the current binary as `native-ops.prev`, swaps the new one in, and marks the upgrade
+   pending. The daemon then exits with status 75 once running jobs have ended, and systemd starts the
+   new binary (`Restart=on-failure`).
+4. The unit's guard (`ExecStartPre`) counts the new binary's starts. One that has served for 30 seconds
+   commits the upgrade; one that fails to start 3 times is replaced by `native-ops.prev` again, so a bad
+   release puts the old daemon back by itself.
+5. `remote daemon-upgrade` waits for the job, then for `/healthz` to report the new version, and fails
+   if the old one comes back instead.
+
+This needs the binary in the daemon's state directory (`/var/lib/native-ops/bin/native-ops`), which
+the daemon's user can write, with the unit shipped in `deploy/systemd`: hosts made by
+`host create --daemon-version` or `reconcile` are set up that way. To move an existing install over
+(once, on the host):
+
+```bash
+install -d -o native-ops -g native-ops -m 0700 /var/lib/native-ops/bin
+install -o native-ops -g native-ops -m 0755 /path/to/native-ops /var/lib/native-ops/bin/native-ops
+# then use deploy/systemd/native-ops-serve.service's ExecStartPre (the guard), its ExecStart path,
+# and StartLimitBurst=10; systemctl daemon-reload && systemctl restart native-ops-serve
+```
+
+A daemon started from anywhere else (a root-owned `/usr/local/bin`, say) does not serve the endpoint.
+
 ### The state directory
 
 Everything the daemon keeps is in `--state-dir` (default `/var/lib/native-ops`, 0700):
@@ -456,6 +492,7 @@ Everything the daemon keeps is in `--state-dir` (default `/var/lib/native-ops`, 
 | `jobs/` | every job's record and log (the last 200) |
 | `recipes.json` | image recipes asked for, and which an admin approved |
 | `audit.log` | one JSON line per request and per finished job (never a value or credential) |
+| `bin/` | the daemon's binary, the previous one, and the upgrade markers (see above) |
 
 All files are 0600. Back the directory up if losing approvals, job history or users matters to you;
 tokens and secrets can be re-created from the git server.

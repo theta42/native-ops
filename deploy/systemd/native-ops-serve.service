@@ -5,6 +5,8 @@ Description=native-ops daemon (API + UI)
 Documentation=https://github.com/theta42/native-ops/blob/main/docs/daemon.md
 After=network-online.target incus.service
 Wants=network-online.target
+# The guard below may need a few starts to roll back a bad upgrade: do not give up before it can.
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -13,7 +15,10 @@ Group=native-ops
 SupplementaryGroups=incus-admin
 # Listen on loopback, or on the Incus bridge address so the edge container can proxy to it.
 # TLS is terminated by the edge; never expose this port directly.
-ExecStart=/usr/local/bin/native-ops serve --addr 127.0.0.1:8686 --state-dir /var/lib/native-ops
+# The binary lives in the state directory, which the daemon may write, so it can upgrade itself
+# (POST /v1/daemon/upgrade). The guard restores the previous binary if an upgraded one cannot stay up.
+ExecStartPre=/bin/sh -c 'd=/var/lib/native-ops/bin; if [ -f "$$d/upgrade.pending" ]; then n=$$(cat "$$d/upgrade.attempts" 2>/dev/null || echo 0); n=$$((n+1)); echo "$$n" > "$$d/upgrade.attempts"; if [ "$$n" -gt 3 ] && [ -f "$$d/native-ops.prev" ]; then mv -f "$$d/native-ops.prev" "$$d/native-ops"; rm -f "$$d/upgrade.pending" "$$d/upgrade.attempts"; echo "native-ops: upgrade did not start 3 times; restored the previous binary" >&2; fi; fi'
+ExecStart=/var/lib/native-ops/bin/native-ops serve --addr 127.0.0.1:8686 --state-dir /var/lib/native-ops
 # Provisioned by IaC/CI (an org secret written to this root-owned 0600 file):
 #   NATIVE_OPS_BOOTSTRAP_TOKEN=nops_<at least 32 characters>
 # or, where the file's content may be read back by others (cloud-init user-data), only its hash:

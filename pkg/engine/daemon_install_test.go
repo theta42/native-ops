@@ -43,7 +43,7 @@ func TestCloudInitInstallsTheDaemonAndStaysValidYAML(t *testing.T) {
 	inc := strings.Index(run, "apt-get install -y incus")
 	dl := strings.Index(run, "releases/download/v1.54.0/native-ops_v1.54.0_linux_amd64.tar.gz")
 	sum := strings.Index(run, strings.Repeat("a", 64)+"  /tmp/native-ops.tgz' | sha256sum -c -")
-	inst := strings.Index(run, "install -m 0755")
+	inst := strings.Index(run, "/var/lib/native-ops/bin/native-ops")
 	start := strings.Index(run, "systemctl enable --now native-ops-serve")
 	if inc < 0 || dl < inc || sum < dl || inst < sum || start < inst {
 		t.Fatalf("want incus, then download, checksum, install, start, in order:\n%s", run)
