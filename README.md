@@ -10,7 +10,7 @@
 ## Key Features
 
 - **Multi-Level Orchestration**:
-  - **Level 0 (Host / VM Lifecycle)**: Provision, resize, and destroy host VMs on **DigitalOcean** or **Proxmox VE** with automated cloud-init Incus bootstrapping.
+  - **Level 0 (Host / VM Lifecycle)**: Provision, resize, and destroy hosts on **DigitalOcean**, with cloud-init that installs Incus and the native-ops daemon (**Proxmox VE** is experimental: see [#45](https://github.com/theta42/native-ops/issues/45)).
   - **Level 1 (Incus & Edge Workloads)**: Declarative service deployments, template-driven dynamic tenant instances, storage volume management (`security.shifted=true`), cgroup live resizing, and automated health checks.
   - **Level 2 (Workload Mobility)**: Cross-host container and volume migration (`native-ops instance migrate`) across cloud providers and on-prem nodes.
 - **Pluggable DNS Architecture**: Native DigitalOcean DNS support + extensible Python/Bash script plugins (`providers/dns/*.py`) defined in user configuration repos.
@@ -85,12 +85,22 @@ native-ops - Generic Incus & Cloud Fleet Orchestration Engine (theta42)
 Usage:
   native-ops <command> [options]
 
-Commands:
-  remote           Drive a host's daemon from CI: plan, apply, edge-apply, backup, restore,
-                   dns-sync, wait, token-create, recipe-approve
-  serve            Run the daemon on a host (API + UI)
-  reconcile        Provision the fleet's hosts, sync DNS and prepare Incus
-  host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)
+GitOps Commands:
+  validate         Check the manifests parse and are consistent (no host access; used in PRs)
+  reconcile        Provision the fleet's hosts, sync DNS and prepare Incus (services: via the daemon;
+                   --deploy-services deploys them directly, bypassing approval)
+
+The daemon (runs on each host; CI drives it over HTTPS):
+  status           Read-only view of the host's instances, volumes and images (--json)
+  serve            Run the authenticated API + UI daemon (needs a state dir; see README)
+  token create     Create an API token (also: token list, token revoke)
+  user create      Create a local UI user (also: user list, user passwd, user role, user disable)
+  remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
+                   token-create, recipe-approve (uploads the checked-out tree; NATIVE_OPS_URL,
+                   NATIVE_OPS_TOKEN)
+
+Core Commands:
+  host create      Provision a new cloud host (DigitalOcean; Proxmox is experimental)
   host destroy     Tear down a host VM
   host list        List active hosts for a provider
   plan             Show what apply would change, without changing anything
@@ -100,7 +110,20 @@ Commands:
   instance resize  Live CPU/memory cgroup resizing
   instance destroy Delete an instance and its Caddy route
   instance migrate Move an instance and its volumes across Incus remotes (--finalize removes the source)
-  dns sync         Sync DNS records using configured provider or python plugin
+  backup init      Create the destination bucket if it does not exist
+  backup create    Back up one custom volume to S3-compatible object storage
+  backup all       Back up every (allowlisted) custom volume
+  backup list      List stored backups for a volume
+  backup restore   Restore a volume from a stored backup
+  backup prune     Apply retention to a volume's stored backups
+  image build      Build + publish an app image from a git ref (conf recipe)
+  image recipe-digest  Print the digest of scripts/ + images/ a daemon must have approved to build
+  edge apply       Apply the config repo's edge/Caddyfile to the edge container (validated, with rollback)
+  preview launch   Deploy an ephemeral preview from a template + ref
+  preview list     List active previews (with TTL)
+  preview destroy  Tear down a preview (container + volume + route)
+  preview gc       Destroy expired previews
+  dns sync         Sync DNS records through the configured provider or a script plugin
   version          Print version information
 ```
 
@@ -122,7 +145,10 @@ with a random, already-expired root password and cannot be logged in to at all. 
 therefore **refuses to run without a configured key** (it will not invent a throwaway one that
 is lost when the command exits), and stops before creating anything if the key can't be registered.
 
-#### 2. Provision a Proxmox VE KVM Host
+#### 2. Provision a Proxmox VE KVM Host (experimental)
+
+Listing, resizing and destroying Proxmox VMs work. Creating one makes an empty VM with no OS or
+cloud-init yet, so it is not a usable host; see [#45](https://github.com/theta42/native-ops/issues/45).
 ```bash
 export PVE_ENDPOINT="https://pve.example.com:8006"
 export PVE_API_TOKEN="root@pam!token=xxxx-xxxx"
@@ -236,7 +262,7 @@ Moving DNS / edge routing between the two steps is not automated yet.
 ```yaml
 name: my-cluster
 domain: example.com
-dns_provider: digitalocean # or "cloudflare", "custom_plugin"
+dns_provider: digitalocean # built in; or the name of a script plugin in providers/dns/ (CLI only)
 
 network:
   bridge_name: incusbr0
@@ -246,9 +272,20 @@ providers:
   digitalocean:
     region: nyc1
     default_size: s-4vcpu-8gb
-  proxmox:
-    endpoint: https://pve.example.com:8006
-    node: pve-01
+
+# address: auto -> reconcile finds the host by name at the provider, or creates it.
+# A host you already run: provider: static, address: <its IP>.
+hosts:
+  node-01:
+    provider: digitalocean
+    address: auto
+
+# The daemon a new host installs from cloud-init (the bootstrap token's hash comes from
+# NATIVE_OPS_BOOTSTRAP_TOKEN in the environment of reconcile or host create).
+daemon:
+  version: v1.54.0
+  sha256: <sha256 of native-ops_v1.54.0_linux_amd64.tar.gz, from checksums.txt>
+  flags: "--addr 10.0.100.1:8686 --enable-apply --enable-edge-apply"
 
 # Records kept in sync by `native-ops dns sync` (create or update, never delete),
 # beyond the computed apex + wildcard A. Each names its own zone.

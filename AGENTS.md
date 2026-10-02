@@ -3,7 +3,7 @@
 ## Project Overview
 
 `native-ops` is a generic, open-source Infrastructure-as-Code (IaC) and fleet orchestration engine written in Go. It automates:
-1. **Level 0 (Cloud/Hypervisor VMs)**: Host provisioning, resizing, and destruction on DigitalOcean Droplets, Proxmox VE KVM/LXC, or on-prem nodes.
+1. **Level 0 (Cloud/Hypervisor VMs)**: Host provisioning, resizing, and destruction on DigitalOcean Droplets (Proxmox VE is experimental, #45), or adopting existing hosts (`provider: static`).
 2. **Level 1 (Incus Workloads & Edge Proxy)**: Immutable container lifecycle, `security.shifted=true` persistent storage volumes, live cgroup limits, and dynamic Caddy edge routing.
 3. **Level 2 (Workload Mobility)**: Cross-host container and volume migration (`native-ops instance migrate`).
 
@@ -19,14 +19,21 @@
 ## Build and Test
 
 ```bash
-# Run unit tests
-go test -v ./...
+# What CI runs (.github/workflows/pr-test.yml); all of it must pass before a merge
+gofmt -l .                      # must print nothing
+go mod tidy && git diff --exit-code go.mod go.sum
+go vet ./...
+go test -race ./...
+node --check pkg/server/ui/static/js/app.js
+
+# Against a real Incus server (on a host; not run in CI)
+go test -tags integration ./pkg/incus
 
 # Build local binary
 go build -o bin/native-ops ./cmd/native-ops
 
-# Check CLI commands
-./bin/native-ops --help
+# Check CLI commands (README.md's CLI Usage block must match this output; a test checks it)
+./bin/native-ops
 ```
 
 ## Repository Layout
@@ -52,3 +59,12 @@ native-ops/
 ├── images/                   # Generic base and edge container recipes
 └── scripts/                  # Generic host provisioning and helper scripts
 ```
+
+## Testing conventions
+
+- Engine code never talks to Incus directly: it runs commands through `remote.Executor`, and tests
+  use a simulator (`hostSim` in `pkg/engine`, `edgeSim` in `pkg/caddy`) or a recording fake. File
+  contents and scripts go over stdin (`RunWithInput`), never in a command line.
+- Provider clients (DigitalOcean, Proxmox, S3) are tested against `httptest` fakes of their APIs.
+- Every daemon endpoint has tests for its role gate (no token, viewer, scoped token) and its job.
+- Plan and apply share their decisions; the idempotency tests run both against the same states.
