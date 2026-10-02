@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/theta42/native-ops/pkg/server"
+	"github.com/theta42/native-ops/pkg/status"
 )
 
 func TestPackTreeIsAcceptedByTheDaemonsExtractor(t *testing.T) {
@@ -161,5 +162,33 @@ func TestLazyDOReadsTheTokenAtEachCall(t *testing.T) {
 	tok = "dop_x"
 	if _, err := l.client(); err != nil {
 		t.Fatalf("a token synced later must be used: %v", err)
+	}
+}
+
+func TestRemoteSecretSyncPushesTheNamedVariables(t *testing.T) {
+	dir := t.TempDir()
+	tokens, _ := server.OpenTokenStore(filepath.Join(dir, "tokens.json"))
+	admin, _, _ := tokens.Create("ci-secrets", server.RoleAdmin)
+	store, _ := server.OpenSecretStore(filepath.Join(dir, "secrets.json"))
+	audit, _ := server.OpenAudit(filepath.Join(dir, "audit.log"))
+	defer audit.Close()
+	srv, err := server.New(server.Options{Tokens: tokens, Audit: audit, Secrets: store,
+		Status: func(context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	t.Setenv("NATIVE_OPS_URL", ts.URL)
+	t.Setenv("NATIVE_OPS_TOKEN", admin)
+	t.Setenv("DO_API_TOKEN", "dop_from_git")
+	t.Setenv("BACKUP_S3_SECRET_KEY", "")
+	handleRemoteCommand(context.Background(), []string{"secret-sync", "DO_API_TOKEN", "BACKUP_S3_SECRET_KEY"})
+	if v, ok := store.Get("DO_API_TOKEN"); !ok || v != "dop_from_git" {
+		t.Fatalf("the variable was not pushed: %q %v", v, ok)
+	}
+	if _, ok := store.Get("BACKUP_S3_SECRET_KEY"); ok {
+		t.Fatal("an empty variable must not be pushed")
 	}
 }
