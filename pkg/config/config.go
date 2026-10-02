@@ -20,6 +20,9 @@ type FleetConfig struct {
 	Providers   ProvidersConfig       `yaml:"providers"`
 	Hosts       map[string]HostConfig `yaml:"hosts"`
 	Backup      *BackupConfig         `yaml:"backup,omitempty"`
+	// Daemon, when set, has a host that reconcile creates install the native-ops daemon from its
+	// cloud-init (see engine.DaemonInstall); the bootstrap admin token comes from the environment.
+	Daemon *DaemonConfig `yaml:"daemon,omitempty"`
 	// DNSRecords are records kept in sync by `dns sync` (and reconcile): arbitrary A/AAAA/CNAME/MX/TXT
 	// beyond the computed apex/wildcard A. Each names its own zone, so a fleet that spans zones (and
 	// leaves `domain` empty) can still declare records — e.g. an MX for an intake domain.
@@ -131,6 +134,14 @@ func (b *BackupConfig) ValidateForBackup() error {
 type NetworkConfig struct {
 	BridgeName string `yaml:"bridge_name"` // default: incusbr0
 	IPv4CIDR   string `yaml:"ipv4_cidr"`   // default: 10.0.100.0/24
+}
+
+// DaemonConfig pins the native-ops release a new host's cloud-init installs as its daemon.
+type DaemonConfig struct {
+	Version string `yaml:"version"`         // release tag, e.g. v1.60.0
+	SHA256  string `yaml:"sha256"`          // of native-ops_<version>_linux_<arch>.tar.gz (checksums.txt)
+	Arch    string `yaml:"arch,omitempty"`  // amd64 (default) or arm64
+	Flags   string `yaml:"flags,omitempty"` // extra `native-ops serve` flags, e.g. "--enable-apply"
 }
 
 type ProvidersConfig struct {

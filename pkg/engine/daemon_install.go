@@ -1,13 +1,17 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/theta42/native-ops/deploy"
+	"github.com/theta42/native-ops/pkg/config"
 )
 
 // DaemonInstall asks a new host's cloud-init to install the native-ops daemon, so the host can be
@@ -36,6 +40,32 @@ var (
 	serveFlagsRe = regexp.MustCompile(`^[A-Za-z0-9 _=,.:/@-]*$`)
 	releaseURLRe = regexp.MustCompile(`^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~%/-]*)?$`)
 )
+
+// DaemonInstallFor turns fleet.yml's daemon section into an install, taking the bootstrap admin token
+// from the environment: NATIVE_OPS_BOOTSTRAP_TOKEN (hashed here; the host only ever sees the hash) or
+// NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256. It returns nil for a nil section.
+func DaemonInstallFor(d *config.DaemonConfig) (*DaemonInstall, error) {
+	if d == nil {
+		return nil, nil
+	}
+	sum := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
+	if tok := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"); tok != "" {
+		if !strings.HasPrefix(tok, "nops_") || len(tok) < len("nops_")+32 {
+			return nil, fmt.Errorf("NATIVE_OPS_BOOTSTRAP_TOKEN must look like nops_ followed by at least 32 characters")
+		}
+		h := sha256.Sum256([]byte(tok))
+		sum = hex.EncodeToString(h[:])
+	}
+	if sum == "" {
+		return nil, fmt.Errorf("installing the daemon needs NATIVE_OPS_BOOTSTRAP_TOKEN (or NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256) in the environment: the admin token CI will use to set the daemon up")
+	}
+	di := &DaemonInstall{Version: d.Version, SHA256: strings.ToLower(d.SHA256), Arch: d.Arch,
+		BootstrapTokenSHA256: strings.ToLower(sum), ServeFlags: d.Flags}
+	if err := di.Validate(); err != nil {
+		return nil, err
+	}
+	return di, nil
+}
 
 // Validate reports why the install cannot be written into a cloud-init. Every value ends up in a shell
 // command or a unit file, so each is held to a narrow shape.

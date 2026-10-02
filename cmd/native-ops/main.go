@@ -21,7 +21,6 @@ import (
 	"github.com/theta42/native-ops/pkg/provider/plugin"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/s3"
-	"github.com/theta42/native-ops/pkg/server"
 )
 
 var Version = "v1.0.0"
@@ -215,20 +214,11 @@ func handleHostCommand(ctx context.Context, args []string) {
 		_, pub, generated := engine.LoadSSHCredentials()
 		if *daemonVersion != "" {
 			// The token stays with the caller (a CI secret); the host only learns its hash.
-			sum := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
-			if tok := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"); tok != "" {
-				if !server.ValidSecretFormat(tok) {
-					log.Fatal("Error: NATIVE_OPS_BOOTSTRAP_TOKEN must look like nops_ followed by at least 32 characters")
-				}
-				sum = server.HashSecret(tok)
+			di, err := engine.DaemonInstallFor(&config.DaemonConfig{Version: *daemonVersion, SHA256: *daemonSHA, Arch: *daemonArch, Flags: *daemonFlags})
+			if err != nil {
+				log.Fatalf("Error: %v", err)
 			}
-			if sum == "" {
-				log.Fatal("Error: --daemon-version needs NATIVE_OPS_BOOTSTRAP_TOKEN (or NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256) in the environment: the admin token CI will use to set the daemon up")
-			}
-			ud, err := engine.GenerateCloudInitUserDataWith(pub, &engine.DaemonInstall{
-				Version: *daemonVersion, SHA256: strings.ToLower(*daemonSHA), Arch: *daemonArch,
-				BootstrapTokenSHA256: strings.ToLower(sum), ServeFlags: *daemonFlags,
-			})
+			ud, err := engine.GenerateCloudInitUserDataWith(pub, di)
 			if err != nil {
 				log.Fatalf("Error: %v", err)
 			}
