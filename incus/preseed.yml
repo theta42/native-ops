@@ -1,4 +1,4 @@
-# Incus initialization preseed for opsavor-node-1.
+# Incus initialization preseed for a single-node host.
 # Non-interactive: sudo incus admin init --preseed < incus/preseed.yml
 #
 # Uses dir storage on the root filesystem. On DO droplets, ZFS DKMS fails

@@ -8,7 +8,7 @@
 # its own field — `{print $2}` on a matched row prints the ALIAS back
 # (field 2), not the FINGERPRINT (field 4). Every script that shelled out to
 # that awk one-liner therefore fed the colon-bearing alias (e.g.
-# "opsavor-manager:latest") straight into `incus launch`, which is exactly
+# "app-manager:latest") straight into `incus launch`, which is exactly
 # the string gotcha #3 warns is misparsed as a remote name. Parse the JSON
 # instead so this can't silently drift again with a column-width change.
 image_fingerprint() {

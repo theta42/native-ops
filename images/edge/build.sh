@@ -34,7 +34,7 @@ mkdir -p /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy
 # EnvironmentFile instead (see AGENTS.md gotcha #1).
 cat > /etc/systemd/system/caddy.service <<'SVC'
 [Unit]
-Description=Caddy web server (opsavor edge)
+Description=Caddy web server (edge)
 After=network.target
 
 [Service]
