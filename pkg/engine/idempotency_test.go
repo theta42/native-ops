@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +21,7 @@ import (
 // volumes, image aliases, files, and a Caddy edge container). It lets the tests
 // run a command twice and assert that the second run changes nothing.
 type hostSim struct {
+	stdin   string // what the current RunWithInput call was fed
 	t       *testing.T
 	ctrs    map[string]*simCtr
 	volumes map[string]bool
@@ -62,10 +62,10 @@ var (
 	simFlagRe   = regexp.MustCompile(`--(profile|config) '([^']*)'`)
 	simListRe   = regexp.MustCompile(`^incus list '?([^' ]+)'? --format json$`)
 	simDevRe    = regexp.MustCompile(`^incus config device add '([^']+)' '([^']+)' '?(\w+)'?((?: '[^']*')*)$`)
-	simPushRe   = regexp.MustCompile(`^printf %s '([^']*)' \| base64 -d \| incus file push .* - '([^/']+)(/[^']*)'$`)
+	simPushRe   = regexp.MustCompile(`^incus file push .* - '([^/']+)(/[^']*)'$`)
 	simPullRe   = regexp.MustCompile(`^incus file pull '([^/']+)(/[^']*)' -$`)
 	simExecRe   = regexp.MustCompile(`^incus exec '?([^' ]+)'? -- (.*)$`)
-	simHookRe   = regexp.MustCompile(`^echo '([^']*)' \| base64 -d \| (bash|incus exec '([^']+)' -- bash)$`)
+	simHookRe   = regexp.MustCompile(`^(bash -s|incus exec '([^']+)' -- bash -s)$`)
 	simQuotedRe = regexp.MustCompile(`'([^']*)'`)
 	// simStatRe/simChownRe match the two calls EnsurePathOwner makes: a plain read of the current owner,
 	// then -- only when it differs -- a chown to the one asked for.
@@ -218,19 +218,17 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		return content, nil
 	case simPushRe.MatchString(cmd):
 		m := simPushRe.FindStringSubmatch(cmd)
-		c, ok := s.get(m[2])
+		c, ok := s.get(m[1])
 		if !ok {
 			return "", errors.New("Error: Instance not found")
 		}
-		raw, _ := base64.StdEncoding.DecodeString(m[1])
-		c.files[m[3]] = string(raw)
+		c.files[m[2]] = s.stdin
 	case simHookRe.MatchString(cmd):
 		m := simHookRe.FindStringSubmatch(cmd)
-		raw, _ := base64.StdEncoding.DecodeString(m[1])
-		if m[3] != "" {
-			s.inits = append(s.inits, string(raw))
+		if m[2] != "" {
+			s.inits = append(s.inits, s.stdin)
 		} else {
-			s.hooks = append(s.hooks, string(raw))
+			s.hooks = append(s.hooks, s.stdin)
 		}
 	case simExecRe.MatchString(cmd):
 		m := simExecRe.FindStringSubmatch(cmd)
@@ -272,9 +270,14 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 	}
 	return "", nil
 }
-func (s *hostSim) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
-func (s *hostSim) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
-func (s *hostSim) Close() error                                                    { return nil }
+func (s *hostSim) RunWithInput(ctx context.Context, cmd string, in io.Reader) (string, error) {
+	b, _ := io.ReadAll(in)
+	s.stdin = string(b)
+	defer func() { s.stdin = "" }()
+	return s.Run(ctx, cmd)
+}
+func (s *hostSim) WriteFile(context.Context, string, []byte, os.FileMode) error { return nil }
+func (s *hostSim) Close() error                                                 { return nil }
 
 func (s *hostSim) mutations() []string {
 	var out []string

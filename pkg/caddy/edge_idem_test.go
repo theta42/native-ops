@@ -2,7 +2,6 @@ package caddy
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"os"
@@ -16,6 +15,7 @@ import (
 
 // edgeSim simulates the edge container's filesystem and Caddy.
 type edgeSim struct {
+	stdin       string // what the current RunWithInput call was fed
 	files       map[string]string
 	cmds        []string
 	writes      int // file pushes
@@ -38,7 +38,7 @@ var _ remote.Executor = (*edgeSim)(nil)
 func newEdgeSim() *edgeSim { return &edgeSim{files: map[string]string{}} }
 
 var (
-	pushRe = regexp.MustCompile(`^printf %s '([^']*)' \| base64 -d \| incus file push .* - 'edge(/[^']*)'$`)
+	pushRe = regexp.MustCompile(`^incus file push .* - 'edge(/[^']*)'$`)
 	pullRe = regexp.MustCompile(`^incus file pull 'edge(/[^']*)' -$`)
 )
 
@@ -52,8 +52,7 @@ func (s *edgeSim) Run(_ context.Context, cmd string) (string, error) {
 		return c, nil
 	}
 	if m := pushRe.FindStringSubmatch(cmd); m != nil {
-		raw, _ := base64.StdEncoding.DecodeString(m[1])
-		s.files[m[2]] = string(raw)
+		s.files[m[1]] = s.stdin
 		s.writes++
 		return "", nil
 	}
@@ -86,9 +85,14 @@ func (s *edgeSim) Run(_ context.Context, cmd string) (string, error) {
 	}
 	return "", nil
 }
-func (s *edgeSim) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
-func (s *edgeSim) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
-func (s *edgeSim) Close() error                                                    { return nil }
+func (s *edgeSim) RunWithInput(ctx context.Context, cmd string, in io.Reader) (string, error) {
+	b, _ := io.ReadAll(in)
+	s.stdin = string(b)
+	defer func() { s.stdin = "" }()
+	return s.Run(ctx, cmd)
+}
+func (s *edgeSim) WriteFile(context.Context, string, []byte, os.FileMode) error { return nil }
+func (s *edgeSim) Close() error                                                 { return nil }
 
 func (s *edgeSim) mutations() int { return s.writes + s.removes + s.reloads + s.restarts }
 

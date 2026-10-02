@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
@@ -182,8 +181,9 @@ func hookScript(configDir, svcName, hook string) string {
 }
 
 func (d *Deployer) runHostHook(ctx context.Context, label, svcName, script string) error {
-	b64 := base64.StdEncoding.EncodeToString([]byte(script))
-	out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | bash", b64))
+	// The script goes over stdin: a command line is visible to every user on the host, has a size
+	// limit, and is quoted in errors.
+	out, err := d.exec.RunWithInput(ctx, "bash -s", strings.NewReader(script))
 	if err != nil {
 		d.log("    %s hook failed for %s: %s (err: %v)\n", label, svcName, out, err)
 		return fmt.Errorf("%s hook failed for %s: %w (output: %s)", label, svcName, err, out)
@@ -192,8 +192,7 @@ func (d *Deployer) runHostHook(ctx context.Context, label, svcName, script strin
 }
 
 func (d *Deployer) runContainerHook(ctx context.Context, name, script string) error {
-	b64 := base64.StdEncoding.EncodeToString([]byte(script))
-	out, err := d.exec.Run(ctx, fmt.Sprintf("echo '%s' | base64 -d | incus exec %s -- bash", b64, incus.ShQuote(name)))
+	out, err := d.exec.RunWithInput(ctx, fmt.Sprintf("incus exec %s -- bash -s", incus.ShQuote(name)), strings.NewReader(script))
 	if err != nil {
 		d.log("    Container init failed for %s: %s (err: %v)\n", name, out, err)
 		return fmt.Errorf("container_init hook failed for %s: %w (output: %s)", name, err, out)

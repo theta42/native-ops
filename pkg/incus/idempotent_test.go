@@ -2,11 +2,9 @@ package incus
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -63,13 +61,11 @@ func TestWriteEnvironmentFileUsesFilePushWithOwnershipAndSortedContent(t *testin
 			t.Errorf("missing %q in %s", want, cmd)
 		}
 	}
-	m := regexp.MustCompile(`printf %s '([^']+)'`).FindStringSubmatch(cmd)
-	if m == nil {
-		t.Fatalf("no payload in %s", cmd)
+	if strings.Contains(cmd, "A=1") || strings.Contains(cmd, "printf") {
+		t.Fatalf("the content must go over stdin, never in the command line: %s", cmd)
 	}
-	raw, _ := base64.StdEncoding.DecodeString(m[1])
-	if string(raw) != "# Managed by native-ops for svc\nA=1\nB=2\n" {
-		t.Fatalf("payload = %q", raw)
+	if len(ex.stdins) != 1 || ex.stdins[0] != "# Managed by native-ops for svc\nA=1\nB=2\n" {
+		t.Fatalf("payload = %q", ex.stdins)
 	}
 	if err := c.WriteEnvironmentFile(context.Background(), "web", "svc;rm", nil); err == nil {
 		t.Error("unsafe service names must be rejected")
