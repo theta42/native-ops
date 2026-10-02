@@ -21,6 +21,7 @@ import (
 	"github.com/theta42/native-ops/pkg/provider/plugin"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/s3"
+	"github.com/theta42/native-ops/pkg/server"
 )
 
 var Version = "v1.0.0"
@@ -82,6 +83,9 @@ func main() {
 	case "user":
 		handleUserCommand(os.Args[2:])
 
+	case "remote":
+		handleRemoteCommand(ctx, os.Args[2:])
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", subcommand)
 		printUsage()
@@ -97,13 +101,16 @@ Usage:
 
 GitOps Commands:
   validate         Validate manifests and show dry-run plan (used in PRs)
-  reconcile        End-to-end GitOps cluster reconciliation (Level 0 + DNS + Level 1)
+  reconcile        Provision the fleet's hosts, sync DNS and prepare Incus (services: via the daemon;
+                   --deploy-services deploys them directly, bypassing approval)
 
 Remote daemon (runs on the host it manages; deployed by IaC, driven by CI over HTTPS):
   status           Read-only view of the host's instances, volumes and images (--json)
   serve            Run the authenticated API + UI daemon (needs a state dir; see README)
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
+  remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
+                   token-create (uploads the checked-out tree; NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
 
 Core Commands:
   host create      Provision a new cloud host / VM (DigitalOcean, Proxmox)
@@ -123,6 +130,7 @@ Core Commands:
   backup restore   Restore a volume from a stored backup
   backup prune     Apply retention to a volume's stored backups
   image build      Build + publish an app image from a git ref (conf recipe)
+  image recipe-digest  Print the digest of scripts/ + images/ a daemon must have approved to build
   edge apply       Apply the config repo's edge/Caddyfile to the edge container (validated, with rollback)
   preview launch   Deploy an ephemeral preview from a template + ref
   preview list     List active previews (with TTL)
@@ -135,10 +143,12 @@ Core Commands:
 func handleValidateCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("validate", flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	deployServices := flags.Bool("deploy-services", false, "Also deploy every service directly over SSH (break-glass: bypasses the daemon's plan approval, host lock and job record). Normally services go through `native-ops remote plan` / `apply`")
 	_ = flags.Parse(args)
 
 	exec := remote.NewLocalExecutor()
 	rec := engine.NewReconciler(*configDir, exec)
+	rec.DeployServices = *deployServices
 
 	summary, err := rec.Validate(ctx)
 	if err != nil {
@@ -156,10 +166,12 @@ func handleValidateCommand(ctx context.Context, args []string) {
 func handleReconcileCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("reconcile", flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
+	deployServices := flags.Bool("deploy-services", false, "Also deploy every service directly over SSH (break-glass: bypasses the daemon's plan approval, host lock and job record). Normally services go through `native-ops remote plan` / `apply`")
 	_ = flags.Parse(args)
 
 	exec := remote.NewLocalExecutor()
 	rec := engine.NewReconciler(*configDir, exec)
+	rec.DeployServices = *deployServices
 
 	if err := rec.Reconcile(ctx); err != nil {
 		log.Fatalf("Reconciliation failed: %v", err)
@@ -183,6 +195,10 @@ func handleHostCommand(ctx context.Context, args []string) {
 		name := flags.String("name", "", "Host name")
 		size := flags.String("size", "s-4vcpu-8gb", "Host size slug or specs")
 		region := flags.String("region", "nyc1", "Provider region")
+		daemonVersion := flags.String("daemon-version", "", "Install this native-ops release as the host's daemon from cloud-init (e.g. v1.54.0); needs --daemon-sha256 and a bootstrap token")
+		daemonSHA := flags.String("daemon-sha256", "", "SHA-256 of the release's linux tarball (from its checksums.txt)")
+		daemonArch := flags.String("daemon-arch", "amd64", "Architecture of the daemon release: amd64 or arm64")
+		daemonFlags := flags.String("daemon-flags", "", "Extra `native-ops serve` flags for the daemon, e.g. '--enable-apply --enable-edge-apply'")
 		_ = flags.Parse(args[1:])
 
 		if *name == "" {
@@ -196,9 +212,31 @@ func handleHostCommand(ctx context.Context, args []string) {
 			Region:   *region,
 		}
 
+		_, pub, generated := engine.LoadSSHCredentials()
+		if *daemonVersion != "" {
+			// The token stays with the caller (a CI secret); the host only learns its hash.
+			sum := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
+			if tok := os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"); tok != "" {
+				if !server.ValidSecretFormat(tok) {
+					log.Fatal("Error: NATIVE_OPS_BOOTSTRAP_TOKEN must look like nops_ followed by at least 32 characters")
+				}
+				sum = server.HashSecret(tok)
+			}
+			if sum == "" {
+				log.Fatal("Error: --daemon-version needs NATIVE_OPS_BOOTSTRAP_TOKEN (or NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256) in the environment: the admin token CI will use to set the daemon up")
+			}
+			ud, err := engine.GenerateCloudInitUserDataWith(pub, &engine.DaemonInstall{
+				Version: *daemonVersion, SHA256: strings.ToLower(*daemonSHA), Arch: *daemonArch,
+				BootstrapTokenSHA256: strings.ToLower(sum), ServeFlags: *daemonFlags,
+			})
+			if err != nil {
+				log.Fatalf("Error: %v", err)
+			}
+			spec.UserData = ud
+		}
+
 		// Register the operator's SSH key first, so the host can be logged in to. A key
 		// generated on the fly is refused: it would be lost when this command exits.
-		_, pub, generated := engine.LoadSSHCredentials()
 		if err := hm.PrepareAccess(ctx, &spec, pub, generated, false); err != nil {
 			log.Fatalf("Host creation failed: %v", err)
 		}
@@ -209,6 +247,9 @@ func handleHostCommand(ctx context.Context, args []string) {
 		}
 		fmt.Printf("Created host %s (%s) at IP: %s\n", host.Name, host.ID, host.PublicIP)
 		fmt.Printf("Log in with the private key whose public half was registered: ssh root@%s\n", host.PublicIP)
+		if *daemonVersion != "" {
+			fmt.Printf("The native-ops daemon %s is being installed by cloud-init; it listens on 127.0.0.1:8686 (put the edge in front of it) and accepts the bootstrap token.\n", *daemonVersion)
+		}
 
 	case "destroy":
 		providerName := flags.String("provider", "digitalocean", "Provider (digitalocean, proxmox)")
@@ -493,11 +534,19 @@ func handleDNSCommand(ctx context.Context, args []string) {
 		fmt.Printf("DNS records synced for %s (apex and wildcard -> %s)\n", dom, *targetIP)
 	}
 
-	// Records declared in fleet.yml (`dns_records:`), grouped by zone. A sync only creates or updates;
-	// it never deletes a record it was not told about.
+	logf := func(format string, a ...any) { fmt.Printf(format+"\n", a...) }
+	if err := syncDeclaredRecords(ctx, fleet, dnsProv, logf); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// syncDeclaredRecords creates or updates the records declared in fleet.yml (`dns_records:`), zone by
+// zone. A sync never deletes a record it was not told about. `dns sync` and the daemon's
+// POST /v1/dns/sync both use it.
+func syncDeclaredRecords(ctx context.Context, fleet *config.FleetConfig, dnsProv provider.DNSProvider, logf func(string, ...any)) error {
 	byZone, err := fleet.DNSRecordsByZone()
 	if err != nil {
-		log.Fatalf("dns_records: %v", err)
+		return fmt.Errorf("dns_records: %w", err)
 	}
 	zones := make([]string, 0, len(byZone))
 	for z := range byZone {
@@ -512,13 +561,23 @@ func handleDNSCommand(ctx context.Context, args []string) {
 			names = append(names, fmt.Sprintf("%s %s", r.Type, r.Name))
 		}
 		if err := dnsProv.SyncRecords(ctx, zone, records); err != nil {
-			log.Fatalf("DNS sync for %s failed: %v", zone, err)
+			return fmt.Errorf("DNS sync for %s failed: %w", zone, err)
 		}
-		fmt.Printf("DNS records synced for %s: %s\n", zone, strings.Join(names, ", "))
+		logf("DNS records synced for %s: %s", zone, strings.Join(names, ", "))
 	}
+	if len(zones) == 0 {
+		logf("fleet.yml declares no dns_records; nothing to sync")
+	}
+	return nil
 }
 
 func loadBackupStore(configDir string) (*backup.Manager, error) {
+	return loadBackupStoreWith(configDir, remote.NewLocalExecutor())
+}
+
+// loadBackupStoreWith builds the backup manager from fleet.yml's `backup:` section; the object store's
+// credentials come from this process's environment, never from the tree.
+func loadBackupStoreWith(configDir string, exec remote.Executor) (*backup.Manager, error) {
 	fleet, err := config.LoadFleetConfig(configDir)
 	if err != nil {
 		return nil, err
@@ -545,7 +604,7 @@ func loadBackupStore(configDir string) (*backup.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return backup.New(remote.NewLocalExecutor(), store, cfg), nil
+	return backup.New(exec, store, cfg), nil
 }
 
 func handleBackupCommand(ctx context.Context, args []string) {
@@ -646,13 +705,22 @@ func handleBackupCommand(ctx context.Context, args []string) {
 
 func handleImageCommand(ctx context.Context, args []string) {
 	if len(args) < 1 {
-		fmt.Println("Usage: native-ops image build <app> <ref> --config-dir <dir>")
+		fmt.Println("Usage: native-ops image build <app> <ref> --config-dir <dir>\n       native-ops image recipe-digest --config-dir <dir>")
 		os.Exit(1)
 	}
 	action := args[0]
 	flags := flag.NewFlagSet("image "+action, flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
 	_ = flags.Parse(args[1:])
+	if action == "recipe-digest" {
+		// What a daemon checks before it builds from this tree (see POST /v1/images/recipes/{digest}/approve).
+		d, err := engine.RecipeDigest(*configDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(d)
+		return
+	}
 	if action != "build" {
 		fmt.Fprintf(os.Stderr, "Unknown image action: %s\n", action)
 		os.Exit(1)

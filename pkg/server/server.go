@@ -52,10 +52,21 @@ type Options struct {
 	// ImageBuild, with Jobs, enables POST /v1/images/build. A token with a scope may use it for an
 	// image its scope allows (see InstanceOps); one without a scope may build anything.
 	ImageBuild ImageBuildFunc
+	// Recipes records which image recipes an admin has approved; required with ImageBuild, since a build
+	// runs the uploaded recipe's scripts on the host (see recipes.go).
+	Recipes *RecipeStore
+	// ImagePrefix is what the config repo's build recipe names an image before <app>:<ref> (its
+	// scripts/build-image.sh decides; e.g. "acme-"). A scoped token's image globs are checked against it.
+	ImagePrefix string
 	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
 	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
 	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
 	EdgeApply EdgeApplyFunc
+	// Backup, Restore and DNSSync, with Jobs, enable the maintenance endpoints (see maintenance.go):
+	// POST /v1/backups, POST /v1/backups/restore and POST /v1/dns/sync.
+	Backup  BackupFunc
+	Restore RestoreFunc
+	DNSSync DNSSyncFunc
 	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
 	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
 	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.
@@ -91,14 +102,19 @@ func New(opts Options) (*Server, error) {
 	if opts.OIDC != nil && opts.Users == nil {
 		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
 	}
-	if (opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil) && opts.Jobs == nil {
-		return nil, errors.New("apply, instances, image builds and edge applies need a job store: every change to the host is a job with a record")
+	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil ||
+		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil
+	if changes && opts.Jobs == nil {
+		return nil, errors.New("apply, instances, image builds, edge applies, backups and DNS syncs need a job store: every change to the host is a job with a record")
+	}
+	if opts.ImageBuild != nil && opts.Recipes == nil {
+		return nil, errors.New("image builds need a recipe store: a build runs the uploaded scripts, so only approved recipes may")
 	}
 	if opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil) {
 		return nil, errors.New("apply needs a plan source and a plan store (approvals) to check the plan against")
 	}
-	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil && opts.ImageBuild == nil && opts.EdgeApply == nil {
-		return nil, errors.New("a job store is only useful with apply, instances, image builds or edge applies")
+	if opts.Jobs != nil && !changes {
+		return nil, errors.New("a job store is only useful with apply, instances, image builds, edge applies, backups or DNS syncs")
 	}
 	if opts.JobDrain <= 0 {
 		opts.JobDrain = 5 * time.Minute
@@ -339,6 +355,14 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, snap)
 	}))
+	mux.Handle("GET /v1/tokens", s.auth(RoleAdmin, s.handleTokenList))
+	mux.Handle("POST /v1/tokens", s.auth(RoleAdmin, s.handleTokenCreate))
+	mux.Handle("DELETE /v1/tokens/{id}", s.auth(RoleAdmin, s.handleTokenRevoke))
+	if s.opts.Users != nil {
+		mux.Handle("GET /v1/users", s.auth(RoleAdmin, s.handleUserList))
+		mux.Handle("POST /v1/users", s.auth(RoleAdmin, s.handleUserCreate))
+		mux.Handle("PATCH /v1/users/{username}", s.auth(RoleAdmin, s.handleUserUpdate))
+	}
 	if s.opts.Plan != nil {
 		mux.Handle("POST /v1/plan", s.auth(RolePlanner, s.handlePlan))
 	}
@@ -366,9 +390,21 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.ImageBuild != nil {
 		mux.Handle("POST /v1/images/build", s.authScoped(RoleDeployer, s.handleImageBuild))
+		mux.Handle("GET /v1/images/recipes", s.auth(RoleAdmin, s.handleRecipeList))
+		mux.Handle("POST /v1/images/recipes/{digest}/approve", s.auth(RoleAdmin, s.handleRecipeApprove))
+		mux.Handle("DELETE /v1/images/recipes/{digest}/approval", s.auth(RoleAdmin, s.handleRecipeRevoke))
 	}
 	if s.opts.EdgeApply != nil {
 		mux.Handle("POST /v1/edge/apply", s.auth(RoleDeployer, s.handleEdgeApply))
+	}
+	if s.opts.Backup != nil {
+		mux.Handle("POST /v1/backups", s.auth(RoleDeployer, s.handleBackup))
+	}
+	if s.opts.Restore != nil {
+		mux.Handle("POST /v1/backups/restore", s.auth(RoleAdmin, s.handleRestore))
+	}
+	if s.opts.DNSSync != nil {
+		mux.Handle("POST /v1/dns/sync", s.auth(RoleDeployer, s.handleDNSSync))
 	}
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)

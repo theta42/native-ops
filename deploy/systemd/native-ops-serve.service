@@ -16,6 +16,8 @@ SupplementaryGroups=incus-admin
 ExecStart=/usr/local/bin/native-ops serve --addr 127.0.0.1:8686 --state-dir /var/lib/native-ops
 # Provisioned by IaC/CI (an org secret written to this root-owned 0600 file):
 #   NATIVE_OPS_BOOTSTRAP_TOKEN=nops_<at least 32 characters>
+# or, where the file's content may be read back by others (cloud-init user-data), only its hash:
+#   NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256=<hex sha256 of the token>
 EnvironmentFile=-/etc/native-ops/serve.env
 Environment=HOME=/var/lib/native-ops
 StateDirectory=native-ops

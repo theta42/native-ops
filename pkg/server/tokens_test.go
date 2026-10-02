@@ -133,3 +133,23 @@ func TestRoleOrdering(t *testing.T) {
 		t.Fatal("an unknown role has no access")
 	}
 }
+
+func TestBootstrapByHashAcceptsOnlyTheMatchingSecret(t *testing.T) {
+	store, err := OpenTokenStore(filepath.Join(t.TempDir(), "tokens.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := "nops_" + strings.Repeat("c", 64)
+	if err := store.SetBootstrapHash("nops_not-a-hash"); err == nil {
+		t.Fatal("a value that is not a hex SHA-256 must be refused")
+	}
+	if err := store.SetBootstrapHash(strings.ToUpper(HashSecret(secret))); err != nil {
+		t.Fatal(err)
+	}
+	if tok, ok := store.Verify(secret); !ok || tok.Role != RoleAdmin || tok.Name != "bootstrap" {
+		t.Fatalf("the secret whose hash was given must verify as the bootstrap admin: %v %v", tok, ok)
+	}
+	if _, ok := store.Verify("nops_" + strings.Repeat("d", 64)); ok {
+		t.Fatal("another secret must not verify")
+	}
+}

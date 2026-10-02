@@ -29,6 +29,28 @@ func NewHostManager() *HostManager {
 
 // GenerateCloudInitUserData produces the cloud-init script for Debian 13 Incus host setup.
 func GenerateCloudInitUserData(sshPubKey string) string {
+	s, _ := GenerateCloudInitUserDataWith(sshPubKey, nil)
+	return s
+}
+
+// GenerateCloudInitUserDataWith is GenerateCloudInitUserData that also installs the native-ops daemon
+// when daemon is not nil (see DaemonInstall).
+func GenerateCloudInitUserDataWith(sshPubKey string, daemon *DaemonInstall) (string, error) {
+	base := baseCloudInit(sshPubKey)
+	if daemon == nil {
+		return base, nil
+	}
+	if err := daemon.Validate(); err != nil {
+		return "", err
+	}
+	section, err := daemon.cloudInitDaemonSection()
+	if err != nil {
+		return "", err
+	}
+	return base + section, nil
+}
+
+func baseCloudInit(sshPubKey string) string {
 	var sb strings.Builder
 	sb.WriteString("#cloud-config\n")
 	sb.WriteString("chpasswd:\n  expire: false\n")

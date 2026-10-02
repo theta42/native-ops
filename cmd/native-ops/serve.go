@@ -17,6 +17,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/theta42/native-ops/pkg/backup"
+	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/provider"
 	"github.com/theta42/native-ops/pkg/provider/digitalocean"
@@ -110,6 +112,9 @@ func handleServeCommand(ctx context.Context, args []string) {
 	instanceProfiles := flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
 	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
 	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
+	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as fleet.yml's backup section in the uploaded tree says. The object store's keys come from the daemon's environment (BACKUP_S3_ACCESS_KEY, BACKUP_S3_SECRET_KEY or the names fleet.yml gives)")
+	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded tree's fleet.yml dns_records through the built-in provider (DO_API_TOKEN in the daemon's environment). Script plugins are not run from an upload")
+	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "opsavor-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
 	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Serve POST /v1/edge/apply: apply the config repo's edge/Caddyfile to the edge container (validated, with rollback). Changes the host, so it runs as a job")
 	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
 	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
@@ -145,14 +150,19 @@ func handleServeCommand(ctx context.Context, args []string) {
 		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
 		EnableImageBuild: *enableImageBuild,
+		ImagePrefix:      *imagePrefix,
 		EnableEdgeApply:  *enableEdgeApply,
+		EnableBackup:     *enableBackup,
+		EnableDNSSync:    *enableDNSSync,
 		EnableAuth:       *enableAuth,
 		OIDC: server.OIDCSettings{Issuer: *oidcIssuer, ClientID: *oidcClientID, ClientSecret: *oidcClientSecret,
 			RedirectURL: *oidcRedirectURL, AllowedDomain: *oidcAllowedDomain, Role: server.Role(*oidcRole), Label: *oidcLabel},
-		EdgeContainer: *edgeContainer,
-		DNS:           dnsProv,
-		DNSDomains:    splitList(*dnsDomains),
-		Exec:             remote.NewLocalExecutor(), BootstrapToken: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
+		EdgeContainer:        *edgeContainer,
+		DNS:                  dnsProv,
+		DNSDomains:           splitList(*dnsDomains),
+		Exec:                 remote.NewLocalExecutor(),
+		BootstrapToken:       os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
+		BootstrapTokenSHA256: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256"),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -174,10 +184,14 @@ type daemonConfig struct {
 	EnableInstances      bool
 	InstancePolicy       engine.InstancePolicy
 	EnableImageBuild     bool
+	ImagePrefix          string
 	EnableEdgeApply      bool
+	EnableBackup         bool
+	EnableDNSSync        bool
 	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
+	BootstrapTokenSHA256 string // the hex SHA-256 of the bootstrap token, for a host whose env may be read by others (user-data)
 	// EnableAuth serves local sign-in and session cookies for the UI. OIDC (an Issuer) adds generic
 	// OpenID Connect sign-in; either implies a user store and a session signer.
 	EnableAuth bool
@@ -201,6 +215,11 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			return nil, nil, fmt.Errorf("NATIVE_OPS_BOOTSTRAP_TOKEN: %w", err)
 		}
 		log.Printf("bootstrap admin token loaded from NATIVE_OPS_BOOTSTRAP_TOKEN")
+	} else if cfg.BootstrapTokenSHA256 != "" {
+		if err := tokens.SetBootstrapHash(cfg.BootstrapTokenSHA256); err != nil {
+			return nil, nil, fmt.Errorf("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256: %w", err)
+		}
+		log.Printf("bootstrap admin token loaded from NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
 	}
 	audit, err := server.OpenAudit(filepath.Join(cfg.StateDir, "audit.log"))
 	if err != nil {
@@ -223,9 +242,9 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) {
 			return status.CollectFull(ctx, cfg.Exec, status.Options{Pool: cfg.Pool, EdgeContainer: cfg.EdgeContainer, DNS: cfg.DNS, DNSDomains: cfg.DNSDomains})
 		},
-		Plan:   planSource(cfg.Exec, key),
+		Plan: planSource(cfg.Exec, key),
 	}
-	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply {
+	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply || cfg.EnableBackup || cfg.EnableDNSSync {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
 		if err != nil {
 			audit.Close()
@@ -239,7 +258,20 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			opts.Instances, opts.InstancePolicy = engine.NewInstances(cfg.Exec), cfg.InstancePolicy
 		}
 		if cfg.EnableImageBuild {
+			recipes, err := server.OpenRecipeStore(filepath.Join(cfg.StateDir, "recipes.json"))
+			if err != nil {
+				audit.Close()
+				return nil, nil, fmt.Errorf("image recipes: %w", err)
+			}
+			opts.Recipes = recipes
+			opts.ImagePrefix = cfg.ImagePrefix
 			opts.ImageBuild = imageBuildSource(cfg.Exec)
+		}
+		if cfg.EnableBackup {
+			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool), restoreSource(cfg.Exec, cfg.Pool)
+		}
+		if cfg.EnableDNSSync {
+			opts.DNSSync = dnsSyncSource()
 		}
 		if cfg.EnableEdgeApply {
 			opts.EdgeApply = edgeApplySource(cfg.Exec, cfg.EdgeContainer)
@@ -299,7 +331,8 @@ func envBool(key string) bool {
 	return false
 }
 
-func splitList(s string) []string {	var out []string
+func splitList(s string) []string {
+	var out []string
 	for _, p := range strings.Split(s, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
@@ -340,6 +373,87 @@ func edgeApplySource(exec remote.Executor, edgeContainer string) server.EdgeAppl
 	return func(ctx context.Context, dir string, logf func(string, ...any)) error {
 		logf("applying edge config from %s", dir)
 		return engine.ApplyEdgeConfig(ctx, exec, dir, edgeContainer)
+	}
+}
+
+// backupSource is what POST /v1/backups runs: back up one volume (or every allowed one) as the uploaded
+// fleet.yml's backup section says, then optionally apply retention.
+func backupSource(exec remote.Executor, pool string) server.BackupFunc {
+	return func(ctx context.Context, dir string, req server.BackupRequest, logf func(string, ...any)) error {
+		mgr, err := loadBackupStoreWith(dir, exec)
+		if err != nil {
+			return fmt.Errorf("backup config: %w", err)
+		}
+		if req.Volume != "" {
+			man, err := mgr.CreateVolume(ctx, pool, req.Volume)
+			if err != nil {
+				return err
+			}
+			logf("backed up %s (%d bytes, sha256 %s) to %s", man.Volume, man.SizeBytes, man.SHA256[:12], man.Key)
+		} else {
+			mans, err := mgr.CreateVolumes(ctx, pool)
+			for _, man := range mans {
+				logf("backed up %s (%d bytes) to %s", man.Volume, man.SizeBytes, man.Key)
+			}
+			if err != nil {
+				return err
+			}
+			logf("backed up %d volume(s)", len(mans))
+		}
+		if !req.Prune {
+			return nil
+		}
+		var deleted []string
+		if req.Volume != "" {
+			deleted, err = mgr.Prune(ctx, req.Volume)
+		} else {
+			deleted, err = mgr.PruneAll(ctx, pool)
+		}
+		for _, k := range deleted {
+			logf("retention: deleted %s", k)
+		}
+		return err
+	}
+}
+
+// restoreSource is what POST /v1/backups/restore runs.
+func restoreSource(exec remote.Executor, pool string) server.RestoreFunc {
+	return func(ctx context.Context, dir string, req server.RestoreRequest, logf func(string, ...any)) error {
+		mgr, err := loadBackupStoreWith(dir, exec)
+		if err != nil {
+			return fmt.Errorf("backup config: %w", err)
+		}
+		if err := mgr.Restore(ctx, backup.RestoreOptions{Pool: pool, Volume: req.Volume, FromKey: req.From, AsName: req.As, Force: req.Force}); err != nil {
+			return err
+		}
+		if req.As != "" {
+			logf("restored %s from %s as %s", req.Volume, req.From, req.As)
+		} else {
+			logf("restored %s from %s in place", req.Volume, req.From)
+		}
+		return nil
+	}
+}
+
+// dnsSyncSource is what POST /v1/dns/sync runs: the uploaded fleet.yml's dns_records, through a built-in
+// provider. A script plugin is never run from an upload: that would let any deployer token run code
+// on the host without the plan approval an apply needs.
+func dnsSyncSource() server.DNSSyncFunc {
+	return func(ctx context.Context, dir string, logf func(string, ...any)) error {
+		fleet, err := config.LoadFleetConfig(dir)
+		if err != nil {
+			return err
+		}
+		switch fleet.DNSProvider {
+		case "digitalocean", "do":
+		default:
+			return fmt.Errorf("dns_provider %q: the daemon syncs DNS only through a built-in provider (digitalocean); run `native-ops dns sync` for a script plugin", fleet.DNSProvider)
+		}
+		prov, err := digitalocean.New("")
+		if err != nil {
+			return fmt.Errorf("DigitalOcean provider: %w", err)
+		}
+		return syncDeclaredRecords(ctx, fleet, prov, logf)
 	}
 }
 

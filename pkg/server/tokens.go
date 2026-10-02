@@ -218,6 +218,24 @@ func (s *TokenStore) SetBootstrap(secret string) error {
 	return nil
 }
 
+// SetBootstrapHash registers the in-memory admin token by the SHA-256 of its secret (64 hex
+// characters) instead of the secret itself. It is for places that may be read by more than root, such
+// as a cloud provider's user-data, which a container that can reach the metadata service can fetch:
+// the hash of a 256-bit secret gives nothing away, and CI keeps the secret.
+func (s *TokenStore) SetBootstrapHash(sum string) error {
+	sum = strings.ToLower(strings.TrimSpace(sum))
+	if len(sum) != 64 || strings.Trim(sum, "0123456789abcdef") != "" {
+		return errors.New("the bootstrap token hash must be the 64-character hex SHA-256 of the token")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bootstrap = &Token{ID: "bootstrap", Name: "bootstrap", Role: RoleAdmin, Hash: sum}
+	return nil
+}
+
+// HashSecret is how a token secret is stored: hex SHA-256. It is what SetBootstrapHash expects.
+func HashSecret(secret string) string { return hashSecret(secret) }
+
 // Create makes a new token and returns its secret, which is not recoverable afterwards.
 func (s *TokenStore) Create(name string, role Role) (secret string, t Token, err error) {
 	return s.CreateScoped(name, role, Scope{})

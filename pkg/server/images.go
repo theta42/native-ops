@@ -15,9 +15,9 @@ type ImageBuildFunc func(ctx context.Context, configDir, app, ref string, logf f
 // tar of the native-ops-conf tree, exactly like /v1/plan and /v1/apply: the daemon needs no git
 // access or credentials of its own, and every caller supplies the recipe it wants built rather than
 // the daemon trusting a path on its own disk. A token with a scope may only build an image that
-// matches its own Images glob, checked against the reference the build actually produces
-// (opsavor-<app>:<ref>, always with a tag: build-image.sh only omits one when no ref is given, and
-// this endpoint always gives one), the same shape a scope is written in, e.g. "opsavor-platform:*".
+// matches its own Images glob, checked against the reference the build produces
+// (<ImagePrefix><app>:<ref>, always with a tag: the recipe only omits one when no ref is given, and
+// this endpoint always gives one), the same shape a scope is written in, e.g. "acme-platform:*".
 func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 	app, ref := r.URL.Query().Get("app"), r.URL.Query().Get("ref")
 	if !engine.ValidImageApp(app) {
@@ -28,7 +28,7 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "ref must be a plausible git branch or tag name")
 		return
 	}
-	built := "opsavor-" + app + ":" + ref
+	built := s.opts.ImagePrefix + app + ":" + ref
 	actor, scope := s.actorScope(r)
 	if scope != nil && !scope.AllowsImage(built) {
 		auditDetail(r, "image build %s@%s refused: outside the token's scope", app, ref)
@@ -37,6 +37,31 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	u, ok := s.receiveTree(w, r, "image build")
 	if !ok {
+		return
+	}
+	// The build runs the upload's scripts on the host: only an approved recipe may (see recipes.go).
+	digest, err := engine.RecipeDigest(u.root)
+	if err != nil {
+		u.discard()
+		writeError(w, http.StatusBadRequest, "bad_config", trim(err.Error()))
+		return
+	}
+	approved, err := s.opts.Recipes.Seen(digest, actor, app, u.sha)
+	if err != nil {
+		u.discard()
+		writeError(w, http.StatusInternalServerError, "internal", "could not record the recipe, so nothing was built")
+		return
+	}
+	if !approved {
+		u.discard()
+		auditDetail(r, "image build %s@%s refused: recipe %s not approved", app, ref, digest[:12])
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"code":   "recipe_not_approved",
+			"digest": digest,
+			"error": "this image recipe (scripts/ and images/ in the upload) has not been approved, and a build runs it on the host. " +
+				"An admin can approve it with POST /v1/images/recipes/" + digest + "/approve (or `native-ops remote recipe-approve " + digest + "`); then run the build again. " +
+				"Builds of other refs from the same recipe need no new approval.",
+		})
 		return
 	}
 	if !s.applyMu.TryLock() {

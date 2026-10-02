@@ -24,12 +24,18 @@ import (
 	"github.com/theta42/native-ops/pkg/remote"
 )
 
-// Reconciler performs end-to-end GitOps cluster reconciliation (Level 0 + DNS + Level 1).
+// Reconciler brings a fleet's hosts up: it provisions the hosts fleet.yml declares (Level 0), syncs
+// their DNS, and prepares each host's Incus runtime. Deploying services is the daemon's job, through a
+// plan an admin approved (POST /v1/plan, /v1/apply); reconcile does it too only when DeployServices is
+// set, as a break-glass path for a host whose daemon is not running yet or is broken, since that path
+// skips the plan, the approval, the host lock and the job record.
 type Reconciler struct {
 	configDir string
 	exec      remote.Executor
 	deployer  *Deployer
 	hostMgr   *HostManager
+	// DeployServices also deploys every service directly, bypassing the daemon's approval gate.
+	DeployServices bool
 }
 
 func NewReconciler(configDir string, exec remote.Executor) *Reconciler {
@@ -352,6 +358,14 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		deployer = NewDeployer(sshExec)
 	}
 
+	if !r.DeployServices {
+		if dnsErr != nil {
+			return fmt.Errorf("hosts reconciled, but DNS sync failed: %w", dnsErr)
+		}
+		log.Printf("==> [GitOps] Hosts and DNS reconciled. Services are deployed through the daemon: plan and apply an approved plan (native-ops remote plan / apply). Pass --deploy-services to deploy them directly over SSH instead (break-glass: no plan, approval or job record).\n")
+		return nil
+	}
+	log.Printf("==> [GitOps] --deploy-services: deploying services directly, without the daemon's plan approval\n")
 	servicesDir := filepath.Join(r.configDir, "services")
 	entries, err := os.ReadDir(servicesDir)
 	if err == nil {
