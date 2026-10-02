@@ -20,6 +20,9 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | Endpoint | Auth | |
 |---|---|---|
 | `GET /healthz` | none | liveness (`{"ok":true,"version":...}`), no state |
+| `GET /api/session` | none | how this daemon lets people sign in, and who is signed in (with `--enable-auth` or OIDC) |
+| `POST /api/login`, `POST /api/logout` | none / session | local sign-in (sets the session cookie) and sign-out |
+| `GET /auth/oidc`, `GET /auth/oidc/callback` | none | the OIDC sign-in redirect and its callback (with the `--oidc-*` flags) |
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images, host metrics (load, memory, swap, pool disk, uptime) and warnings -- plus, when configured, the edge's routes and certificates and the DNS records in the configured zones |
 | `POST /v1/plan` | planner | what `apply` would change for the configuration you upload (never changes the host) |
@@ -34,7 +37,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `GET/PUT /v1/secrets`, `DELETE /v1/secrets/{name}` | admin | the daemon's own credentials, pushed from the git server's secret store; names only are ever returned |
 | `GET/POST /v1/tokens`, `DELETE /v1/tokens/{id}` | admin | list, create (the secret is returned once) and revoke API tokens |
 | `GET/POST /v1/users`, `PATCH /v1/users/{username}` | admin | list and create local users; change a role, disable, or set a password (with `--enable-auth` or OIDC) |
-| `GET /v1/images/recipes`, `POST /v1/images/recipes/{digest}/approve`, `DELETE .../approval` | admin | the image recipes builds were asked for, and approving or withdrawing one (with `--enable-image-build`) |
+| `GET /v1/images/recipes`, `POST /v1/images/recipes/{digest}/approve`, `DELETE /v1/images/recipes/{digest}/approval` | admin | the image recipes builds were asked for, and approving or withdrawing one (with `--enable-image-build`) |
 | `PUT /v1/instances/{name}`, `POST /v1/instances/{name}/update`, `DELETE /v1/instances/{name}` | deployer | create, move to another image, or remove a tenant instance, as a job (only with `--enable-instances`) |
 | `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
 | `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
@@ -70,9 +73,19 @@ can create privileged containers), so it is deliberately small:
 - Roles: `viewer` < `planner` < `deployer` < `admin`. Reading needs `viewer`; sending a configuration
   to be planned needs `planner` (a plan never changes the host, so this is the role for a pull-request
   pipeline: the secrets of a repository are readable by any branch of it); applying needs `deployer`;
-  managing tokens needs `admin`. The gate is tested so the write endpoints that follow inherit it.
+  approving plans and image recipes, restoring backups, and managing tokens, users and secrets need
+  `admin`. A token with a **scope** (instance names, images, domains) may only call the instance
+  endpoints, for what its scope allows, and sees only its own jobs. Every endpoint's role gate is tested.
+- What a deployer token cannot do on its own: apply a plan an admin has not approved (one apply, within
+  the approval's lifetime), build from a recipe an admin has not approved, send backups anywhere but the
+  pinned destination, or change DNS outside the allowed zones.
+- A signed-in person's session is checked against the user store on every request; repeated failed
+  sign-ins for an account are throttled; OIDC uses PKCE.
+- File contents and scripts reach containers over stdin, never in a command line; errors and job
+  records name only the start of a command, so they cannot carry a secret.
 - Every request is appended to `audit.log` (JSON lines): time, token name, method, path, status,
-  remote address, duration. Never the query string, never a credential.
+  remote address, duration, and what it did (a plan hash, a job, which secrets changed). Never the query
+  string, never a credential or secret value.
 - The UI is served with a strict Content-Security-Policy (`default-src 'none'`, no inline script or
   style) and inserts all data as text, never as HTML.
 - The UI uses the same shell as the other theta-suite apps (proxy, jump-host, sso-manager): Bootstrap 5.3
@@ -360,6 +373,19 @@ secrets), and a CI workflow pushes them to the daemon:
 | `NATIVE_OPS_DNS_ZONES` | the zones a DNS sync may change (comma separated; with `--dns-domains`) |
 | `NATIVE_OPS_OIDC_CLIENT_SECRET` | OIDC sign-in |
 
+They are stored on the host, in `secrets.json`, because the daemon needs some of them at any time (a
+person signing in, someone opening the status page). The protection is the host itself: the daemon's
+user is in `incus-admin`, so whoever can read that file already controls every container and volume
+there. What matters is how far each credential reaches **beyond** the host, so give each the least it
+needs:
+
+- **DNS token:** a scoped token that can only read and update domains, not create or destroy droplets
+  (DigitalOcean custom scopes: `domain:read`, `domain:update`). An account-wide token on the host
+  could take down every other server in the account.
+- **Backup keys:** keys limited to the one backup bucket (per-bucket access keys), so a leaked pair
+  cannot read or delete other backups.
+- **OIDC client secret:** only usable with the redirect URL registered at the identity provider.
+
 ## UI sign-in: local users and OIDC
 
 By default the UI takes a pasted API token (kept for the browser tab). Two sign-in methods can be turned
@@ -403,9 +429,10 @@ A running daemon honours user changes immediately (it notices the file change).
 
 ## Running it
 
-`deploy/systemd/native-ops-serve.service` is the unit CI/IaC installs (hardened; state in
-`/var/lib/native-ops`; env in `/etc/native-ops/serve.env`). The user needs to exist and be in
-`incus-admin`:
+A host created with `native-ops host create --daemon-version ...` or by `reconcile` with a `daemon:`
+section in `fleet.yml` has all of this done by cloud-init. To install it yourself:
+`deploy/systemd/native-ops-serve.service` is the unit (hardened; state in `/var/lib/native-ops`; env in
+`/etc/native-ops/serve.env`). The user needs to exist and be in `incus-admin`:
 
 ```
 useradd --system --home-dir /var/lib/native-ops --shell /usr/sbin/nologin -G incus-admin native-ops
@@ -413,6 +440,60 @@ useradd --system --home-dir /var/lib/native-ops --shell /usr/sbin/nologin -G inc
 
 Then route it through the edge, e.g. a Caddy site `native-ops.example.com { reverse_proxy 10.0.100.1:8686 }`
 with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the host.
+
+### The state directory
+
+Everything the daemon keeps is in `--state-dir` (default `/var/lib/native-ops`, 0700):
+
+| File | What |
+|---|---|
+| `tokens.json` | API tokens (SHA-256 of each secret, never the secret) |
+| `users.json` | local and OIDC users (bcrypt hashes for local passwords) |
+| `secrets.json` | the daemon's own credentials, synced from the git server |
+| `session.key` | the key that signs session cookies |
+| `plan.key` | the key that binds a plan's hash to values the plan does not print |
+| `plans/` | every plan made, its approval and the apply that used it |
+| `jobs/` | every job's record and log (the last 200) |
+| `recipes.json` | image recipes asked for, and which an admin approved |
+| `audit.log` | one JSON line per request and per finished job (never a value or credential) |
+
+All files are 0600. Back the directory up if losing approvals, job history or users matters to you;
+tokens and secrets can be re-created from the git server.
+
+### Configuration reference (`native-ops serve`)
+
+Every flag; most also read an environment variable, so they can live in `serve.env` or in `fleet.yml`'s
+`daemon.flags`.
+
+| Flag | Env | Default | What |
+|---|---|---|---|
+| `--addr` | | `127.0.0.1:8686` | listen address; put TLS (the edge) in front of it |
+| `--state-dir` | | `/var/lib/native-ops` | where everything above is kept |
+| `--pool` | | `default` | the Incus storage pool holding the data volumes |
+| `--enable-apply` | | off | `POST /v1/apply` |
+| `--approval-ttl` | | `1h` | how long an admin's approval of a plan lasts |
+| `--enable-instances` | | off | the tenant-instance endpoints |
+| `--instance-profiles` | | `base,service` | Incus profiles a tenant instance spec may use |
+| `--instance-route-imports` | | none | Caddy snippets a tenant route may import |
+| `--enable-image-build` | | off | `POST /v1/images/build` and the recipe endpoints |
+| `--image-prefix` | `NATIVE_OPS_IMAGE_PREFIX` | `app-` | what the recipe names images before `<app>:<ref>` |
+| `--enable-edge-apply` | | off | `POST /v1/edge/apply` |
+| `--enable-backup` | | off | `POST /v1/backups` and `/v1/backups/restore` |
+| `--enable-dns-sync` | | off | `POST /v1/dns/sync` |
+| `--edge-container` | `NATIVE_OPS_EDGE_CONTAINER` | `edge` | the container whose routes and certificates the status shows |
+| `--dns-provider` | `NATIVE_OPS_DNS_PROVIDER` | none | `digitalocean`: DNS records on the status page |
+| `--dns-domains` | `NATIVE_OPS_DNS_DOMAINS` | none | zones shown on the status page, and that a DNS sync may change |
+| `--enable-auth` | `NATIVE_OPS_ENABLE_AUTH=1` | off | local sign-in for the UI |
+| `--oidc-issuer` | `NATIVE_OPS_OIDC_ISSUER` | none | turns on OIDC sign-in |
+| `--oidc-client-id` | `NATIVE_OPS_OIDC_CLIENT_ID` | | |
+| `--oidc-client-secret` | `NATIVE_OPS_OIDC_CLIENT_SECRET` | | better synced to the secret store |
+| `--oidc-redirect-url` | `NATIVE_OPS_OIDC_REDIRECT_URL` | | `https://<daemon>/auth/oidc/callback` |
+| `--oidc-allowed-domain` | `NATIVE_OPS_OIDC_ALLOWED_DOMAIN` | any | only emails at this domain may sign in |
+| `--oidc-role` | `NATIVE_OPS_OIDC_ROLE` | `viewer` | the role a newly seen OIDC user gets |
+| `--oidc-label` | `NATIVE_OPS_OIDC_LABEL` | `single sign-on` | the sign-in button's text |
+
+Environment only: `NATIVE_OPS_BOOTSTRAP_TOKEN` or `NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256` (the first admin
+token). Read through the secret store, then the environment: the names in the credentials table above.
 
 ## SSH, for the paths that still use it
 

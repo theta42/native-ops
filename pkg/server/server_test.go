@@ -315,3 +315,30 @@ func TestTheRoleGateEnforcesTheMinimumRole(t *testing.T) {
 		}
 	}
 }
+
+// Every API route the daemon serves is in docs/daemon.md (the UI's static files aside).
+func TestEveryRouteIsDocumented(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "daemon.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`mux\.Handle(?:Func)?\("[A-Z]+ (/[^"]*)"`)
+	n := 0
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		path := m[1]
+		if path == "/{$}" || path == "/index.html" || strings.HasPrefix(path, "/static") {
+			continue
+		}
+		n++
+		if !strings.Contains(string(doc), path) {
+			t.Errorf("%s is served but not in docs/daemon.md", path)
+		}
+	}
+	if n < 30 {
+		t.Fatalf("found only %d routes; the test's pattern is out of date", n)
+	}
+}
