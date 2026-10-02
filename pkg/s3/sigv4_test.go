@@ -3,8 +3,10 @@ package s3
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"net/url"
 	"testing"
+	"time"
 )
 
 // AWS-documented SigV4 test vector: signing key derivation.
@@ -50,5 +52,21 @@ func TestSHA256Hex(t *testing.T) {
 	}
 	if got := sha256Hex([]byte("")); got != emptySHA256 {
 		t.Fatalf("empty hash = %s, want %s", got, emptySHA256)
+	}
+}
+
+// The full signature against AWS's published S3 example ("GET Object" with a Range header, in
+// "Signature Calculations for the Authorization Header"), so the canonical request, string to sign and
+// header handling are checked against an independent answer, not just against this code.
+func TestSignMatchesTheAWSGetObjectExample(t *testing.T) {
+	req, _ := http.NewRequest("GET", "https://examplebucket.s3.amazonaws.com/test.txt", nil)
+	req.Host = "examplebucket.s3.amazonaws.com"
+	now := time.Date(2013, 5, 24, 0, 0, 0, 0, time.UTC)
+	sign(req, "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "us-east-1", emptySHA256, now, map[string]string{"range": "bytes=0-9"})
+	want := "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, " +
+		"SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, " +
+		"Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Fatalf("Authorization =\n  %s\nwant\n  %s", got, want)
 	}
 }
