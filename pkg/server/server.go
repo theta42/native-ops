@@ -65,6 +65,11 @@ type Options struct {
 	// own binary with a pinned release and restarts on it (see upgrade.go and pkg/selfupdate).
 	Upgrade UpgradeFunc
 	Restart RestartFunc
+	// Deploy, with Apply, enables POST /v1/deploy: apply the commit a protected deploy tag points at,
+	// read from the git server, with the tag as the approval (see deploy.go). DeployTags is the tag
+	// pattern, for the UI.
+	Deploy     DeploySource
+	DeployTags string
 	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
 	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
 	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
@@ -111,6 +116,9 @@ func New(opts Options) (*Server, error) {
 	}
 	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil ||
 		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil || opts.Upgrade != nil
+	if opts.Deploy != nil && opts.Apply == nil {
+		return nil, errors.New("deploys need apply: a deploy applies the tagged commit")
+	}
 	if opts.Upgrade != nil && opts.Restart == nil {
 		return nil, errors.New("a daemon upgrade needs a way to restart the daemon")
 	}
@@ -402,6 +410,9 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.Apply != nil {
 		mux.Handle("POST /v1/apply", s.auth(RoleDeployer, s.handleApply))
+	}
+	if s.opts.Apply != nil && s.opts.Deploy != nil {
+		mux.Handle("POST /v1/deploy", s.auth(RoleDeployer, s.handleDeploy))
 	}
 	if s.opts.ImageBuild != nil {
 		mux.Handle("POST /v1/images/build", s.authScoped(RoleDeployer, s.handleImageBuild))

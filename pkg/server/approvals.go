@@ -16,7 +16,19 @@ type planView struct {
 }
 
 func (s *Server) viewOf(rec PlanRecord) planView {
-	return planView{PlanRecord: rec, State: rec.State(time.Now().UTC())}
+	return s.viewWith(rec, s.lastHostChange())
+}
+
+// viewWith is viewOf with the time the host last changed already worked out (a list does it once).
+func (s *Server) viewWith(rec PlanRecord, lastChange time.Time) planView {
+	st := rec.State(time.Now().UTC())
+	switch st {
+	case PlanPending, PlanApproved, PlanExpired:
+		if lastChange.After(rec.LastSeen) {
+			st = PlanStale
+		}
+	}
+	return planView{PlanRecord: rec, State: st}
 }
 
 // recordPlan notes a plan that was just made, so it can be looked at and approved.
@@ -38,10 +50,17 @@ func (s *Server) recordPlan(r *http.Request, u *upload, fp *engine.FleetPlan) {
 func (s *Server) handlePlanList(w http.ResponseWriter, r *http.Request) {
 	recs := s.opts.Plans.List()
 	views := make([]planView, len(recs))
+	last := s.lastHostChange()
 	for i, rec := range recs {
-		views[i] = s.viewOf(rec)
+		views[i] = s.viewWith(rec, last)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"plans": views, "approval_ttl_seconds": int(s.opts.Plans.TTL().Seconds())})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"plans":                views,
+		"approval_ttl_seconds": int(s.opts.Plans.TTL().Seconds()),
+		// Without apply a plan can only be reviewed; with a deploy source, a protected tag deploys.
+		"apply_enabled": s.opts.Apply != nil,
+		"deploy_tags":   s.opts.DeployTags,
+	})
 }
 
 // handlePlanGet is GET /v1/plans/{hash}: one plan, with its text.
@@ -71,6 +90,10 @@ func (s *Server) handlePlanApprove(w http.ResponseWriter, r *http.Request) {
 	by := "-"
 	if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
 		by = h.name
+	}
+	if cur, ok := s.opts.Plans.Get(hash); ok && s.viewOf(cur).State == PlanStale {
+		writeError(w, http.StatusConflict, "stale", "this plan was made before the host last changed, so it cannot be applied: make a new plan")
+		return
 	}
 	rec, err := s.opts.Plans.Approve(hash, by)
 	switch {

@@ -76,7 +76,11 @@ const signedIn = () => !!(authUser || sessionStorage.getItem(KEY));
 const when = (t) => (t ? new Date(t).toLocaleString() : "");
 const short = (hash) => (hash || "").slice(0, 12);
 const summary = (c) => Object.entries(c || {}).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(", ") || "nothing";
-const PLAN_STATE = { pending: "warning", approved: "success", used: "secondary", expired: "dark", blocked: "danger", nothing: "light" };
+const PLAN_STATE = { pending: "warning", approved: "success", used: "secondary", expired: "dark", blocked: "danger", nothing: "light", stale: "light", "review only": "info" };
+let applyEnabled = true; // from /v1/plans: without apply a plan can be reviewed, not applied
+let deployTags = "";     // from /v1/plans: the tags that deploy, when the daemon deploys tags
+// What a plan's state means here: "pending" only when something could apply it.
+const planState = (s) => (s === "pending" && !applyEnabled ? "review only" : s);
 const JOB_STATE = { running: "primary", succeeded: "success", failed: "danger", interrupted: "warning" };
 const stateBadge = (state, kinds) => badge(state, kinds[state] || "secondary");
 const RECIPE_STATE = { approved: "success", waiting: "warning" };
@@ -235,20 +239,29 @@ function volumesView(s) {
 // ---- plans and jobs ---------------------------------------------------------
 
 function plansView(d) {
+  applyEnabled = d.apply_enabled !== false;
+  deployTags = d.deploy_tags || "";
   const rows = (d.plans || []).map((p) => [
     when(p.last_seen),
     p.actor,
     p.sha ? p.sha.slice(0, 8) : "",
     summary(p.counts),
-    stateBadge(p.state, PLAN_STATE),
+    stateBadge(planState(p.state), PLAN_STATE),
     h("a", { href: "#/plans/" + p.hash }, short(p.hash)),
   ]);
   const ttl = Math.round((d.approval_ttl_seconds || 0) / 60);
-  return card("clipboard-check", "Plans",
+  const how = !applyEnabled
+    ? h("div", { class: "alert alert-info mb-3" }, icon("circle-info", "me-1"),
+        "Apply is not enabled on this daemon, so plans are for review: nothing here can change the host.")
+    : deployTags
+      ? h("div", { class: "alert alert-light border mb-3" }, icon("tag", "me-1"),
+          `Pushing a protected ${deployTags} tag deploys that commit. A plan made before the host last changed is stale and can no longer be applied.`)
+      : null;
+  return h("div", {}, how, card("clipboard-check", "Plans",
     rows.length
       ? table(["Made", "By", "Commit", "Would", "State", "Plan"], rows)
       : empty("No plan has been made yet. CI makes one on every pull request (POST /v1/plan)."),
-    h("span", { class: "badge text-bg-secondary", title: "How long an approval lasts" }, `approval ${ttl} min`));
+    h("span", { class: "badge text-bg-secondary", title: "How long an approval lasts" }, `approval ${ttl} min`)));
 }
 
 function infoTable(pairs) {
@@ -259,7 +272,7 @@ function infoTable(pairs) {
 }
 
 function planView(p) {
-  const canApprove = role === "admin" && ["pending", "expired", "approved"].includes(p.state);
+  const canApprove = applyEnabled && role === "admin" && ["pending", "expired", "approved"].includes(p.state);
   const buttons = [];
   if (canApprove) {
     buttons.push(h("button", { type: "button", class: "btn btn-sm btn-success me-1", "data-act": "approve" }, icon("check", "me-1"), p.state === "approved" ? "Renew approval" : "Approve"));
@@ -274,11 +287,15 @@ function planView(p) {
   }
   const approval = p.approval ? `${p.approval.by}, until ${when(p.approval.expires)}` : "";
   const used = p.used ? h("a", { href: "#/jobs/" + p.used.job }, p.used.job) : "";
-  const hint = p.state === "pending" && role !== "admin" ? h("p", { class: "text-muted small mt-2 mb-0" }, "An admin has to approve this plan before an apply can run it.") : null;
+  const hint = p.state === "stale"
+    ? h("p", { class: "text-muted small mt-2 mb-0" }, "The host has changed since this plan was made, so it can no longer be applied.")
+    : !applyEnabled && p.state === "pending"
+      ? h("p", { class: "text-muted small mt-2 mb-0" }, "Apply is not enabled on this daemon: this plan is for review.")
+      : p.state === "pending" && role !== "admin" ? h("p", { class: "text-muted small mt-2 mb-0" }, "An admin has to approve this plan before an apply can run it.") : null;
   return h("div", {},
     card("clipboard-check", `Plan ${short(p.hash)}`,
       h("div", {}, infoTable([
-        ["State", stateBadge(p.state, PLAN_STATE)],
+        ["State", stateBadge(planState(p.state), PLAN_STATE)],
         ["Would", summary(p.counts)],
         ["Requested by", p.actor],
         ["Commit", p.sha],
@@ -556,7 +573,11 @@ async function start() {
     render();
   }).catch(() => {});
   // Plans and Jobs are only in the nav when this daemon serves them (an older one does not).
-  api("/v1/plans").then(() => { document.getElementById("nav-plans").hidden = false; }).catch(() => {});
+  api("/v1/plans").then((d) => {
+    applyEnabled = d.apply_enabled !== false;
+    deployTags = d.deploy_tags || "";
+    document.getElementById("nav-plans").hidden = false;
+  }).catch(() => {});
   api("/v1/jobs").then(() => { document.getElementById("nav-jobs").hidden = false; }).catch(() => {});
   refresh();
   clearInterval(timer);

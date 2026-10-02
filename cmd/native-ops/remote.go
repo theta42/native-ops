@@ -32,6 +32,8 @@ const remoteUsage = `Usage: native-ops remote <action> [flags]
 Actions (each uploads --config-dir unless noted, and waits for the job it starts):
   plan        [--service s]       print what apply would change; exits 1 if the plan is blocked
   apply       --expect <hash>     apply an approved plan
+  deploy      --tag <tag>         deploy the commit a protected deploy tag points at; the daemon reads it
+                                  from the git server, nothing is uploaded
   edge-apply                      apply edge/Caddyfile to the edge container
   backup      [--volume v] [--prune]
   restore     --volume v [--from key|latest] [--as name] [--force]   (admin)
@@ -68,6 +70,7 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	timeout := flags.Duration("timeout", 30*time.Minute, "How long to wait for the job")
 	service := flags.String("service", "", "plan: only this service")
 	expect := flags.String("expect", "", "apply: the hash of the approved plan")
+	tag := flags.String("tag", os.Getenv("GITHUB_REF_NAME"), "deploy: the deploy tag (default: the tag the CI job runs for)")
 	volume := flags.String("volume", "", "backup/restore: the volume")
 	prune := flags.Bool("prune", false, "backup: apply retention afterwards; secret-sync: remove every secret not named")
 	from := flags.String("from", "latest", "restore: the object key, or latest")
@@ -110,6 +113,20 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		}
 		q.Set("expect", *expect)
 		c.uploadAndWait(ctx, "/v1/apply", *configDir, q)
+	case "deploy":
+		if *tag == "" {
+			fatalf("deploy needs --tag")
+		}
+		var out struct {
+			Job struct {
+				ID string `json:"id"`
+			} `json:"job"`
+		}
+		if code, raw := c.json(ctx, "POST", "/v1/deploy", map[string]string{"tag": *tag}, &out); code != http.StatusAccepted {
+			fatalf("the daemon answered %d: %s", code, raw)
+		}
+		fmt.Printf("deploying %s (job %s)\n", *tag, out.Job.ID)
+		os.Exit(c.wait(ctx, out.Job.ID))
 	case "edge-apply":
 		c.uploadAndWait(ctx, "/v1/edge/apply", *configDir, q)
 	case "backup":

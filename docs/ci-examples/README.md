@@ -13,6 +13,7 @@ talks to the daemon with `native-ops remote`; none of them holds an SSH key or a
 | `apply.yml` | manual (or on merge): apply the plan an admin approved | `deployer` |
 | `edge.yml` | a change to `edge/`: apply the edge Caddyfile | `deployer` |
 | `maintenance.yml` | nightly: back up volumes with retention, sync DNS | `deployer` |
+| `deploy.yml` | a pushed `deploy-*` tag: deploy that commit (the daemon fetches it) | `deployer` |
 | `daemon-upgrade.yml` | manual: move the daemon to a pinned release | admin (protected environment) |
 
 Create the tokens once with the bootstrap admin token (no shell on the host needed):

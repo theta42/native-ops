@@ -34,6 +34,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/backups?volume=&prune=1` | deployer | back up one volume, or every volume `fleet.yml` allows, then optionally apply retention, as a job (only with `--enable-backup`) |
 | `POST /v1/backups/restore?volume=&from=&as=&force=1` | admin | restore a volume in place (keeping a copy of the current one) or as a new volume, as a job (only with `--enable-backup`) |
 | `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (only with `--enable-dns-sync`) |
+| `POST /v1/deploy` | deployer | deploy the commit a protected deploy tag points at, read from the git server (`{"tag": ...}`), as a job (with `--enable-apply`, `--git-url` and `--deploy-repo`) |
 | `POST /v1/daemon/upgrade` | admin | upgrade this daemon to a pinned release (`{version, sha256}`), as a job; it then restarts on the new binary (when the binary is in `<state-dir>/bin`) |
 | `GET/PUT /v1/secrets`, `DELETE /v1/secrets/{name}` | admin | the daemon's own credentials, pushed from the git server's secret store; names only are ever returned |
 | `GET/POST /v1/tokens`, `DELETE /v1/tokens/{id}` | admin | list, create (the secret is returned once) and revoke API tokens |
@@ -199,6 +200,36 @@ branch. Because a Git host that shows secrets to every branch cannot keep a depl
 pull request, the approval is what stops that token from changing the host on its own: the most a
 stolen or misused deployer token can do is apply a plan an admin already looked at and approved,
 once, within the hour.
+
+## Deploying on a tag
+
+With `--git-url`, `--deploy-repo` and `--enable-apply`, **pushing a protected deploy tag deploys**:
+
+```bash
+git tag deploy-2026.10.03 && git push origin deploy-2026.10.03     # someone the repository allows
+# CI, on that tag:
+NATIVE_OPS_TOKEN=$DEPLOY_TOKEN native-ops remote deploy --tag deploy-2026.10.03
+```
+
+`POST /v1/deploy {"tag"}` (deployer) runs a job that:
+
+1. resolves the tag on the git server, and checks that a **tag protection rule** covers it, so only the
+   people the repository allows could have pushed it (a rule the daemon cannot read, or no rule, stops
+   the deploy);
+2. **downloads that commit's tree from the git server**: the caller sends only the tag name, so a CI job
+   (or a leaked deployer token) cannot make the daemon apply anything but a tagged commit;
+3. plans it, refusing a blocked plan, and records the plan as approved by the tag and used by the job;
+4. applies it. A plan with nothing to change ends the job without applying.
+
+The protected tag is the approval, in place of an admin approving a plan in the UI (which still works
+for one-off applies). The daemon reads the repository with a token synced as `NATIVE_OPS_GIT_TOKEN`:
+it needs to read the repository and its tag protections, which on Gitea means a user who is an admin of
+the repository, with a token scoped to read the repository only.
+
+Plans close themselves: one a deploy used shows **used** (with its job); one made before the host last
+changed (an apply, a deploy, an instance change, an edge apply, a restore or an image build since) shows
+**stale** and cannot be approved; on a daemon without apply, the Plans page says plans are for review
+and shows **review only** instead of pending.
 
 ## Tenant instances (for a fleet manager)
 
@@ -373,6 +404,7 @@ secrets), and a CI workflow pushes them to the daemon:
 | `NATIVE_OPS_BACKUP_ENDPOINT`, `NATIVE_OPS_BACKUP_BUCKET` | the only backup destination an upload may use |
 | `NATIVE_OPS_DNS_ZONES` | the zones a DNS sync may change (comma separated; with `--dns-domains`) |
 | `NATIVE_OPS_OIDC_CLIENT_SECRET` | OIDC sign-in |
+| `NATIVE_OPS_GIT_TOKEN` | reading the configuration repository and its tag protections, for deploys on a tag |
 
 They are stored on the host, in `secrets.json`, because the daemon needs some of them at any time (a
 person signing in, someone opening the status page). The protection is the host itself: the daemon's
@@ -515,6 +547,9 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--enable-image-build` | | off | `POST /v1/images/build` and the recipe endpoints |
 | `--image-prefix` | `NATIVE_OPS_IMAGE_PREFIX` | `app-` | what the recipe names images before `<app>:<ref>` |
 | `--enable-edge-apply` | | off | `POST /v1/edge/apply` |
+| `--git-url` | `NATIVE_OPS_GIT_URL` | none | the git server (Gitea) holding the configuration repository; with `--deploy-repo` and `--enable-apply`, `POST /v1/deploy` |
+| `--deploy-repo` | `NATIVE_OPS_DEPLOY_REPO` | none | the configuration repository there, as `owner/name` |
+| `--deploy-tags` | `NATIVE_OPS_DEPLOY_TAGS` | `deploy-*` | the tags that deploy; the repository must protect them |
 | `--enable-backup` | | off | `POST /v1/backups` and `/v1/backups/restore` |
 | `--enable-dns-sync` | | off | `POST /v1/dns/sync` |
 | `--edge-container` | `NATIVE_OPS_EDGE_CONTAINER` | `edge` | the container whose routes and certificates the status shows |

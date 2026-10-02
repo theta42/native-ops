@@ -50,6 +50,9 @@ const (
 	PlanApproved PlanState = "approved" // approved, not yet used, not expired
 	PlanExpired  PlanState = "expired"  // approved once, too long ago
 	PlanUsed     PlanState = "used"     // an apply already consumed the approval
+	// PlanStale: changes, never applied, and made before the host last changed (see
+	// Server.lastHostChange): it describes a host that no longer exists and cannot be applied.
+	PlanStale PlanState = "stale"
 )
 
 // State reports where the plan stands at now.
@@ -264,6 +267,21 @@ func (p *Plans) Consume(hash string, job JobID) error {
 	}
 	rec := p.byID[hash]
 	rec.Used = &PlanUse{Job: job, At: p.now()}
+	return p.persist(rec)
+}
+
+// UseForDeploy records that a deploy tag approved and used the plan, for job. Pushing a protected deploy
+// tag is the approval (see handleDeploy), so the record says which tag and commit, and is used at once.
+func (p *Plans) UseForDeploy(hash, by string, job JobID) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rec := p.byID[hash]
+	if rec == nil {
+		return ErrNoSuchPlan
+	}
+	now := p.now()
+	rec.Approval = &Approval{By: by, At: now, Expires: now}
+	rec.Used = &PlanUse{Job: job, At: now}
 	return p.persist(rec)
 }
 
