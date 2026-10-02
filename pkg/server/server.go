@@ -56,6 +56,11 @@ type Options struct {
 	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
 	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
 	EdgeApply EdgeApplyFunc
+	// Backup, Restore and DNSSync, with Jobs, enable the maintenance endpoints (see maintenance.go):
+	// POST /v1/backups, POST /v1/backups/restore and POST /v1/dns/sync.
+	Backup  BackupFunc
+	Restore RestoreFunc
+	DNSSync DNSSyncFunc
 	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
 	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
 	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.
@@ -91,14 +96,16 @@ func New(opts Options) (*Server, error) {
 	if opts.OIDC != nil && opts.Users == nil {
 		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
 	}
-	if (opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil) && opts.Jobs == nil {
-		return nil, errors.New("apply, instances, image builds and edge applies need a job store: every change to the host is a job with a record")
+	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil ||
+		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil
+	if changes && opts.Jobs == nil {
+		return nil, errors.New("apply, instances, image builds, edge applies, backups and DNS syncs need a job store: every change to the host is a job with a record")
 	}
 	if opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil) {
 		return nil, errors.New("apply needs a plan source and a plan store (approvals) to check the plan against")
 	}
-	if opts.Jobs != nil && opts.Apply == nil && opts.Instances == nil && opts.ImageBuild == nil && opts.EdgeApply == nil {
-		return nil, errors.New("a job store is only useful with apply, instances, image builds or edge applies")
+	if opts.Jobs != nil && !changes {
+		return nil, errors.New("a job store is only useful with apply, instances, image builds, edge applies, backups or DNS syncs")
 	}
 	if opts.JobDrain <= 0 {
 		opts.JobDrain = 5 * time.Minute
@@ -377,6 +384,15 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.EdgeApply != nil {
 		mux.Handle("POST /v1/edge/apply", s.auth(RoleDeployer, s.handleEdgeApply))
+	}
+	if s.opts.Backup != nil {
+		mux.Handle("POST /v1/backups", s.auth(RoleDeployer, s.handleBackup))
+	}
+	if s.opts.Restore != nil {
+		mux.Handle("POST /v1/backups/restore", s.auth(RoleAdmin, s.handleRestore))
+	}
+	if s.opts.DNSSync != nil {
+		mux.Handle("POST /v1/dns/sync", s.auth(RoleDeployer, s.handleDNSSync))
 	}
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)

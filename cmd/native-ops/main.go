@@ -523,11 +523,19 @@ func handleDNSCommand(ctx context.Context, args []string) {
 		fmt.Printf("DNS records synced for %s (apex and wildcard -> %s)\n", dom, *targetIP)
 	}
 
-	// Records declared in fleet.yml (`dns_records:`), grouped by zone. A sync only creates or updates;
-	// it never deletes a record it was not told about.
+	logf := func(format string, a ...any) { fmt.Printf(format+"\n", a...) }
+	if err := syncDeclaredRecords(ctx, fleet, dnsProv, logf); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// syncDeclaredRecords creates or updates the records declared in fleet.yml (`dns_records:`), zone by
+// zone. A sync never deletes a record it was not told about. `dns sync` and the daemon's
+// POST /v1/dns/sync both use it.
+func syncDeclaredRecords(ctx context.Context, fleet *config.FleetConfig, dnsProv provider.DNSProvider, logf func(string, ...any)) error {
 	byZone, err := fleet.DNSRecordsByZone()
 	if err != nil {
-		log.Fatalf("dns_records: %v", err)
+		return fmt.Errorf("dns_records: %w", err)
 	}
 	zones := make([]string, 0, len(byZone))
 	for z := range byZone {
@@ -542,13 +550,23 @@ func handleDNSCommand(ctx context.Context, args []string) {
 			names = append(names, fmt.Sprintf("%s %s", r.Type, r.Name))
 		}
 		if err := dnsProv.SyncRecords(ctx, zone, records); err != nil {
-			log.Fatalf("DNS sync for %s failed: %v", zone, err)
+			return fmt.Errorf("DNS sync for %s failed: %w", zone, err)
 		}
-		fmt.Printf("DNS records synced for %s: %s\n", zone, strings.Join(names, ", "))
+		logf("DNS records synced for %s: %s", zone, strings.Join(names, ", "))
 	}
+	if len(zones) == 0 {
+		logf("fleet.yml declares no dns_records; nothing to sync")
+	}
+	return nil
 }
 
 func loadBackupStore(configDir string) (*backup.Manager, error) {
+	return loadBackupStoreWith(configDir, remote.NewLocalExecutor())
+}
+
+// loadBackupStoreWith builds the backup manager from fleet.yml's `backup:` section; the object store's
+// credentials come from this process's environment, never from the tree.
+func loadBackupStoreWith(configDir string, exec remote.Executor) (*backup.Manager, error) {
 	fleet, err := config.LoadFleetConfig(configDir)
 	if err != nil {
 		return nil, err
@@ -575,7 +593,7 @@ func loadBackupStore(configDir string) (*backup.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return backup.New(remote.NewLocalExecutor(), store, cfg), nil
+	return backup.New(exec, store, cfg), nil
 }
 
 func handleBackupCommand(ctx context.Context, args []string) {
