@@ -126,6 +126,9 @@ func (e *EdgeManager) EnsureBaseCaddyfile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if found && isStockCaddyfile(cur) {
+		found = false // the Caddy image's own sample, not anyone's config: replace it
+	}
 	if found {
 		if !strings.Contains(cur, "import "+sitesDir) {
 			return fmt.Errorf("%s in %s does not import %s/*.caddy, so published sites would never be served; add that import line (native-ops never overwrites an existing Caddyfile)", caddyfilePath, e.edgeContainer, sitesDir)
@@ -478,4 +481,17 @@ func (e *EdgeManager) Reload(ctx context.Context) error {
 		return fmt.Errorf("caddy reload failed (%v) and failed again after restarting %s: %w", firstErr, e.edgeContainer, err)
 	}
 	return nil
+}
+
+// isStockCaddyfile reports whether a Caddyfile is the sample the official Caddy image ships (a static
+// file server on :80 for /usr/share/caddy, and nothing else). An edge launched from that image has it,
+// and it is nobody's configuration, so it is replaced like a missing file.
+func isStockCaddyfile(content string) bool {
+	var lines []string
+	for _, l := range strings.Split(content, "\n") {
+		if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\n") == ":80 {\nroot * /usr/share/caddy\nfile_server\n}"
 }

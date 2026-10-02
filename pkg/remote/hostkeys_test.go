@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 func newHostKey(t *testing.T) ssh.PublicKey {
@@ -62,5 +63,22 @@ func TestKnownHostsStrictRefusesAnUnknownHost(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(path); len(b) != 0 {
 		t.Fatalf("strict mode must not record anything: %q", b)
+	}
+}
+
+func TestKnownAlgorithmsAreTheRecordedTypes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	ed := newHostKey(t)
+	line := knownhosts.Line([]string{knownhosts.Normalize("203.0.113.7:22")}, ed)
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The server is asked for the type on record, so it does not answer with, say, its ECDSA key
+	// (which the check would take for a changed key).
+	if got := knownAlgorithms(path, "203.0.113.7:22"); len(got) != 1 || got[0] != ssh.KeyAlgoED25519 {
+		t.Fatalf("algorithms for a host with an ed25519 key on record: %v", got)
+	}
+	if got := knownAlgorithms(path, "198.51.100.1:22"); got != nil {
+		t.Fatalf("an unknown host has no preference: %v", got)
 	}
 }

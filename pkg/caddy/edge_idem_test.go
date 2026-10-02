@@ -483,3 +483,13 @@ func TestSuspendRejectsUnsafeInputAndRollsBackOnRejection(t *testing.T) {
 		t.Fatal("a rejected suspend must roll back without a reload")
 	}
 }
+
+func TestTheCaddyImagesSampleCaddyfileIsReplaced(t *testing.T) {
+	stock := "# The Caddyfile is an easy way to configure your Caddy web server.\n\n:80 {\n\t# Set this path to your site's directory.\n\troot * /usr/share/caddy\n\n\t# Enable the static file server.\n\tfile_server\n\n\t# reverse_proxy localhost:8080\n}\n"
+	if !isStockCaddyfile(stock) {
+		t.Fatal("the official image's sample must be recognised")
+	}
+	if isStockCaddyfile(stock + "\nexample.com {\n\treverse_proxy 10.0.0.1:80\n}\n") {
+		t.Fatal("a Caddyfile someone added a site to is theirs, not the sample")
+	}
+}

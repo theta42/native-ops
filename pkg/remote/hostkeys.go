@@ -27,16 +27,58 @@ const (
 
 var warnInsecureOnce sync.Once
 
-// hostKeyCallback returns the host key check the environment asks for.
-func hostKeyCallback() (ssh.HostKeyCallback, error) {
+// hostKeyCallback returns the host key check the environment asks for, and the host key algorithms to
+// ask addr for: the types already recorded for it, so a server with several keys presents the one on
+// record rather than another type that would look like a changed key (nil: no preference).
+func hostKeyCallback(addr string) (ssh.HostKeyCallback, []string, error) {
 	path := os.Getenv(envKnownHosts)
 	if path == "" {
 		warnInsecureOnce.Do(func() {
 			log.Printf("warning: SSH host keys are not checked; set %s to a known_hosts file to check them", envKnownHosts)
 		})
-		return ssh.InsecureIgnoreHostKey(), nil
+		return ssh.InsecureIgnoreHostKey(), nil, nil
 	}
-	return knownHostsCallback(path, os.Getenv(envStrict) == "1")
+	cb, err := knownHostsCallback(path, os.Getenv(envStrict) == "1")
+	if err != nil {
+		return nil, nil, err
+	}
+	return cb, knownAlgorithms(path, addr), nil
+}
+
+// knownAlgorithms lists the host key algorithms for the keys path records for addr.
+func knownAlgorithms(path, addr string) []string {
+	check, err := knownhosts.New(path)
+	if err != nil {
+		return nil
+	}
+	// Asking about a key that cannot be on record makes the check list the keys that are.
+	probe, _, _, _, err := ssh.ParseAuthorizedKey([]byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA probe"))
+	if err != nil {
+		return nil
+	}
+	tcp, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		tcp = &net.TCPAddr{}
+	}
+	var ke *knownhosts.KeyError
+	if !errors.As(check(addr, tcp, probe), &ke) {
+		return nil
+	}
+	var algos []string
+	seen := map[string]bool{}
+	for _, k := range ke.Want {
+		types := []string{k.Key.Type()}
+		if k.Key.Type() == ssh.KeyAlgoRSA {
+			types = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+		}
+		for _, t := range types {
+			if !seen[t] {
+				seen[t] = true
+				algos = append(algos, t)
+			}
+		}
+	}
+	return algos
 }
 
 // knownHostsCallback checks keys against a known_hosts file, adding unknown hosts unless strict.

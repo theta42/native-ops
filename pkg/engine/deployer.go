@@ -72,7 +72,9 @@ func normalizeRef(ref string) string {
 	if hasRemotePrefix(ref) || isFingerprint(ref) {
 		return ref
 	}
-	return "docker:" + ref
+	// The docker remote is Docker Hub, so a full Docker Hub reference drops its registry:
+	// docker.io/library/caddy:2 is docker:library/caddy:2, not docker:docker.io/library/caddy:2.
+	return "docker:" + strings.TrimPrefix(ref, "docker.io/")
 }
 
 // resolveServiceImage returns the reference to deploy. A local image alias
@@ -341,11 +343,19 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 	d.log("    Container IP: %s\n", ip)
 
 	if svc.Name == "edge" {
-		if err := d.caddy.EnsureBaseCaddyfile(ctx); err != nil {
-			return err
-		}
-		if err := d.caddy.Reload(ctx); err != nil {
-			return err
+		// A new edge gets the repo's edge/Caddyfile when there is one (the same file POST
+		// /v1/edge/apply applies), else the base Caddyfile that imports the sites directory.
+		if repo, err := os.ReadFile(filepath.Join(configDir, "edge", "Caddyfile")); err == nil {
+			if _, err := d.caddy.SyncCaddyfile(ctx, string(repo)); err != nil {
+				return fmt.Errorf("apply edge/Caddyfile to the new edge: %w", err)
+			}
+		} else {
+			if err := d.caddy.EnsureBaseCaddyfile(ctx); err != nil {
+				return err
+			}
+			if err := d.caddy.Reload(ctx); err != nil {
+				return err
+			}
 		}
 	}
 
