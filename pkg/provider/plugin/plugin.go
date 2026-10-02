@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 
@@ -100,6 +101,6 @@ func (p *ScriptDNSProvider) DeleteRecord(ctx context.Context, domain string, rec
 }
 
 func pathExists(path string) bool {
-	cmd := exec.Command("test", "-f", path)
-	return cmd.Run() == nil
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular()
 }
