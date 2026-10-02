@@ -88,7 +88,7 @@ func newImageRig(t *testing.T) *imageRig {
 	if _, err := rig.recipes.Approve(empty, "test"); err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Jobs: jobs, ImageBuild: rig.b.fn, Recipes: rig.recipes,
+	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Jobs: jobs, ImageBuild: rig.b.fn, Recipes: rig.recipes, ImagePrefix: "opsavor-",
 		Status: func(context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil }})
 	if err != nil {
 		t.Fatal(err)

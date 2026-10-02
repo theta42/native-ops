@@ -55,6 +55,9 @@ type Options struct {
 	// Recipes records which image recipes an admin has approved; required with ImageBuild, since a build
 	// runs the uploaded recipe's scripts on the host (see recipes.go).
 	Recipes *RecipeStore
+	// ImagePrefix is what the config repo's build recipe names an image before <app>:<ref> (its
+	// scripts/build-image.sh decides; e.g. "acme-"). A scoped token's image globs are checked against it.
+	ImagePrefix string
 	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
 	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
 	// never reconciles service containers, so unlike Apply it is safe to run on every merge.

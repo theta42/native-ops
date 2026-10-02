@@ -114,6 +114,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
 	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as fleet.yml's backup section in the uploaded tree says. The object store's keys come from the daemon's environment (BACKUP_S3_ACCESS_KEY, BACKUP_S3_SECRET_KEY or the names fleet.yml gives)")
 	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded tree's fleet.yml dns_records through the built-in provider (DO_API_TOKEN in the daemon's environment). Script plugins are not run from an upload")
+	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "opsavor-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
 	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Serve POST /v1/edge/apply: apply the config repo's edge/Caddyfile to the edge container (validated, with rollback). Changes the host, so it runs as a job")
 	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
 	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
@@ -149,6 +150,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
 		EnableImageBuild: *enableImageBuild,
+		ImagePrefix:      *imagePrefix,
 		EnableEdgeApply:  *enableEdgeApply,
 		EnableBackup:     *enableBackup,
 		EnableDNSSync:    *enableDNSSync,
@@ -182,6 +184,7 @@ type daemonConfig struct {
 	EnableInstances      bool
 	InstancePolicy       engine.InstancePolicy
 	EnableImageBuild     bool
+	ImagePrefix          string
 	EnableEdgeApply      bool
 	EnableBackup         bool
 	EnableDNSSync        bool
@@ -261,6 +264,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 				return nil, nil, fmt.Errorf("image recipes: %w", err)
 			}
 			opts.Recipes = recipes
+			opts.ImagePrefix = cfg.ImagePrefix
 			opts.ImageBuild = imageBuildSource(cfg.Exec)
 		}
 		if cfg.EnableBackup {

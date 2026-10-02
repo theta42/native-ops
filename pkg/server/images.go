@@ -15,9 +15,9 @@ type ImageBuildFunc func(ctx context.Context, configDir, app, ref string, logf f
 // tar of the native-ops-conf tree, exactly like /v1/plan and /v1/apply: the daemon needs no git
 // access or credentials of its own, and every caller supplies the recipe it wants built rather than
 // the daemon trusting a path on its own disk. A token with a scope may only build an image that
-// matches its own Images glob, checked against the reference the build actually produces
-// (opsavor-<app>:<ref>, always with a tag: build-image.sh only omits one when no ref is given, and
-// this endpoint always gives one), the same shape a scope is written in, e.g. "opsavor-platform:*".
+// matches its own Images glob, checked against the reference the build produces
+// (<ImagePrefix><app>:<ref>, always with a tag: the recipe only omits one when no ref is given, and
+// this endpoint always gives one), the same shape a scope is written in, e.g. "acme-platform:*".
 func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 	app, ref := r.URL.Query().Get("app"), r.URL.Query().Get("ref")
 	if !engine.ValidImageApp(app) {
@@ -28,7 +28,7 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "ref must be a plausible git branch or tag name")
 		return
 	}
-	built := "opsavor-" + app + ":" + ref
+	built := s.opts.ImagePrefix + app + ":" + ref
 	actor, scope := s.actorScope(r)
 	if scope != nil && !scope.AllowsImage(built) {
 		auditDetail(r, "image build %s@%s refused: outside the token's scope", app, ref)
