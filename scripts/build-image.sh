@@ -38,6 +38,12 @@ case "$IMAGE_NAME" in
     ;;
 esac
 
+# Everything builds FROM the base image: on a fresh host, build that first.
+if [ "$IMAGE_NAME" != "base" ] && ! incus image alias list --format csv </dev/null | grep -q "^${FROM},"; then
+  echo "[build] $FROM does not exist yet; building it first"
+  bash "$REPO_DIR/scripts/build-image.sh" base </dev/null
+fi
+
 # The `base` profile caps a container at 512MB, which is enough to run an
 # app but not to build one: `npm ci` on an app (Next.js +
 # drizzle-kit + typescript + eslint as devDependencies, plus better-sqlite3
@@ -50,7 +56,7 @@ BUILD_LIMITS=(--config limits.cpu=2 --config limits.memory=5GB)
 
 echo "[build] Building $ALIAS from $FROM"
 incus delete "$TMP_CT" --force 2>/dev/null || true
-incus launch "$FROM" "$TMP_CT" --profile base "${BUILD_LIMITS[@]}"
+incus launch "$FROM" "$TMP_CT" --profile default --profile base "${BUILD_LIMITS[@]}"
 
 echo "  waiting for network..."
 for i in $(seq 1 30); do

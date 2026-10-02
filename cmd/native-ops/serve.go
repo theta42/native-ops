@@ -448,6 +448,10 @@ func dnsSyncSource() server.DNSSyncFunc {
 		if err != nil {
 			return err
 		}
+		if len(fleet.DNSRecords) == 0 {
+			logf("fleet.yml declares no dns_records; nothing to sync")
+			return nil
+		}
 		switch fleet.DNSProvider {
 		case "digitalocean", "do":
 		default:

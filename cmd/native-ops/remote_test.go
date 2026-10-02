@@ -90,3 +90,18 @@ func TestREADMECarriesTheUsage(t *testing.T) {
 		t.Fatal("README.md's CLI Usage block must be exactly usageText (copy `native-ops` with no arguments into it)")
 	}
 }
+
+func TestDNSSyncWithNoRecordsNeedsNoProvider(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte("name: f\ndns_provider: digitalocean\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DO_API_TOKEN", "")
+	var logged []string
+	if err := dnsSyncSource()(context.Background(), dir, func(f string, a ...any) { logged = append(logged, f) }); err != nil {
+		t.Fatalf("nothing to sync must succeed without provider credentials: %v", err)
+	}
+	if len(logged) != 1 {
+		t.Fatalf("it must say there was nothing to sync: %v", logged)
+	}
+}

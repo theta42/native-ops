@@ -146,3 +146,17 @@ func TestBuildImagePrefixedTellsTheRecipeItsPrefix(t *testing.T) {
 		t.Fatal("an unsafe prefix must be refused")
 	}
 }
+
+func TestNormalizeRefMapsDockerHubReferencesOntoTheDockerRemote(t *testing.T) {
+	for in, want := range map[string]string{
+		"docker.io/library/caddy:2-alpine": "docker:library/caddy:2-alpine",
+		"docker.io/gitea/gitea:1.22":       "docker:gitea/gitea:1.22",
+		"caddy:2-alpine":                   "docker:caddy:2-alpine",
+		"docker:postgres:15.7-alpine":      "docker:postgres:15.7-alpine",
+		"quay:minio/minio":                 "quay:minio/minio",
+	} {
+		if got := normalizeRef(in); got != want {
+			t.Errorf("normalizeRef(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

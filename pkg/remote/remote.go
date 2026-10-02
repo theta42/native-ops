@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,7 +83,8 @@ func NewSSHExecutor(host string, port int, user string, privateKeyPEM []byte) (*
 		return nil, fmt.Errorf("parse SSH private key: %w", err)
 	}
 
-	hostKeys, err := hostKeyCallback()
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	hostKeys, algos, err := hostKeyCallback(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -90,11 +93,11 @@ func NewSSHExecutor(host string, port int, user string, privateKeyPEM []byte) (*
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: hostKeys, // see hostkeys.go
-		Timeout:         15 * time.Second,
+		HostKeyCallback:   hostKeys, // see hostkeys.go
+		HostKeyAlgorithms: algos,
+		Timeout:           15 * time.Second,
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
 	client, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
 		return nil, fmt.Errorf("dial SSH to %s: %w", addr, err)

@@ -174,7 +174,7 @@ func (c *Client) LaunchContainer(ctx context.Context, image string, name string,
 	}
 	// Normalize image for Incus: if not prefixed with images:, docker:, or local remote, prefix with docker:
 	if !strings.HasPrefix(image, "images:") && !strings.HasPrefix(image, "docker:") && !strings.HasPrefix(image, "local:") && len(image) != 64 {
-		image = "docker:" + image
+		image = "docker:" + strings.TrimPrefix(image, "docker.io/") // the docker remote is Docker Hub
 	}
 
 	if strings.HasPrefix(image, "docker:") {
