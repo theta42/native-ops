@@ -1,7 +1,7 @@
 // Package backup implements off-host volume backup and restore to any
 // S3-compatible object store. It snapshots a custom Incus volume, exports it
 // to a compressed artifact, uploads it with a SHA-256 manifest, and can
-// restore it (in place, with a pre-restore snapshot) or under a new name.
+// restore it (in place, keeping a copy of the volume it replaces) or under a new name.
 package backup
 
 import (
@@ -197,7 +197,7 @@ type RestoreOptions struct {
 
 // Restore downloads a backup, verifies its SHA-256, and imports it. When
 // AsName is set the volume is created under that name (non-destructive).
-// Otherwise the existing volume is snapshotted (pre-restore) then replaced.
+// Otherwise the existing volume is copied aside (see preRestoreName) and then replaced.
 func (m *Manager) Restore(ctx context.Context, o RestoreOptions) error {
 	if m.store == nil {
 		return errors.New("backup: no object store configured")
@@ -247,28 +247,47 @@ func (m *Manager) Restore(ctx context.Context, o RestoreOptions) error {
 	if len(deps) > 0 && !o.Force {
 		return fmt.Errorf("volume %s is mounted by %s; re-run with --force to stop them", o.Volume, strings.Join(deps, ", "))
 	}
-	for _, c := range deps {
-		if err := m.incus.StopContainer(ctx, c); err != nil {
-			return err
+	var stopped []string
+	// Whatever happens below, the containers that were stopped for the restore are started again.
+	restart := func(err error) error {
+		for _, c := range stopped {
+			if serr := m.incus.StartContainer(ctx, c); serr != nil && err == nil {
+				err = serr
+			}
 		}
-	}
-	// Always leave a recovery point behind, even if the import fails.
-	pre := "pre-restore-" + m.now().Format("20060102T150405Z")
-	if err := m.incus.CreateVolumeSnapshot(ctx, o.Pool, o.Volume, pre); err != nil {
-		return fmt.Errorf("refusing to restore without a pre-restore snapshot: %w", err)
-	}
-	if err := m.incus.DeleteVolume(ctx, o.Pool, o.Volume); err != nil {
 		return err
 	}
-	if err := m.incus.ImportVolume(ctx, o.Pool, artifact, o.Volume); err != nil {
-		return fmt.Errorf("import failed; volume %s@%s still holds the pre-restore state: %w", o.Volume, pre, err)
-	}
 	for _, c := range deps {
-		if err := m.incus.StartContainer(ctx, c); err != nil {
-			return err
+		if err := m.incus.StopContainer(ctx, c); err != nil {
+			return restart(err)
 		}
+		stopped = append(stopped, c)
 	}
-	return nil
+	// Always leave a recovery point behind, even if the import fails. It has to be a separate volume:
+	// a snapshot of the volume would be deleted together with it a moment later.
+	pre := preRestoreName(o.Volume, m.now())
+	if err := m.incus.DuplicateVolume(ctx, o.Pool, o.Volume, pre); err != nil {
+		return restart(fmt.Errorf("refusing to restore without a copy of the current volume: %w", err))
+	}
+	if err := m.incus.DeleteVolume(ctx, o.Pool, o.Volume); err != nil {
+		return restart(fmt.Errorf("%w (the current data is unchanged; a copy of it is in volume %s)", err, pre))
+	}
+	if err := m.incus.ImportVolume(ctx, o.Pool, artifact, o.Volume); err != nil {
+		return restart(fmt.Errorf("import failed; volume %s is gone and its data is in volume %s (copy it back with `incus storage volume copy %s/%s %s/%s`): %w",
+			o.Volume, pre, o.Pool, pre, o.Pool, o.Volume, err))
+	}
+	return restart(nil)
+}
+
+// preRestoreName is the volume an in-place restore copies the current data to: the volume's name and
+// the time, cut to fit Incus' 63-character limit. It is kept after the restore, so a restore that
+// brought back the wrong thing can itself be undone; delete it once the restored data is checked.
+func preRestoreName(volume string, now time.Time) string {
+	suffix := "-pre-restore-" + now.UTC().Format("20060102t150405")
+	if max := 63 - len(suffix); len(volume) > max {
+		volume = strings.TrimRight(volume[:max], ".-_")
+	}
+	return volume + suffix
 }
 
 // PruneAll applies retention to every allowlisted (or all) custom volume,

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"os"
@@ -22,8 +21,9 @@ type rule struct {
 // scriptExec answers commands from a rule list (first substring match wins,
 // default success/empty) and records every command in order.
 type scriptExec struct {
-	rules []rule
-	cmds  []string
+	rules  []rule
+	cmds   []string
+	stdins map[int]string // command index -> what RunWithInput was fed
 }
 
 func (s *scriptExec) Run(_ context.Context, cmd string) (string, error) {
@@ -35,9 +35,16 @@ func (s *scriptExec) Run(_ context.Context, cmd string) (string, error) {
 	}
 	return "", nil
 }
-func (s *scriptExec) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
-func (s *scriptExec) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
-func (s *scriptExec) Close() error                                                    { return nil }
+func (s *scriptExec) RunWithInput(ctx context.Context, cmd string, in io.Reader) (string, error) {
+	b, _ := io.ReadAll(in)
+	if s.stdins == nil {
+		s.stdins = map[int]string{}
+	}
+	s.stdins[len(s.cmds)] = string(b)
+	return s.Run(ctx, cmd)
+}
+func (s *scriptExec) WriteFile(context.Context, string, []byte, os.FileMode) error { return nil }
+func (s *scriptExec) Close() error                                                 { return nil }
 
 var _ remote.Executor = (*scriptExec)(nil)
 
@@ -131,7 +138,7 @@ func TestUpdateHappyPathCarriesConfigAndSnapshotsFirst(t *testing.T) {
 		t.Fatalf("data volume not re-attached: %v", ex.cmds)
 	}
 	push := ex.index("incus file push")
-	if push < dev || !strings.Contains(ex.cmds[push], base64.StdEncoding.EncodeToString([]byte(envTxt))) {
+	if push < dev || ex.stdins[push] != envTxt {
 		t.Fatalf("env file must be restored byte-for-byte after the device: %v", ex.cmds)
 	}
 	if ex.index("systemctl restart 'platform'") < push {

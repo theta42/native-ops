@@ -421,9 +421,11 @@ native-ops backup prune gitea-data     # apply retention
 ```
 
 Restores are safe by default: the artifact's SHA-256 is verified before import,
-a pre-restore snapshot is always taken, and an in-place restore refuses to touch
-a volume that is mounted by a running container unless `--force` is given (which
-stops and restarts those containers). Use `--as <name>` to import under a new
+an in-place restore first copies the current volume to `<volume>-pre-restore-<time>`
+(a separate volume, so it survives the old one being replaced, and is kept until you
+delete it), and it refuses to touch a volume that is mounted by a running container
+unless `--force` is given (which stops those containers and always starts them again,
+whether or not the restore succeeds). Use `--as <name>` to import under a new
 volume name without touching anything live.
 
 ---

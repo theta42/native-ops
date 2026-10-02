@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/theta42/native-ops/pkg/engine"
@@ -177,9 +178,31 @@ func (s *Server) startJob(id JobID, actor, what, audit string, cleanup func(), w
 	}()
 }
 
-// handleJobs is GET /v1/jobs: the recent jobs, newest first, without logs.
+// handleJobs is GET /v1/jobs: the recent jobs, newest first, without logs. A token with a scope
+// sees only its own jobs (see scopeSees).
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": s.opts.Jobs.List()})
+	actor, scope := s.actorScope(r)
+	jobs := s.opts.Jobs.List()
+	if scope != nil {
+		mine := jobs[:0]
+		for _, j := range jobs {
+			if scopeSees(scope, actor, j) {
+				mine = append(mine, j)
+			}
+		}
+		jobs = mine
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
+// scopeSees reports whether a token limited to scope, named actor, may see a job: one it started
+// itself, or a change to an instance its scope allows. A tenant system must not learn what else
+// runs on the host -- other tenants, applies, builds -- from the job list.
+func scopeSees(scope *Scope, actor string, j Job) bool {
+	if j.Actor == actor {
+		return true
+	}
+	return strings.HasPrefix(j.Kind, "instance:") && scope.AllowsName(j.Service)
 }
 
 // handleJob is GET /v1/jobs/{id}. The log (which can hold whatever a hook printed) is for
@@ -191,6 +214,9 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	job, ok := s.opts.Jobs.Get(JobID(id))
+	if actor, scope := s.actorScope(r); ok && scope != nil && !scopeSees(scope, actor, job) {
+		ok = false // the same answer as a job that does not exist
+	}
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "no such job")
 		return

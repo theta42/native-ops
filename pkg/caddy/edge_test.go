@@ -2,7 +2,6 @@ package caddy
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -37,6 +36,7 @@ func TestRenderSiteBlock(t *testing.T) {
 // fakeEdge simulates the edge container's file store and caddy commands, so
 // SyncCaddyfile can be exercised without a host.
 type fakeEdge struct {
+	stdin  string // what the current RunWithInput call was fed
 	files  map[string]string
 	valid  bool
 	reload bool
@@ -47,7 +47,7 @@ func newFakeEdge() *fakeEdge { return &fakeEdge{files: map[string]string{}, vali
 
 var (
 	fakePullRe = regexp.MustCompile(`^incus file pull '([^']*)' -$`)
-	fakePushRe = regexp.MustCompile(`printf %s '([^']*)' \| base64 -d \| incus file push .* - '([^']*)'$`)
+	fakePushRe = regexp.MustCompile(`^incus file push .* - '([^']*)'$`)
 	fakeRmRe   = regexp.MustCompile(`^incus exec .* -- rm -f '([^']*)'$`)
 )
 
@@ -62,11 +62,7 @@ func (f *fakeEdge) Run(_ context.Context, cmd string) (string, error) {
 		return "", fmt.Errorf("incus file pull: %s: not found", p)
 	case fakePushRe.MatchString(cmd):
 		m := fakePushRe.FindStringSubmatch(cmd)
-		b, err := base64.StdEncoding.DecodeString(m[1])
-		if err != nil {
-			return "", err
-		}
-		f.files[m[2]] = string(b)
+		f.files[m[1]] = f.stdin
 		return "", nil
 	case fakeRmRe.MatchString(cmd):
 		delete(f.files, fakeRmRe.FindStringSubmatch(cmd)[1])
@@ -85,9 +81,14 @@ func (f *fakeEdge) Run(_ context.Context, cmd string) (string, error) {
 	return "", nil
 }
 
-func (f *fakeEdge) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
-func (f *fakeEdge) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
-func (f *fakeEdge) Close() error                                                    { return nil }
+func (f *fakeEdge) RunWithInput(ctx context.Context, cmd string, in io.Reader) (string, error) {
+	b, _ := io.ReadAll(in)
+	f.stdin = string(b)
+	defer func() { f.stdin = "" }()
+	return f.Run(ctx, cmd)
+}
+func (f *fakeEdge) WriteFile(context.Context, string, []byte, os.FileMode) error { return nil }
+func (f *fakeEdge) Close() error                                                 { return nil }
 
 const goodCaddyfile = "{\n    email ops@example.com\n}\n\nimport /etc/caddy/sites/*.caddy\n"
 

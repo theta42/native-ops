@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,8 +101,9 @@ func (o *OIDCConfig) Provider(ctx context.Context) (*oidcProvider, error) {
 	return o.provider, nil
 }
 
-// AuthorizeURL is where the browser is sent to sign in.
-func (o *OIDCConfig) AuthorizeURL(ctx context.Context, state string) (string, error) {
+// AuthorizeURL is where the browser is sent to sign in. challenge is the PKCE S256 challenge of a
+// verifier the caller keeps (see PKCEChallenge); empty sends none.
+func (o *OIDCConfig) AuthorizeURL(ctx context.Context, state, challenge string) (string, error) {
 	p, err := o.Provider(ctx)
 	if err != nil {
 		return "", err
@@ -112,11 +115,16 @@ func (o *OIDCConfig) AuthorizeURL(ctx context.Context, state string) (string, er
 		"scope":         {strings.Join(o.Scopes, " ")},
 		"state":         {state},
 	}
+	if challenge != "" {
+		q.Set("code_challenge", challenge)
+		q.Set("code_challenge_method", "S256")
+	}
 	return p.AuthorizationEndpoint + "?" + q.Encode(), nil
 }
 
-// Exchange trades an authorization code for an access token.
-func (o *OIDCConfig) Exchange(ctx context.Context, code string) (string, error) {
+// Exchange trades an authorization code for an access token. verifier is the PKCE verifier whose
+// challenge went to AuthorizeURL (empty if none did).
+func (o *OIDCConfig) Exchange(ctx context.Context, code, verifier string) (string, error) {
 	p, err := o.Provider(ctx)
 	if err != nil {
 		return "", err
@@ -127,6 +135,9 @@ func (o *OIDCConfig) Exchange(ctx context.Context, code string) (string, error) 
 		"redirect_uri":  {o.RedirectURL},
 		"client_id":     {o.ClientID},
 		"client_secret": {o.ClientSecret},
+	}
+	if verifier != "" {
+		form.Set("code_verifier", verifier)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.TokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -211,4 +222,12 @@ func truthy(v any) bool {
 		return t == "true"
 	}
 	return false
+}
+
+// PKCEChallenge is the S256 code challenge of a PKCE verifier (RFC 7636). PKCE binds the code the
+// identity provider returns to the browser that started the sign-in, so a code that leaks (a referrer,
+// a log, a hostile redirect) cannot be redeemed by anyone else.
+func PKCEChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }

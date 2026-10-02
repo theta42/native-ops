@@ -1,0 +1,66 @@
+package remote
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"golang.org/x/crypto/ssh"
+)
+
+func newHostKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+func TestKnownHostsTrustsOnFirstUseAndRefusesAChangedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ssh", "known_hosts")
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.7"), Port: 22}
+	first, second := newHostKey(t), newHostKey(t)
+
+	cb, err := knownHostsCallback(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cb("203.0.113.7:22", addr, first); err != nil {
+		t.Fatalf("first use must be accepted and recorded: %v", err)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), "203.0.113.7") {
+		t.Fatalf("the key was not recorded: %q", b)
+	}
+	// A new callback re-reads the file, as the next run would.
+	cb, _ = knownHostsCallback(path, false)
+	if err := cb("203.0.113.7:22", addr, first); err != nil {
+		t.Fatalf("the recorded key must be accepted: %v", err)
+	}
+	if err := cb("203.0.113.7:22", addr, second); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("a changed key must be refused: %v", err)
+	}
+}
+
+func TestKnownHostsStrictRefusesAnUnknownHost(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	cb, err := knownHostsCallback(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.8"), Port: 22}
+	if err := cb("203.0.113.8:22", addr, newHostKey(t)); err == nil {
+		t.Fatal("strict mode must refuse a host it does not know")
+	}
+	if b, _ := os.ReadFile(path); len(b) != 0 {
+		t.Fatalf("strict mode must not record anything: %q", b)
+	}
+}

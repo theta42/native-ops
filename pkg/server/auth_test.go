@@ -126,7 +126,8 @@ func fakeIdP(t *testing.T, userinfo map[string]any) *httptest.Server {
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		if r.Form.Get("code") != "good" {
+		// The code was issued for the challenge of "the-verifier" (see TestOIDCGenericFlowAndChecks).
+		if r.Form.Get("code") != "good" || r.Form.Get("code_verifier") != "the-verifier" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -155,22 +156,26 @@ func TestOIDCGenericFlowAndChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	authURL, err := cfg.AuthorizeURL(ctx, "state123")
+	authURL, err := cfg.AuthorizeURL(ctx, "state123", PKCEChallenge("the-verifier"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	redirect := url.QueryEscape(idp.URL + "/auth/oidc/callback")
-	for _, want := range []string{"client_id=cid", "state=state123", "response_type=code", "redirect_uri=" + redirect} {
+	for _, want := range []string{"client_id=cid", "state=state123", "response_type=code", "redirect_uri=" + redirect,
+		"code_challenge_method=S256", "code_challenge=" + PKCEChallenge("the-verifier")} {
 		if !strings.Contains(authURL, want) {
 			t.Fatalf("authorize url missing %q: %s", want, authURL)
 		}
 	}
-	at, err := cfg.Exchange(ctx, "good")
+	at, err := cfg.Exchange(ctx, "good", "the-verifier")
 	if err != nil || at != "at-123" {
 		t.Fatalf("exchange: %v", err)
 	}
-	if _, err := cfg.Exchange(ctx, "bad"); err == nil {
+	if _, err := cfg.Exchange(ctx, "bad", "the-verifier"); err == nil {
 		t.Fatal("a bad code was exchanged")
+	}
+	if _, err := cfg.Exchange(ctx, "good", "another-verifier"); err == nil {
+		t.Fatal("a code was exchanged without its PKCE verifier")
 	}
 	id, err := cfg.Identity(ctx, at)
 	if err != nil || id.Email != "will@opsavor.ai" || id.Name != "Will" {
@@ -222,6 +227,13 @@ func TestLoginSetsACookieAndTheAPIHonoursIt(t *testing.T) {
 	if res := post(`{"username":"sam","password":"the wrong password"}`); res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("bad password: %d", res.StatusCode)
 	}
+	// Repeated failures for one account are refused for a while, even with the right password.
+	for i := 0; i <= throttleFree; i++ {
+		post(`{"username":"mallory","password":"guess guess guess"}`)
+	}
+	if res := post(`{"username":"mallory","password":"guess guess guess"}`); res.StatusCode != http.StatusTooManyRequests || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("a guessed-at account must be throttled: %d", res.StatusCode)
+	}
 	res := post(`{"username":"sam","password":"a long enough password"}`)
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("login: %d", res.StatusCode)
@@ -249,6 +261,35 @@ func TestLoginSetsACookieAndTheAPIHonoursIt(t *testing.T) {
 	if out["name"] != "sam" || out["role"] != "deployer" {
 		t.Fatalf("whoami body: %v", out)
 	}
+
+	// The cookie follows the user store, not the role it was issued with: a demotion takes effect at
+	// once, and a disabled user is signed out on their next request.
+	whoami := func() (int, map[string]any) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/whoami", nil)
+		req.AddCookie(cookie)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		var m map[string]any
+		_ = json.NewDecoder(res.Body).Decode(&m)
+		return res.StatusCode, m
+	}
+	if err := users.SetRole("sam", RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if code, m := whoami(); code != http.StatusOK || m["role"] != "viewer" {
+		t.Fatalf("after a demotion the session must carry the new role: %d %v", code, m)
+	}
+	if err := users.SetDisabled("sam", true); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := whoami(); code != http.StatusUnauthorized {
+		t.Fatalf("a disabled user's session must stop working at once: %d", code)
+	}
+	_ = users.SetDisabled("sam", false)
+	_ = users.SetRole("sam", RoleDeployer)
 
 	// A request with no cookie and no token is still refused.
 	anon, _ := http.Get(ts.URL + "/v1/whoami")

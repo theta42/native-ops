@@ -2,7 +2,6 @@ package incus
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -125,10 +124,11 @@ func (c *Client) PullFile(ctx context.Context, container, path string) (content 
 
 // PushFile writes content to a path inside a container with the given octal mode, byte for byte.
 func (c *Client) PushFile(ctx context.Context, container, path, content, mode string) error {
-	b64 := base64.StdEncoding.EncodeToString([]byte(content))
-	cmd := fmt.Sprintf("printf %%s %s | base64 -d | incus file push --create-dirs --uid 0 --gid 0 --mode %s - %s",
-		ShQuote(b64), ShQuote(mode), ShQuote(container+path))
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
+	// The content goes over stdin, never in the command line: it can be an environment file of
+	// secrets, and a command line is visible to every user on the host and is quoted in errors.
+	cmd := fmt.Sprintf("incus file push --create-dirs --uid 0 --gid 0 --mode %s - %s",
+		ShQuote(mode), ShQuote(container+path))
+	if _, err := c.exec.RunWithInput(ctx, cmd, strings.NewReader(content)); err != nil {
 		return fmt.Errorf("write %s in %s: %w", path, container, err)
 	}
 	return nil

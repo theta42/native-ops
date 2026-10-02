@@ -76,6 +76,7 @@ type Server struct {
 	cachedAt time.Time
 
 	planSlots chan struct{}
+	logins    *loginThrottle
 	applyMu   sync.Mutex // one apply at a time on this host
 	jobsWG    sync.WaitGroup
 }
@@ -105,7 +106,7 @@ func New(opts Options) (*Server, error) {
 	if opts.StatusTTL <= 0 {
 		opts.StatusTTL = 5 * time.Second
 	}
-	return &Server{opts: opts, planSlots: make(chan struct{}, maxConcurrentPlans)}, nil
+	return &Server{opts: opts, planSlots: make(chan struct{}, maxConcurrentPlans), logins: newLoginThrottle()}, nil
 }
 
 type actorHolder struct {
@@ -167,7 +168,7 @@ func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) htt
 		// A person signed in through the UI first: the session cookie carries a username and role, and a
 		// session is never scoped, so it may call any endpoint its role allows.
 		if s.opts.Sessions != nil {
-			if username, role, ok := s.opts.Sessions.FromRequest(r); ok {
+			if username, role, ok := s.currentSession(r); ok {
 				if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
 					h.name, h.role = username, role
 				}
@@ -201,6 +202,21 @@ func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) htt
 		}
 		next(w, r)
 	})
+}
+
+// currentSession reads the session cookie and checks it against the user store, so a user who has
+// been disabled, removed or given another role since signing in is treated accordingly at once, not
+// when the cookie expires. The role is the one stored now, not the one the cookie was issued with.
+func (s *Server) currentSession(r *http.Request) (string, Role, bool) {
+	username, role, ok := s.opts.Sessions.FromRequest(r)
+	if !ok || s.opts.Users == nil {
+		return username, role, ok
+	}
+	u, found, err := s.opts.Users.Get(username)
+	if err != nil || !found || u.Disabled || !ValidRole(u.Role) {
+		return "", "", false
+	}
+	return u.Username, u.Role, true
 }
 
 // audited wraps every request: it records who did what and how it ended.

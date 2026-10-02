@@ -5,9 +5,21 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
-const oidcStateCookie = "nops_oidc_state"
+const (
+	oidcStateCookie    = "nops_oidc_state"
+	oidcVerifierCookie = "nops_oidc_pkce"
+)
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // handleSession tells the UI how to sign someone in and, if they already are, who they are. It is
 // public (it carries no host data), so the SPA can decide between a login form and the app.
@@ -20,7 +32,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		out["oidc_label"] = s.opts.OIDC.Label
 	}
 	if s.opts.Sessions != nil {
-		if username, role, ok := s.opts.Sessions.FromRequest(r); ok {
+		if username, role, ok := s.currentSession(r); ok {
 			out["user"] = map[string]any{"username": username, "role": role}
 		}
 	}
@@ -40,13 +52,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
+	if wait := s.logins.Wait(body.Username); wait > 0 {
+		s.setActor(r, body.Username)
+		auditDetail(r, "sign-in refused: too many failed attempts")
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too_many_attempts", "too many failed sign-ins for this account; wait a little and try again")
+		return
+	}
 	u, err := s.opts.Users.Authenticate(body.Username, body.Password)
 	if err != nil {
+		s.logins.Fail(body.Username)
 		s.setActor(r, body.Username)
 		auditDetail(r, "sign-in failed")
 		writeError(w, http.StatusUnauthorized, "bad_login", "wrong username or password")
 		return
 	}
+	s.logins.Succeed(body.Username)
 	s.opts.Sessions.SetCookie(w, r, s.opts.Sessions.Issue(u.Username, u.Role))
 	_ = s.opts.Users.TouchLogin(u.Username)
 	s.setActor(r, u.Username)
@@ -69,17 +90,19 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 // handleOIDCStart sends the browser to the identity provider with a random state in a short-lived
 // cookie (the CSRF check for the callback).
 func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
-	b := make([]byte, 24)
-	if _, err := rand.Read(b); err != nil {
+	state, err := randomHex(24)
+	verifier, verr := randomHex(32)
+	if err != nil || verr != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "could not start the sign-in")
 		return
 	}
-	state := hex.EncodeToString(b)
-	http.SetCookie(w, &http.Cookie{
-		Name: oidcStateCookie, Value: state, Path: "/auth/oidc", HttpOnly: true,
-		SameSite: http.SameSiteLaxMode, Secure: isHTTPS(r), MaxAge: 600,
-	})
-	target, err := s.opts.OIDC.AuthorizeURL(r.Context(), state)
+	for name, value := range map[string]string{oidcStateCookie: state, oidcVerifierCookie: verifier} {
+		http.SetCookie(w, &http.Cookie{
+			Name: name, Value: value, Path: "/auth/oidc", HttpOnly: true,
+			SameSite: http.SameSiteLaxMode, Secure: isHTTPS(r), MaxAge: 600,
+		})
+	}
+	target, err := s.opts.OIDC.AuthorizeURL(r.Context(), state, PKCEChallenge(verifier))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "oidc", "could not reach the identity provider")
 		return
@@ -90,12 +113,16 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 // handleOIDCCallback finishes the OIDC flow: check the state, exchange the code, read the identity from
 // the provider, find-or-create the matching user, and set the session cookie.
 func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
-	clearState := &http.Cookie{
-		Name: oidcStateCookie, Value: "", Path: "/auth/oidc", HttpOnly: true,
-		SameSite: http.SameSiteLaxMode, Secure: isHTTPS(r), MaxAge: -1,
+	clearState := func() {
+		for _, name := range []string{oidcStateCookie, oidcVerifierCookie} {
+			http.SetCookie(w, &http.Cookie{
+				Name: name, Value: "", Path: "/auth/oidc", HttpOnly: true,
+				SameSite: http.SameSiteLaxMode, Secure: isHTTPS(r), MaxAge: -1,
+			})
+		}
 	}
 	fail := func(msg string) {
-		http.SetCookie(w, clearState)
+		clearState()
 		http.Redirect(w, r, "/?error="+url.QueryEscape(msg), http.StatusFound)
 	}
 	if s.opts.Users == nil {
@@ -112,7 +139,11 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		fail("sign-in was cancelled")
 		return
 	}
-	access, err := s.opts.OIDC.Exchange(r.Context(), code)
+	verifier := ""
+	if c, err := r.Cookie(oidcVerifierCookie); err == nil {
+		verifier = c.Value
+	}
+	access, err := s.opts.OIDC.Exchange(r.Context(), code, verifier)
 	if err != nil {
 		fail("could not complete the sign-in")
 		return
@@ -133,7 +164,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opts.Sessions.SetCookie(w, r, s.opts.Sessions.Issue(u.Username, u.Role))
 	_ = s.opts.Users.TouchLogin(u.Username)
-	http.SetCookie(w, clearState)
+	clearState()
 	s.setActor(r, u.Username)
 	auditDetail(r, "signed in via oidc")
 	http.Redirect(w, r, "/", http.StatusFound)

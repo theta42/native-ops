@@ -35,7 +35,7 @@ func (l *LocalExecutor) Run(ctx context.Context, command string) (string, error)
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("command failed: %s (stderr: %s): %w", command, strings.TrimSpace(stderr.String()), err)
+		return stdout.String(), fmt.Errorf("command failed: %s (stderr: %s): %w", CommandHead(command), strings.TrimSpace(stderr.String()), err)
 	}
 	return stdout.String(), nil
 }
@@ -48,7 +48,7 @@ func (l *LocalExecutor) RunWithInput(ctx context.Context, command string, stdin 
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("command failed: %s (stderr: %s): %w", command, strings.TrimSpace(stderr.String()), err)
+		return stdout.String(), fmt.Errorf("command with stdin failed: %s (stderr: %s): %w", CommandHead(command), strings.TrimSpace(stderr.String()), err)
 	}
 	return stdout.String(), nil
 }
@@ -81,12 +81,16 @@ func NewSSHExecutor(host string, port int, user string, privateKeyPEM []byte) (*
 		return nil, fmt.Errorf("parse SSH private key: %w", err)
 	}
 
+	hostKeys, err := hostKeyCallback()
+	if err != nil {
+		return nil, err
+	}
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // in CI/automated fleet provisioning
+		HostKeyCallback: hostKeys, // see hostkeys.go
 		Timeout:         15 * time.Second,
 	}
 
@@ -124,7 +128,7 @@ func (s *SSHExecutor) Run(ctx context.Context, command string) (string, error) {
 		return "", ctx.Err()
 	case err := <-errChan:
 		if err != nil {
-			return stdout.String(), fmt.Errorf("SSH command '%s' failed on %s (stderr: %s): %w", command, s.host, strings.TrimSpace(stderr.String()), err)
+			return stdout.String(), fmt.Errorf("SSH command '%s' failed on %s (stderr: %s): %w", CommandHead(command), s.host, strings.TrimSpace(stderr.String()), err)
 		}
 		return stdout.String(), nil
 	}
@@ -153,17 +157,17 @@ func (s *SSHExecutor) RunWithInput(ctx context.Context, command string, stdin io
 		return "", ctx.Err()
 	case err := <-errChan:
 		if err != nil {
-			return stdout.String(), fmt.Errorf("SSH command with stdin failed on %s (stderr: %s): %w", s.host, strings.TrimSpace(stderr.String()), err)
+			return stdout.String(), fmt.Errorf("SSH command '%s' with stdin failed on %s (stderr: %s): %w", CommandHead(command), s.host, strings.TrimSpace(stderr.String()), err)
 		}
 		return stdout.String(), nil
 	}
 }
 
 func (s *SSHExecutor) WriteFile(ctx context.Context, remotePath string, content []byte, perm os.FileMode) error {
-	// Base64 pipe to avoid quoting and permission issues
-	cmd := fmt.Sprintf("base64 -d > %s && chmod %o %s", remotePath, perm, remotePath)
-	b64Data := bytes.NewReader(content)
-	_, err := s.RunWithInput(ctx, cmd, b64Data)
+	// The content goes over stdin, so it never appears in a command line or an error.
+	q := shQuote(remotePath)
+	cmd := fmt.Sprintf("cat > %s && chmod %o %s", q, perm, q)
+	_, err := s.RunWithInput(ctx, cmd, bytes.NewReader(content))
 	return err
 }
 
@@ -172,4 +176,25 @@ func (s *SSHExecutor) Close() error {
 		return s.client.Close()
 	}
 	return nil
+}
+
+// CommandHead is the start of a command that is safe to put in an error or a log: its first few
+// plain words (e.g. "incus config set 'web'"), never its arguments in full. A command can carry a
+// value that must not be repeated (an instance config value, a file's content), and errors end up
+// in job records that more people can read than can read the host.
+func CommandHead(command string) string {
+	const maxWords, maxLen = 4, 80
+	words := strings.Fields(command)
+	if len(words) > maxWords {
+		words = append(words[:maxWords], "...")
+	}
+	head := strings.Join(words, " ")
+	if len(head) > maxLen {
+		head = head[:maxLen] + "..."
+	}
+	return head
+}
+
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

@@ -14,18 +14,24 @@ import (
 )
 
 type stubExec struct {
-	out  string
-	err  error
-	cmds []string
+	out    string
+	err    error
+	cmds   []string
+	stdins []string // what each RunWithInput call was fed, in order
 }
 
 func (s *stubExec) Run(_ context.Context, cmd string) (string, error) {
 	s.cmds = append(s.cmds, cmd)
 	return s.out, s.err
 }
-func (s *stubExec) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
-func (s *stubExec) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
-func (s *stubExec) Close() error                                                    { return nil }
+func (s *stubExec) RunWithInput(_ context.Context, cmd string, in io.Reader) (string, error) {
+	b, _ := io.ReadAll(in)
+	s.cmds = append(s.cmds, cmd)
+	s.stdins = append(s.stdins, string(b))
+	return s.out, s.err
+}
+func (s *stubExec) WriteFile(context.Context, string, []byte, os.FileMode) error { return nil }
+func (s *stubExec) Close() error                                                 { return nil }
 
 var _ remote.Executor = (*stubExec)(nil)
 

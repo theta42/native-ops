@@ -590,3 +590,47 @@ func TestInstancesNeedAJobStore(t *testing.T) {
 		t.Error("a job store that nothing uses is a misconfiguration")
 	}
 }
+
+func TestScopedTokenSeesOnlyItsOwnJobs(t *testing.T) {
+	rig := newInstRig(t)
+	jobs := rig.srv.opts.Jobs
+	mine, _ := jobs.CreateKind("instance:put", "fleet-manager", "", "demo-a", "")
+	jobs.Finish(mine.ID, nil)
+	other, _ := jobs.CreateKind("instance:put", "narrow", "", "x-one", "")
+	jobs.Finish(other.ID, errors.New("boom"))
+	apply, _ := jobs.Create("ci-apply", "abc", "gitea", strings.Repeat("a", 64))
+	jobs.Finish(apply.ID, nil)
+	// Started by someone else, but about an instance the scope allows: still the tenant system's business.
+	byAdmin, _ := jobs.CreateKind("instance:delete", "ci-admin", "", "rest-one", "")
+	jobs.Finish(byAdmin.ID, nil)
+
+	ids := func(body string) map[JobID]bool {
+		var out struct{ Jobs []Job }
+		if err := json.Unmarshal([]byte(body), &out); err != nil {
+			t.Fatal(err)
+		}
+		m := map[JobID]bool{}
+		for _, j := range out.Jobs {
+			m[j.ID] = true
+		}
+		return m
+	}
+	res, body := rig.do2(t, "GET", "/v1/jobs", rig.scoped, nil)
+	if res.StatusCode != 200 {
+		t.Fatalf("list: %d %s", res.StatusCode, body)
+	}
+	if got := ids(body); !got[mine.ID] || !got[byAdmin.ID] || got[other.ID] || got[apply.ID] || len(got) != 2 {
+		t.Fatalf("a scoped token must see only its own jobs and its instances' jobs, got %v", got)
+	}
+	if res, _ := rig.do2(t, "GET", "/v1/jobs/"+string(mine.ID), rig.scoped, nil); res.StatusCode != 200 {
+		t.Fatalf("its own job: %d", res.StatusCode)
+	}
+	for _, id := range []JobID{other.ID, apply.ID} {
+		if res, _ := rig.do2(t, "GET", "/v1/jobs/"+string(id), rig.scoped, nil); res.StatusCode != 404 {
+			t.Fatalf("another's job %s must look like it does not exist, got %d", id, res.StatusCode)
+		}
+	}
+	if _, body := rig.do2(t, "GET", "/v1/jobs", rig.adminTok, nil); len(ids(body)) != 4 {
+		t.Fatalf("an unscoped token sees every job: %s", body)
+	}
+}
