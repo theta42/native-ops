@@ -25,6 +25,7 @@ const (
 type Client struct {
 	token      string
 	httpClient *http.Client
+	baseURL    string // apiBaseURL; a test points it at a fake
 }
 
 // New creates a new DigitalOcean client from token or DO_API_TOKEN env.
@@ -37,7 +38,8 @@ func New(token string) (*Client, error) {
 	}
 
 	return &Client{
-		token: token,
+		token:   token,
+		baseURL: apiBaseURL,
 		httpClient: &http.Client{
 			Timeout: defaultTimeout,
 		},
@@ -58,7 +60,7 @@ func (c *Client) request(ctx context.Context, method, path string, bodyIn any, b
 		bodyReader = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, apiBaseURL+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -90,6 +92,42 @@ func (c *Client) request(ctx context.Context, method, path string, bodyIn any, b
 	return nil
 }
 
+// pageLinks is the part of a DigitalOcean list response that says whether there is another page.
+type pageLinks struct {
+	Links struct {
+		Pages struct {
+			Next string `json:"next"`
+		} `json:"pages"`
+	} `json:"links"`
+}
+
+// maxPages bounds a listing, so a misbehaving API cannot keep one going forever.
+const maxPages = 100
+
+// listAll fetches every page of a list endpoint (path already carries per_page), handing each page's
+// raw JSON to add. A listing that stopped at the first page would make reconcile miss a host it should
+// find (and create a duplicate) or a DNS sync miss a record (and create a duplicate).
+func (c *Client) listAll(ctx context.Context, path string, add func(json.RawMessage) error) error {
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	for page := 1; page <= maxPages; page++ {
+		var raw json.RawMessage
+		if err := c.request(ctx, http.MethodGet, fmt.Sprintf("%s%spage=%d", path, sep, page), nil, &raw); err != nil {
+			return err
+		}
+		if err := add(raw); err != nil {
+			return err
+		}
+		var links pageLinks
+		if err := json.Unmarshal(raw, &links); err != nil || links.Links.Pages.Next == "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("listing %s: more than %d pages", path, maxPages)
+}
+
 // ComputeProvider implementation
 
 type dropletResponse struct {
@@ -101,10 +139,10 @@ type dropletsListResponse struct {
 }
 
 type doDroplet struct {
-	ID        int       `json:"id"`
-	Name      string    `json:"name"`
-	Status    string    `json:"status"`
-	Region    struct {
+	ID     int    `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Region struct {
 		Slug string `json:"slug"`
 	} `json:"region"`
 	SizeSlug  string    `json:"size_slug"`
@@ -160,9 +198,8 @@ func (c *Client) EnsureSSHKey(ctx context.Context, name, pubKeyStr string) (stri
 	if pubKeyStr == "" {
 		return "", nil
 	}
-	var res doSSHKeysResponse
-	if err := c.request(ctx, http.MethodGet, "/account/keys?per_page=100", nil, &res); err == nil {
-		for _, k := range res.SSHKeys {
+	if keys, err := c.ListSSHKeys(ctx); err == nil {
+		for _, k := range keys {
 			if strings.TrimSpace(k.PublicKey) == strings.TrimSpace(pubKeyStr) {
 				return k.Fingerprint, nil
 			}
@@ -189,11 +226,16 @@ func (c *Client) EnsureSSHKey(ctx context.Context, name, pubKeyStr string) (stri
 }
 
 func (c *Client) ListSSHKeys(ctx context.Context) ([]doSSHKey, error) {
-	var res doSSHKeysResponse
-	if err := c.request(ctx, http.MethodGet, "/account/keys?per_page=100", nil, &res); err != nil {
-		return nil, err
-	}
-	return res.SSHKeys, nil
+	var keys []doSSHKey
+	err := c.listAll(ctx, "/account/keys?per_page=100", func(raw json.RawMessage) error {
+		var res doSSHKeysResponse
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return err
+		}
+		keys = append(keys, res.SSHKeys...)
+		return nil
+	})
+	return keys, err
 }
 
 func (c *Client) CreateHost(ctx context.Context, spec config.HostSpec) (*provider.Host, error) {
@@ -264,14 +306,19 @@ func (c *Client) GetHost(ctx context.Context, hostID string) (*provider.Host, er
 }
 
 func (c *Client) ListHosts(ctx context.Context) ([]*provider.Host, error) {
-	var res dropletsListResponse
-	if err := c.request(ctx, http.MethodGet, "/droplets?per_page=100", nil, &res); err != nil {
-		return nil, fmt.Errorf("list droplets: %w", err)
-	}
-
 	var hosts []*provider.Host
-	for i := range res.Droplets {
-		hosts = append(hosts, c.toHost(&res.Droplets[i]))
+	err := c.listAll(ctx, "/droplets?per_page=100", func(raw json.RawMessage) error {
+		var res dropletsListResponse
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return err
+		}
+		for i := range res.Droplets {
+			hosts = append(hosts, c.toHost(&res.Droplets[i]))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list droplets: %w", err)
 	}
 	return hosts, nil
 }
@@ -314,14 +361,22 @@ type doDNSRecord struct {
 }
 
 func (c *Client) ListRecords(ctx context.Context, domain string) ([]provider.DNSRecord, error) {
-	var res doDNSRecordsResponse
+	var all []doDNSRecord
 	path := fmt.Sprintf("/domains/%s/records?per_page=200", domain)
-	if err := c.request(ctx, http.MethodGet, path, nil, &res); err != nil {
+	err := c.listAll(ctx, path, func(raw json.RawMessage) error {
+		var res doDNSRecordsResponse
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return err
+		}
+		all = append(all, res.DomainRecords...)
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("list DNS records for %s: %w", domain, err)
 	}
 
 	var records []provider.DNSRecord
-	for _, r := range res.DomainRecords {
+	for _, r := range all {
 		rec := provider.DNSRecord{
 			ID:    strconv.Itoa(r.ID),
 			Type:  r.Type,
