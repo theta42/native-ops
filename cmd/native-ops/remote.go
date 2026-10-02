@@ -38,6 +38,9 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   dns-sync                        create or update fleet.yml's dns_records
   wait        <job-id>            wait for a job (no upload)
   recipe-approve [<digest>]       approve an image recipe; without a digest, the one of --config-dir (admin)
+  secret-sync [--prune] NAME...   push these environment variables to the daemon's secret store, e.g.
+                                  from the git server's secrets; --prune removes every other one (admin)
+  secret-list                     the names in the daemon's secret store, never the values (admin)
   token-create --name n --role r [--names g --images g --domains g]   (admin; no upload)
 
 Common flags: --url (NATIVE_OPS_URL), --token-env (default NATIVE_OPS_TOKEN), --config-dir (.),
@@ -64,7 +67,7 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	service := flags.String("service", "", "plan: only this service")
 	expect := flags.String("expect", "", "apply: the hash of the approved plan")
 	volume := flags.String("volume", "", "backup/restore: the volume")
-	prune := flags.Bool("prune", false, "backup: apply retention afterwards")
+	prune := flags.Bool("prune", false, "backup: apply retention afterwards; secret-sync: remove every secret not named")
 	from := flags.String("from", "latest", "restore: the object key, or latest")
 	as := flags.String("as", "", "restore: restore under this new volume name")
 	force := flags.Bool("force", false, "restore: stop the containers that mount the volume")
@@ -73,6 +76,7 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	names := flags.String("names", "", "token-create: instance name globs, comma separated (a scoped token)")
 	images := flags.String("images", "", "token-create: image globs, comma separated")
 	domains := flags.String("domains", "", "token-create: domain globs, comma separated")
+	prune2 := flags.Bool("prune-secrets", false, "secret-sync: remove every secret on the daemon not named here (also --prune)")
 	_ = flags.Parse(args[1:])
 
 	if *base == "" {
@@ -141,6 +145,47 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 			fatalf("the daemon answered %d: %s", code, raw)
 		}
 		fmt.Printf("approved image recipe %s\n", digest)
+	case "secret-sync":
+		// The values come from this process's environment (a CI job maps the git server's secrets
+		// into it); they go to the daemon in one request and are never printed.
+		set := map[string]string{}
+		var missing []string
+		for _, name := range flags.Args() {
+			if v := os.Getenv(name); v != "" {
+				set[name] = v
+			} else {
+				missing = append(missing, name)
+			}
+		}
+		for _, m := range missing {
+			fmt.Fprintf(os.Stderr, "notice: %s is empty here, so it is not sent\n", m)
+		}
+		doPrune := *prune || *prune2
+		if len(set) == 0 && !doPrune {
+			fatalf("no secret to send: name environment variables that are set, e.g. secret-sync DO_API_TOKEN")
+		}
+		var out struct {
+			Changed []string `json:"changed"`
+			Removed []string `json:"removed"`
+		}
+		if code, raw := c.json(ctx, "PUT", "/v1/secrets", map[string]any{"secrets": set, "prune": doPrune}, &out); code != http.StatusOK {
+			fatalf("the daemon answered %d: %s", code, raw)
+		}
+		fmt.Printf("secrets synced: %d sent, changed: %s, removed: %s\n", len(set), listOrNone(out.Changed), listOrNone(out.Removed))
+	case "secret-list":
+		var out struct {
+			Secrets []struct {
+				Name  string `json:"name"`
+				SetBy string `json:"set_by"`
+				SetAt string `json:"set_at"`
+			} `json:"secrets"`
+		}
+		if code, raw := c.json(ctx, "GET", "/v1/secrets", nil, &out); code != http.StatusOK {
+			fatalf("the daemon answered %d: %s", code, raw)
+		}
+		for _, s := range out.Secrets {
+			fmt.Printf("%-32s set by %s at %s\n", s.Name, s.SetBy, s.SetAt)
+		}
 	case "wait":
 		if flags.NArg() < 1 {
 			fatalf("wait needs a job id")
@@ -375,4 +420,11 @@ func packTree(dir string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func listOrNone(l []string) string {
+	if len(l) == 0 {
+		return "none"
+	}
+	return strings.Join(l, ", ")
 }

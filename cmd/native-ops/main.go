@@ -110,8 +110,8 @@ The daemon (runs on each host; CI drives it over HTTPS):
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
   remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
-                   token-create, recipe-approve (uploads the checked-out tree; NATIVE_OPS_URL,
-                   NATIVE_OPS_TOKEN)
+                   token-create, recipe-approve, secret-sync (uploads the checked-out tree;
+                   NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
 
 Core Commands:
   host create      Provision a new cloud host (DigitalOcean; Proxmox is experimental)
@@ -580,11 +580,15 @@ func loadBackupStoreWith(configDir string, exec remote.Executor) (*backup.Manage
 	if fleet.Backup == nil {
 		return nil, fmt.Errorf("no 'backup:' section in %s/fleet.yml", configDir)
 	}
-	cfg := fleet.Backup
+	return backupManagerFor(fleet.Backup, exec, os.Getenv)
+}
+
+// backupManagerFor builds a backup manager for a backup section, reading the keys with get.
+func backupManagerFor(cfg *config.BackupConfig, exec remote.Executor, get func(string) string) (*backup.Manager, error) {
 	if err := cfg.ValidateForBackup(); err != nil {
 		return nil, err
 	}
-	access, secret, err := cfg.Credentials()
+	access, secret, err := cfg.CredentialsFrom(get)
 	if err != nil {
 		return nil, err
 	}

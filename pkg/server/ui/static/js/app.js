@@ -355,7 +355,28 @@ function tokensView(d) {
   return h("div", {}, shown,
     card("key", "API tokens",
       h("div", {}, rows.length ? table(["Name", "Role", "Scope", "Created", "Id", ""], rows) : empty("No tokens yet (the bootstrap token is not listed)."), form),
-      h("span", { class: "badge text-bg-secondary" }, rows.length)));
+      h("span", { class: "badge text-bg-secondary" }, rows.length)),
+    d.secrets ? secretsCard(d.secrets) : null);
+}
+
+// The daemon's own credentials, pushed from the git server's secret store by CI. Names only: a value
+// is never sent back.
+function secretsCard(list) {
+  const rows = list.map((s) => {
+    const del = h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("trash", "me-1"), "Delete");
+    del.addEventListener("click", () => {
+      if (confirm(`Delete the secret ${s.name} from this daemon? Whatever needs it stops working until it is synced again.`)) {
+        act("DELETE", `/v1/secrets/${encodeURIComponent(s.name)}`, `Secret ${s.name} deleted.`);
+      }
+    });
+    return [h("code", {}, s.name), s.set_by, when(s.set_at), del];
+  });
+  return card("lock", "Daemon secrets",
+    h("div", {},
+      h("div", { class: "card-body pb-0" }, h("p", { class: "text-muted small mb-2" },
+        "Set in the git server's secret store and pushed here by CI (native-ops remote secret-sync). Values are never shown.")),
+      rows.length ? table(["Name", "Set by", "Set at", ""], rows) : empty("No secrets synced yet.")),
+    h("span", { class: "badge text-bg-secondary" }, rows.length));
 }
 
 // ---- image recipes ------------------------------------------------------------
@@ -438,7 +459,8 @@ const pages = [
   { re: /^\/jobs$/, nav: "/jobs", load: () => api("/v1/jobs").catch((e) => { if (e.status === 404) return { disabled: true }; throw e; }), render: jobsView },
   { re: /^\/jobs\/(j-[0-9]+-[0-9a-f]{8})$/, nav: "/jobs", load: (m) => api("/v1/jobs/" + m[1]), render: jobView },
   { re: /^\/recipes$/, nav: "/recipes", load: () => api("/v1/images/recipes"), render: recipesView },
-  { re: /^\/tokens$/, nav: "/tokens", load: () => api("/v1/tokens"), render: tokensView },
+  { re: /^\/tokens$/, nav: "/tokens", load: () => Promise.all([api("/v1/tokens"), api("/v1/secrets").catch(() => null)])
+      .then(([t, s]) => ({ ...t, secrets: s ? s.secrets : null })), render: tokensView },
 ];
 
 const routes = { "/": overviewView, "/instances": instancesView, "/volumes": volumesView, "/network": networkView };

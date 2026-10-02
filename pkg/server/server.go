@@ -58,6 +58,9 @@ type Options struct {
 	// ImagePrefix is what the config repo's build recipe names an image before <app>:<ref> (its
 	// scripts/build-image.sh decides; e.g. "acme-"). A scoped token's image globs are checked against it.
 	ImagePrefix string
+	// Secrets, when set, enables /v1/secrets: the daemon's own credentials, pushed from the git
+	// server's secret store by CI (see secrets.go).
+	Secrets *SecretStore
 	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
 	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
 	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
@@ -355,6 +358,11 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, snap)
 	}))
+	if s.opts.Secrets != nil {
+		mux.Handle("GET /v1/secrets", s.auth(RoleAdmin, s.handleSecretList))
+		mux.Handle("PUT /v1/secrets", s.auth(RoleAdmin, s.handleSecretSync))
+		mux.Handle("DELETE /v1/secrets/{name}", s.auth(RoleAdmin, s.handleSecretDelete))
+	}
 	mux.Handle("GET /v1/tokens", s.auth(RoleAdmin, s.handleTokenList))
 	mux.Handle("POST /v1/tokens", s.auth(RoleAdmin, s.handleTokenCreate))
 	mux.Handle("DELETE /v1/tokens/{id}", s.auth(RoleAdmin, s.handleTokenRevoke))

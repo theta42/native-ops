@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -133,18 +134,10 @@ func handleServeCommand(ctx context.Context, args []string) {
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
-	var dnsProv provider.DNSProvider
-	if *dnsProviderFlag != "" {
-		switch *dnsProviderFlag {
-		case "digitalocean", "do":
-			do, err := digitalocean.New("")
-			if err != nil {
-				log.Fatalf("dns provider: %v", err)
-			}
-			dnsProv = do
-		default:
-			log.Fatalf("unknown --dns-provider %q", *dnsProviderFlag)
-		}
+	switch *dnsProviderFlag {
+	case "", "digitalocean", "do":
+	default:
+		log.Fatalf("unknown --dns-provider %q", *dnsProviderFlag)
 	}
 	srv, closeFn, err := newDaemon(daemonConfig{
 		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
@@ -158,7 +151,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		OIDC: server.OIDCSettings{Issuer: *oidcIssuer, ClientID: *oidcClientID, ClientSecret: *oidcClientSecret,
 			RedirectURL: *oidcRedirectURL, AllowedDomain: *oidcAllowedDomain, Role: server.Role(*oidcRole), Label: *oidcLabel},
 		EdgeContainer:        *edgeContainer,
-		DNS:                  dnsProv,
+		DNSProviderName:      *dnsProviderFlag,
 		DNSDomains:           splitList(*dnsDomains),
 		Exec:                 remote.NewLocalExecutor(),
 		BootstrapToken:       os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
@@ -188,6 +181,9 @@ type daemonConfig struct {
 	EnableEdgeApply      bool
 	EnableBackup         bool
 	EnableDNSSync        bool
+	// DNSProviderName ("digitalocean") lists DNS records for the status page with the provider's token
+	// read through the secret store at each listing; DNS, when set, is used instead (tests).
+	DNSProviderName      string
 	ApprovalTTL          time.Duration
 	Exec                 remote.Executor
 	BootstrapToken       string
@@ -221,6 +217,14 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		log.Printf("bootstrap admin token loaded from NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256")
 	}
+	secrets, err := server.OpenSecretStore(filepath.Join(cfg.StateDir, "secrets.json"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("secrets: %w", err)
+	}
+	lookup := secrets.Lookup
+	if cfg.DNS == nil && (cfg.DNSProviderName == "digitalocean" || cfg.DNSProviderName == "do") {
+		cfg.DNS = lazyDO{lookup}
+	}
 	audit, err := server.OpenAudit(filepath.Join(cfg.StateDir, "audit.log"))
 	if err != nil {
 		return nil, nil, fmt.Errorf("audit log: %w", err)
@@ -242,7 +246,8 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) {
 			return status.CollectFull(ctx, cfg.Exec, status.Options{Pool: cfg.Pool, EdgeContainer: cfg.EdgeContainer, DNS: cfg.DNS, DNSDomains: cfg.DNSDomains})
 		},
-		Plan: planSource(cfg.Exec, key),
+		Plan:    planSource(cfg.Exec, key),
+		Secrets: secrets,
 	}
 	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply || cfg.EnableBackup || cfg.EnableDNSSync {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
@@ -272,10 +277,10 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			opts.ImageBuild = imageBuildSource(cfg.Exec, cfg.ImagePrefix)
 		}
 		if cfg.EnableBackup {
-			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool), restoreSource(cfg.Exec, cfg.Pool)
+			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup), restoreSource(cfg.Exec, cfg.Pool, lookup)
 		}
 		if cfg.EnableDNSSync {
-			opts.DNSSync = dnsSyncSource()
+			opts.DNSSync = dnsSyncSource(lookup, cfg.DNSDomains)
 		}
 		if cfg.EnableEdgeApply {
 			opts.EdgeApply = edgeApplySource(cfg.Exec, cfg.EdgeContainer)
@@ -300,6 +305,9 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		opts.Users, opts.Sessions = users, sess
 	}
 	if cfg.OIDC.Issuer != "" {
+		if cfg.OIDC.ClientSecret == "" {
+			cfg.OIDC.ClientSecretFrom = func() string { return lookup("NATIVE_OPS_OIDC_CLIENT_SECRET") }
+		}
 		oidc, err := server.NewOIDC(cfg.OIDC)
 		if err != nil {
 			audit.Close()
@@ -382,9 +390,9 @@ func edgeApplySource(exec remote.Executor, edgeContainer string) server.EdgeAppl
 
 // backupSource is what POST /v1/backups runs: back up one volume (or every allowed one) as the uploaded
 // fleet.yml's backup section says, then optionally apply retention.
-func backupSource(exec remote.Executor, pool string) server.BackupFunc {
+func backupSource(exec remote.Executor, pool string, lookup func(string) string) server.BackupFunc {
 	return func(ctx context.Context, dir string, req server.BackupRequest, logf func(string, ...any)) error {
-		mgr, err := loadBackupStoreWith(dir, exec)
+		mgr, err := daemonBackupStore(dir, exec, lookup)
 		if err != nil {
 			return fmt.Errorf("backup config: %w", err)
 		}
@@ -421,9 +429,9 @@ func backupSource(exec remote.Executor, pool string) server.BackupFunc {
 }
 
 // restoreSource is what POST /v1/backups/restore runs.
-func restoreSource(exec remote.Executor, pool string) server.RestoreFunc {
+func restoreSource(exec remote.Executor, pool string, lookup func(string) string) server.RestoreFunc {
 	return func(ctx context.Context, dir string, req server.RestoreRequest, logf func(string, ...any)) error {
-		mgr, err := loadBackupStoreWith(dir, exec)
+		mgr, err := daemonBackupStore(dir, exec, lookup)
 		if err != nil {
 			return fmt.Errorf("backup config: %w", err)
 		}
@@ -442,7 +450,7 @@ func restoreSource(exec remote.Executor, pool string) server.RestoreFunc {
 // dnsSyncSource is what POST /v1/dns/sync runs: the uploaded fleet.yml's dns_records, through a built-in
 // provider. A script plugin is never run from an upload: that would let any deployer token run code
 // on the host without the plan approval an apply needs.
-func dnsSyncSource() server.DNSSyncFunc {
+func dnsSyncSource(lookup func(string) string, flagZones []string) server.DNSSyncFunc {
 	return func(ctx context.Context, dir string, logf func(string, ...any)) error {
 		fleet, err := config.LoadFleetConfig(dir)
 		if err != nil {
@@ -457,7 +465,23 @@ func dnsSyncSource() server.DNSSyncFunc {
 		default:
 			return fmt.Errorf("dns_provider %q: the daemon syncs DNS only through a built-in provider (digitalocean); run `native-ops dns sync` for a script plugin", fleet.DNSProvider)
 		}
-		prov, err := digitalocean.New("")
+		// An upload may only touch the zones the daemon was given (--dns-domains, or the synced secret
+		// NATIVE_OPS_DNS_ZONES): the provider's token reaches every zone in the account.
+		allowed := append(append([]string{}, flagZones...), splitList(lookup("NATIVE_OPS_DNS_ZONES"))...)
+		byZone, err := fleet.DNSRecordsByZone()
+		if err != nil {
+			return err
+		}
+		for zone := range byZone {
+			if !containsFold(allowed, zone) {
+				return fmt.Errorf("dns_records name the zone %s, which this daemon may not change: set NATIVE_OPS_DNS_ZONES (synced from the git server's secrets) to the zones it may sync", zone)
+			}
+		}
+		token := lookup("DO_API_TOKEN")
+		if token == "" {
+			return errors.New("DO_API_TOKEN is not set on this daemon: sync it from the git server's secrets (native-ops remote secret-sync)")
+		}
+		prov, err := digitalocean.New(token)
 		if err != nil {
 			return fmt.Errorf("DigitalOcean provider: %w", err)
 		}
@@ -616,4 +640,70 @@ func handleUserCommand(args []string) {
 		fmt.Println("Usage: native-ops user [create|list|passwd|role|disable|enable] --state-dir DIR ...")
 		os.Exit(1)
 	}
+}
+
+// daemonBackupStore is loadBackupStore for the daemon. The upload says what to back up, but not where
+// to: the destination must be the one pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT and
+// NATIVE_OPS_BACKUP_BUCKET, synced from the git server's secrets), or a deployer token could send the
+// host's volumes to storage of its own choosing. The keys come from the secret store too.
+func daemonBackupStore(dir string, exec remote.Executor, lookup func(string) string) (*backup.Manager, error) {
+	fleet, err := config.LoadFleetConfig(dir)
+	if err != nil {
+		return nil, err
+	}
+	if fleet.Backup == nil {
+		return nil, fmt.Errorf("no 'backup:' section in fleet.yml")
+	}
+	endpoint, bucket := lookup("NATIVE_OPS_BACKUP_ENDPOINT"), lookup("NATIVE_OPS_BACKUP_BUCKET")
+	if endpoint == "" || bucket == "" {
+		return nil, errors.New("this daemon has no pinned backup destination: sync NATIVE_OPS_BACKUP_ENDPOINT and NATIVE_OPS_BACKUP_BUCKET from the git server's secrets")
+	}
+	if !strings.EqualFold(strings.TrimRight(fleet.Backup.Endpoint, "/"), strings.TrimRight(endpoint, "/")) || fleet.Backup.Bucket != bucket {
+		return nil, fmt.Errorf("fleet.yml's backup destination (%s, bucket %s) is not the one pinned on this daemon", fleet.Backup.Endpoint, fleet.Backup.Bucket)
+	}
+	return backupManagerFor(fleet.Backup, exec, lookup)
+}
+
+// lazyDO lists DNS records for the status page with the token the secret store has at that moment,
+// so a token synced after the daemon started is used without a restart.
+type lazyDO struct{ lookup func(string) string }
+
+func (l lazyDO) client() (*digitalocean.Client, error) {
+	tok := l.lookup("DO_API_TOKEN")
+	if tok == "" {
+		return nil, errors.New("DO_API_TOKEN is not set on this daemon")
+	}
+	return digitalocean.New(tok)
+}
+
+func (l lazyDO) Name() string { return "digitalocean" }
+func (l lazyDO) SyncRecords(ctx context.Context, domain string, records []provider.DNSRecord) error {
+	c, err := l.client()
+	if err != nil {
+		return err
+	}
+	return c.SyncRecords(ctx, domain, records)
+}
+func (l lazyDO) ListRecords(ctx context.Context, domain string) ([]provider.DNSRecord, error) {
+	c, err := l.client()
+	if err != nil {
+		return nil, err
+	}
+	return c.ListRecords(ctx, domain)
+}
+func (l lazyDO) DeleteRecord(ctx context.Context, domain, id string) error {
+	c, err := l.client()
+	if err != nil {
+		return err
+	}
+	return c.DeleteRecord(ctx, domain, id)
+}
+
+func containsFold(list []string, s string) bool {
+	for _, x := range list {
+		if strings.EqualFold(strings.TrimSuffix(x, "."), strings.TrimSuffix(s, ".")) {
+			return true
+		}
+	}
+	return false
 }
