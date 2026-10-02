@@ -31,6 +31,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/backups?volume=&prune=1` | deployer | back up one volume, or every volume `fleet.yml` allows, then optionally apply retention, as a job (only with `--enable-backup`) |
 | `POST /v1/backups/restore?volume=&from=&as=&force=1` | admin | restore a volume in place (keeping a copy of the current one) or as a new volume, as a job (only with `--enable-backup`) |
 | `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (only with `--enable-dns-sync`) |
+| `GET/PUT /v1/secrets`, `DELETE /v1/secrets/{name}` | admin | the daemon's own credentials, pushed from the git server's secret store; names only are ever returned |
 | `GET/POST /v1/tokens`, `DELETE /v1/tokens/{id}` | admin | list, create (the secret is returned once) and revoke API tokens |
 | `GET/POST /v1/users`, `PATCH /v1/users/{username}` | admin | list and create local users; change a role, disable, or set a password (with `--enable-auth` or OIDC) |
 | `GET /v1/images/recipes`, `POST /v1/images/recipes/{digest}/approve`, `DELETE .../approval` | admin | the image recipes builds were asked for, and approving or withdrawing one (with `--enable-image-build`) |
@@ -306,13 +307,58 @@ native-ops remote dns-sync                        # fleet.yml's dns_records (cre
 native-ops remote restore --volume gitea-data --as gitea-drill    # admin: a restore drill
 ```
 
-`fleet.yml` in the upload says what to do; the credentials stay with the daemon, in its environment:
-the object store's keys (`BACKUP_S3_ACCESS_KEY`/`BACKUP_S3_SECRET_KEY`, or the names `fleet.yml`
-gives) and the DNS provider's (`DO_API_TOKEN`). Through the daemon DNS is synced only with a built-in
-provider: a script plugin from an upload would let a deployer token run code on the host without an
-approved plan (run `native-ops dns sync` on the host for a plugin). An in-place restore stops the
+`fleet.yml` in the upload says what to do; the credentials stay with the daemon, in its secret store
+(see the next section): the object store's keys (`BACKUP_S3_ACCESS_KEY`/`BACKUP_S3_SECRET_KEY`, or the
+names `fleet.yml` gives) and the DNS provider's (`DO_API_TOKEN`). The upload cannot redirect them:
+
+- a backup goes only to the destination pinned on the daemon (`NATIVE_OPS_BACKUP_ENDPOINT` and
+  `NATIVE_OPS_BACKUP_BUCKET`); an upload naming another one is refused, or a deployer token could send
+  the host's volumes to storage of its own;
+- a DNS sync touches only the zones the daemon was given (`--dns-domains`, or `NATIVE_OPS_DNS_ZONES`):
+  the provider's token reaches every zone in the account;
+- DNS is synced only with a built-in provider: a script plugin from an upload would let a deployer token
+  run code on the host without an approved plan (run `native-ops dns sync` on the host for a plugin). An in-place restore stops the
 containers that mount the volume (`force=1`), copies the current volume aside to
 `<volume>-pre-restore-<time>` first, and always starts the containers again.
+
+## The daemon's own credentials (synced from the git server)
+
+The daemon needs a few credentials of its own: the DNS provider's token, the object store's keys, the
+OIDC client secret, and the values that pin what an upload may do with them. Nobody logs in to put them
+on the host. People enter them in the **git server's secret store** (repository or environment
+secrets), and a CI workflow pushes them to the daemon:
+
+```yaml
+# a workflow job, in a protected environment (an admin token is needed)
+- env:
+    NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_BOOTSTRAP_TOKEN }}
+    DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+    BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
+    BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
+    NATIVE_OPS_BACKUP_ENDPOINT: ${{ vars.BACKUP_ENDPOINT }}
+    NATIVE_OPS_BACKUP_BUCKET: ${{ vars.BACKUP_BUCKET }}
+    NATIVE_OPS_DNS_ZONES: ${{ vars.DNS_ZONES }}
+  run: native-ops remote secret-sync --prune DO_API_TOKEN BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY NATIVE_OPS_BACKUP_ENDPOINT NATIVE_OPS_BACKUP_BUCKET NATIVE_OPS_DNS_ZONES
+```
+
+- `PUT /v1/secrets` (admin) stores them in `secrets.json` in the state directory (0600); `GET` lists the
+  names, who set each and when, never a value; `DELETE /v1/secrets/{name}` removes one. The UI's Tokens
+  page shows the same list.
+- A name in the store wins over the daemon's environment, so a host that already has a value in
+  `/etc/native-ops/serve.env` keeps working, and a synced value replaces it.
+- Values are read when needed -- a backup or DNS job, the status page's DNS listing, each OIDC sign-in --
+  so a sync takes effect at once, without a restart. OIDC can be turned on (`--oidc-issuer`,
+  `--oidc-client-id`, `--oidc-redirect-url`) before `NATIVE_OPS_OIDC_CLIENT_SECRET` is synced.
+- Values never appear in an answer, a job, a log or the audit file; the audit line names what changed.
+- `--prune` makes the git server the source of truth: a secret it no longer has is removed.
+
+| Name | Used for |
+|---|---|
+| `DO_API_TOKEN` | DNS sync, and the DNS records on the status page |
+| `BACKUP_S3_ACCESS_KEY`, `BACKUP_S3_SECRET_KEY` | backups and restores (or the names `fleet.yml`'s `backup:` gives) |
+| `NATIVE_OPS_BACKUP_ENDPOINT`, `NATIVE_OPS_BACKUP_BUCKET` | the only backup destination an upload may use |
+| `NATIVE_OPS_DNS_ZONES` | the zones a DNS sync may change (comma separated; with `--dns-domains`) |
+| `NATIVE_OPS_OIDC_CLIENT_SECRET` | OIDC sign-in |
 
 ## UI sign-in: local users and OIDC
 
@@ -341,8 +387,8 @@ UI calls the API with it. API tokens keep working unchanged, for CI and machines
   they are signed in with.
 
 Every auth/OIDC setting also has an environment form (`NATIVE_OPS_ENABLE_AUTH`, `NATIVE_OPS_OIDC_*`;
-see `native-ops serve --help`), so the OIDC client secret can live in the root-only
-`/etc/native-ops/serve.env` instead of a unit file.
+see `native-ops serve --help`). The OIDC client secret is best synced from the git server
+(`NATIVE_OPS_OIDC_CLIENT_SECRET`, see above) rather than put in a unit file or `serve.env`.
 
 ```
 # omit --password to read one line from stdin (so it is not in the shell history)
