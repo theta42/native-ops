@@ -293,6 +293,71 @@ function planView(p) {
       h("a", { href: "#/plans", class: "btn btn-sm btn-outline-secondary" }, icon("arrow-left", "me-1"), "All plans")));
 }
 
+// ---- API tokens -----------------------------------------------------------------
+
+// CI's tokens are made here, by an admin, so nobody needs a shell on the host. A new secret is shown
+// once, in `created`, until the admin leaves the page.
+let created = null; // {name, secret}
+
+function tokensView(d) {
+  const rows = (d.tokens || []).map((t) => {
+    const revoke = h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("trash", "me-1"), "Revoke");
+    revoke.addEventListener("click", () => {
+      if (confirm(`Revoke the token "${t.name}"? Anything using it stops working at once.`)) {
+        act("DELETE", `/v1/tokens/${encodeURIComponent(t.id)}`, `Token "${t.name}" revoked.`);
+      }
+    });
+    const scope = t.scope ? [
+      (t.scope.names || []).length ? `names ${t.scope.names.join(",")}` : "",
+      (t.scope.images || []).length ? `images ${t.scope.images.join(",")}` : "",
+      (t.scope.domains || []).length ? `domains ${t.scope.domains.join(",")}` : "",
+    ].filter(Boolean).join("; ") : "";
+    return [t.name, badge(t.role, t.role === "admin" ? "danger" : t.role === "deployer" ? "warning" : "secondary"), scope, when(t.created), h("code", {}, t.id), revoke];
+  });
+
+  const name = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "name, e.g. ci-plan", required: true, maxlength: "60", "aria-label": "Token name" });
+  const roleSel = h("select", { class: "form-select form-select-sm", "aria-label": "Role" },
+    ["planner", "deployer", "viewer", "admin"].map((r) => h("option", { value: r }, r)));
+  const names = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "instance globs, e.g. demo-*", "aria-label": "Instance name globs" });
+  const images = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "image globs, e.g. app-web:*", "aria-label": "Image globs" });
+  const domains = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "domain globs, e.g. *.example.com", "aria-label": "Domain globs" });
+  const list = (el) => el.value.split(",").map((x) => x.trim()).filter(Boolean);
+  const form = h("form", { class: "card-body border-top" },
+    h("div", { class: "row g-2 align-items-end" },
+      h("div", { class: "col-md-3" }, name),
+      h("div", { class: "col-md-2" }, roleSel),
+      h("div", { class: "col-md-2" }, names),
+      h("div", { class: "col-md-2" }, images),
+      h("div", { class: "col-md-2" }, domains),
+      h("div", { class: "col-md-1" }, h("button", { type: "submit", class: "btn btn-sm btn-success w-100" }, icon("plus"), " Create"))),
+    h("p", { class: "text-muted small mt-2 mb-0" },
+      "A planner token can plan and nothing else: give it to pull-request pipelines. A deployer token applies only plans an admin approved. " +
+      "Fill in instance and image globs to make a scoped deployer token that can manage only those tenant instances."));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { name: name.value.trim(), role: roleSel.value };
+    if (names.value || images.value || domains.value) body.scope = { names: list(names), images: list(images), domains: list(domains) };
+    try {
+      const out = await api("/v1/tokens", "POST", body);
+      created = { name: out.token.name, secret: out.secret };
+      notice = null;
+    } catch (err) {
+      if (err.auth) return signOut("Your sign-in is no longer valid.");
+      notice = { kind: "danger", text: err.message };
+    }
+    await refresh();
+  });
+
+  const shown = created ? h("div", { class: "alert alert-success" },
+    h("div", { class: "mb-2" }, icon("key", "me-1"), `Token "${created.name}" created. Copy the secret now: it is not shown again.`),
+    h("input", { type: "text", class: "form-control font-monospace", readonly: true, value: created.secret, "aria-label": "New token secret" })) : null;
+
+  return h("div", {}, shown,
+    card("key", "API tokens",
+      h("div", {}, rows.length ? table(["Name", "Role", "Scope", "Created", "Id", ""], rows) : empty("No tokens yet (the bootstrap token is not listed)."), form),
+      h("span", { class: "badge text-bg-secondary" }, rows.length)));
+}
+
 // ---- image recipes ------------------------------------------------------------
 
 // An image build runs the uploaded recipe (scripts/ and images/) on the host, so the daemon builds only
@@ -373,6 +438,7 @@ const pages = [
   { re: /^\/jobs$/, nav: "/jobs", load: () => api("/v1/jobs").catch((e) => { if (e.status === 404) return { disabled: true }; throw e; }), render: jobsView },
   { re: /^\/jobs\/(j-[0-9]+-[0-9a-f]{8})$/, nav: "/jobs", load: (m) => api("/v1/jobs/" + m[1]), render: jobView },
   { re: /^\/recipes$/, nav: "/recipes", load: () => api("/v1/images/recipes"), render: recipesView },
+  { re: /^\/tokens$/, nav: "/tokens", load: () => api("/v1/tokens"), render: tokensView },
 ];
 
 const routes = { "/": overviewView, "/instances": instancesView, "/volumes": volumesView, "/network": networkView };
@@ -462,6 +528,7 @@ async function start() {
     role = w.role;
     // Recipes are an admin's page, and only on a daemon that builds images.
     if (role === "admin") api("/v1/images/recipes").then(() => { document.getElementById("nav-recipes").hidden = false; }).catch(() => {});
+    if (role === "admin") api("/v1/tokens").then(() => { document.getElementById("nav-tokens").hidden = false; }).catch(() => {});
     document.getElementById("who-text").textContent = `${w.name} (${w.role})`;
     document.getElementById("who").hidden = false;
     render();
@@ -487,6 +554,8 @@ function signOut(message) {
   document.getElementById("nav-plans").hidden = true;
   document.getElementById("nav-jobs").hidden = true;
   document.getElementById("nav-recipes").hidden = true;
+  document.getElementById("nav-tokens").hidden = true;
+  created = null;
   document.getElementById("who").hidden = true;
   document.getElementById("who-text").textContent = "";
   render();
@@ -495,6 +564,7 @@ function signOut(message) {
 document.getElementById("signout").addEventListener("click", () => signOut());
 window.addEventListener("hashchange", () => {
   notice = null;
+  created = null; // a new secret is shown only until the admin moves on
   render();
   if (signedIn() && currentRoute().page) refresh();
 });

@@ -171,8 +171,9 @@ curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succe
 
 The UI (`/`) has a Plans page (each plan, what it would do, who asked, and an Approve or Withdraw
 button for admins), a Jobs page with each job's outcome and log whenever anything that changes the
-host is enabled, and, for admins on a daemon that builds images, a Recipes page to approve or withdraw
-image recipes.
+host is enabled, and, for admins, a Tokens page (create a token -- its secret is shown once -- or
+revoke one, so CI's tokens are made from a browser, not a shell on the host) and, on a daemon that
+builds images, a Recipes page to approve or withdraw image recipes.
 
 An apply runs `incus` as the daemon's user (which is in `incus-admin`, so it can do to instances
 whatever a deployer's manifest says) and host hooks (`pre_deploy`, `post_deploy`) as that user,
@@ -275,6 +276,8 @@ curl -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens"   
 curl -X DELETE -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens/<id>"
 ```
 
+An admin signed in to the UI can do the same on its Tokens page.
+
 The first admin credential is provisioned with the host, as a secret CI already holds:
 
 - `native-ops host create ... --daemon-version vX.Y.Z --daemon-sha256 <sha>` with
@@ -282,6 +285,8 @@ The first admin credential is provisioned with the host, as a secret CI already 
   the host's cloud-init (`NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256` in `/etc/native-ops/serve.env`). User-data
   can be read back from the provider's metadata service by anything on the host that reaches it,
   containers included, so the token itself never goes there.
+- `native-ops reconcile` does the same for a host it creates when `fleet.yml` has a `daemon:` section
+  (`version`, `sha256`, optional `arch` and `flags`).
 - With your own IaC, set `NATIVE_OPS_BOOTSTRAP_TOKEN=nops_...` (at least 32 characters after the
   prefix), or its hex SHA-256 as `NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256`, in `/etc/native-ops/serve.env`.
 
