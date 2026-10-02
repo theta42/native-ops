@@ -52,6 +52,9 @@ type Options struct {
 	// ImageBuild, with Jobs, enables POST /v1/images/build. A token with a scope may use it for an
 	// image its scope allows (see InstanceOps); one without a scope may build anything.
 	ImageBuild ImageBuildFunc
+	// Recipes records which image recipes an admin has approved; required with ImageBuild, since a build
+	// runs the uploaded recipe's scripts on the host (see recipes.go).
+	Recipes *RecipeStore
 	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
 	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
 	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
@@ -100,6 +103,9 @@ func New(opts Options) (*Server, error) {
 		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil
 	if changes && opts.Jobs == nil {
 		return nil, errors.New("apply, instances, image builds, edge applies, backups and DNS syncs need a job store: every change to the host is a job with a record")
+	}
+	if opts.ImageBuild != nil && opts.Recipes == nil {
+		return nil, errors.New("image builds need a recipe store: a build runs the uploaded scripts, so only approved recipes may")
 	}
 	if opts.Apply != nil && (opts.Plan == nil || opts.Plans == nil) {
 		return nil, errors.New("apply needs a plan source and a plan store (approvals) to check the plan against")
@@ -381,6 +387,9 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.ImageBuild != nil {
 		mux.Handle("POST /v1/images/build", s.authScoped(RoleDeployer, s.handleImageBuild))
+		mux.Handle("GET /v1/images/recipes", s.auth(RoleAdmin, s.handleRecipeList))
+		mux.Handle("POST /v1/images/recipes/{digest}/approve", s.auth(RoleAdmin, s.handleRecipeApprove))
+		mux.Handle("DELETE /v1/images/recipes/{digest}/approval", s.auth(RoleAdmin, s.handleRecipeRevoke))
 	}
 	if s.opts.EdgeApply != nil {
 		mux.Handle("POST /v1/edge/apply", s.auth(RoleDeployer, s.handleEdgeApply))

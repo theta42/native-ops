@@ -2,10 +2,15 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/theta42/native-ops/pkg/incus"
@@ -64,4 +69,47 @@ func BuildImage(ctx context.Context, exec remote.Executor, configDir, app, ref s
 	}
 	logf("%s\n", out)
 	return nil
+}
+
+// RecipeDigest is the hex SHA-256 of everything an image build can run from a configuration tree:
+// every regular file under scripts/ and images/, by path and content. A daemon builds from an uploaded
+// tree only when an admin has approved this digest (see server.RecipeStore), because the build runs
+// those scripts on the host. A change to any of them is a new digest, and so a new approval; building
+// another ref with the same recipe is not.
+func RecipeDigest(configDir string) (string, error) {
+	var lines []string
+	for _, top := range []string{"scripts", "images"} {
+		root := filepath.Join(configDir, top)
+		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) && p == root {
+					return nil
+				}
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if !d.Type().IsRegular() {
+				return fmt.Errorf("%s is not a regular file", p)
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(configDir, p)
+			if err != nil {
+				return err
+			}
+			sum := sha256.Sum256(b)
+			lines = append(lines, filepath.ToSlash(rel)+"\x00"+hex.EncodeToString(sum[:]))
+			return nil
+		})
+		if err != nil {
+			return "", fmt.Errorf("image recipe: %w", err)
+		}
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(sum[:]), nil
 }

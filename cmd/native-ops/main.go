@@ -129,6 +129,7 @@ Core Commands:
   backup restore   Restore a volume from a stored backup
   backup prune     Apply retention to a volume's stored backups
   image build      Build + publish an app image from a git ref (conf recipe)
+  image recipe-digest  Print the digest of scripts/ + images/ a daemon must have approved to build
   edge apply       Apply the config repo's edge/Caddyfile to the edge container (validated, with rollback)
   preview launch   Deploy an ephemeral preview from a template + ref
   preview list     List active previews (with TTL)
@@ -699,13 +700,22 @@ func handleBackupCommand(ctx context.Context, args []string) {
 
 func handleImageCommand(ctx context.Context, args []string) {
 	if len(args) < 1 {
-		fmt.Println("Usage: native-ops image build <app> <ref> --config-dir <dir>")
+		fmt.Println("Usage: native-ops image build <app> <ref> --config-dir <dir>\n       native-ops image recipe-digest --config-dir <dir>")
 		os.Exit(1)
 	}
 	action := args[0]
 	flags := flag.NewFlagSet("image "+action, flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf")
 	_ = flags.Parse(args[1:])
+	if action == "recipe-digest" {
+		// What a daemon checks before it builds from this tree (see POST /v1/images/recipes/{digest}/approve).
+		d, err := engine.RecipeDigest(*configDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(d)
+		return
+	}
 	if action != "build" {
 		fmt.Fprintf(os.Stderr, "Unknown image action: %s\n", action)
 		os.Exit(1)

@@ -39,6 +39,31 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The build runs the upload's scripts on the host: only an approved recipe may (see recipes.go).
+	digest, err := engine.RecipeDigest(u.root)
+	if err != nil {
+		u.discard()
+		writeError(w, http.StatusBadRequest, "bad_config", trim(err.Error()))
+		return
+	}
+	approved, err := s.opts.Recipes.Seen(digest, actor, app, u.sha)
+	if err != nil {
+		u.discard()
+		writeError(w, http.StatusInternalServerError, "internal", "could not record the recipe, so nothing was built")
+		return
+	}
+	if !approved {
+		u.discard()
+		auditDetail(r, "image build %s@%s refused: recipe %s not approved", app, ref, digest[:12])
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"code":   "recipe_not_approved",
+			"digest": digest,
+			"error": "this image recipe (scripts/ and images/ in the upload) has not been approved, and a build runs it on the host. " +
+				"An admin can approve it with POST /v1/images/recipes/" + digest + "/approve (or `native-ops remote recipe-approve " + digest + "`); then run the build again. " +
+				"Builds of other refs from the same recipe need no new approval.",
+		})
+		return
+	}
 	if !s.applyMu.TryLock() {
 		u.discard()
 		msg := "another change is already running on this host"

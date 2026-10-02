@@ -255,6 +255,12 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			opts.Instances, opts.InstancePolicy = engine.NewInstances(cfg.Exec), cfg.InstancePolicy
 		}
 		if cfg.EnableImageBuild {
+			recipes, err := server.OpenRecipeStore(filepath.Join(cfg.StateDir, "recipes.json"))
+			if err != nil {
+				audit.Close()
+				return nil, nil, fmt.Errorf("image recipes: %w", err)
+			}
+			opts.Recipes = recipes
 			opts.ImageBuild = imageBuildSource(cfg.Exec)
 		}
 		if cfg.EnableBackup {

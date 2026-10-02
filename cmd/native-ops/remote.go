@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/theta42/native-ops/pkg/engine"
 )
 
 // `native-ops remote ...` is the client side of the daemon, for CI: it packs the checked-out
@@ -35,6 +37,7 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   restore     --volume v [--from key|latest] [--as name] [--force]   (admin)
   dns-sync                        create or update fleet.yml's dns_records
   wait        <job-id>            wait for a job (no upload)
+  recipe-approve [<digest>]       approve an image recipe; without a digest, the one of --config-dir (admin)
   token-create --name n --role r [--names g --images g --domains g]   (admin; no upload)
 
 Common flags: --url (NATIVE_OPS_URL), --token-env (default NATIVE_OPS_TOKEN), --config-dir (.),
@@ -124,6 +127,20 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		c.uploadAndWait(ctx, "/v1/backups/restore", *configDir, q)
 	case "dns-sync":
 		c.uploadAndWait(ctx, "/v1/dns/sync", *configDir, q)
+	case "recipe-approve":
+		digest := flags.Arg(0)
+		if digest == "" {
+			d, err := engine.RecipeDigest(*configDir)
+			if err != nil {
+				fatalf("%v", err)
+			}
+			digest = d
+		}
+		var out map[string]any
+		if code, raw := c.json(ctx, "POST", "/v1/images/recipes/"+url.PathEscape(digest)+"/approve", nil, &out); code != http.StatusOK {
+			fatalf("the daemon answered %d: %s", code, raw)
+		}
+		fmt.Printf("approved image recipe %s\n", digest)
 	case "wait":
 		if flags.NArg() < 1 {
 			fatalf("wait needs a job id")
