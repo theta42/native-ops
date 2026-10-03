@@ -91,6 +91,34 @@ forwards:
 	}
 }
 
+func TestServiceUnitOverride(t *testing.T) {
+	// Unit() falls back to the instance name, or uses Service when it is set.
+	if got := (ServiceConfig{Name: "git-mcp"}).Unit(); got != "git-mcp" {
+		t.Errorf("Unit() without service: got %q, want git-mcp", got)
+	}
+	if got := (ServiceConfig{Name: "git-mcp", Service: "gitea-mcp"}).Unit(); got != "gitea-mcp" {
+		t.Errorf("Unit() with service: got %q, want gitea-mcp", got)
+	}
+
+	tmp := t.TempDir()
+	ok := filepath.Join(tmp, "ok.yml")
+	if err := os.WriteFile(ok, []byte("name: git-mcp\nimage: x\nservice: gitea-mcp\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := LoadServiceConfig(ok)
+	if err != nil || svc.Unit() != "gitea-mcp" {
+		t.Fatalf("valid service: err=%v unit=%q", err, svc.Unit())
+	}
+
+	bad := filepath.Join(tmp, "bad.yml")
+	if err := os.WriteFile(bad, []byte("name: git-mcp\nimage: x\nservice: ../evil\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadServiceConfig(bad); err == nil {
+		t.Fatal("expected an invalid service name to be rejected")
+	}
+}
+
 func TestLoadTemplateConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	tmplYAML := `

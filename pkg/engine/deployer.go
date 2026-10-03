@@ -327,11 +327,11 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		}
 	}
 
-	if changed, err := ensureEnv(ctx, d.incus, svc.Name, svc.Name, serviceEnv(svc, configDir)); err != nil {
+	if changed, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), serviceEnv(svc, configDir)); err != nil {
 		return fmt.Errorf("write env file: %w", err)
 	} else if changed {
-		d.log("    Wrote /etc/default/%s\n", svc.Name)
-		if err := d.incus.RestartService(ctx, svc.Name, svc.Name); err != nil {
+		d.log("    Wrote /etc/default/%s\n", svc.Unit())
+		if err := d.incus.RestartService(ctx, svc.Name, svc.Unit()); err != nil {
 			d.log("    WARNING: %v\n", err)
 		}
 	}
@@ -492,7 +492,7 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 				return err
 			}
 		}
-		opts := UpdateOptions{Service: svc.Name, HealthCheck: svc.HealthCheck}
+		opts := UpdateOptions{Service: svc.Unit(), HealthCheck: svc.HealthCheck}
 		if svc.Hooks.ContainerInit != "" {
 			script := hookScript(configDir, svc.Name, svc.Hooks.ContainerInit)
 			opts.BeforeStart = func(ctx context.Context, name string) error { return d.runContainerHook(ctx, name, script) }
@@ -502,10 +502,10 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 		}
 		changed = true
 		// The replacement carries the live env over; now apply what the manifest declares.
-		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Name, declaredEnv); err != nil {
+		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), declaredEnv); err != nil {
 			return err
 		} else if envChanged {
-			if err := d.incus.RestartService(ctx, svc.Name, svc.Name); err != nil {
+			if err := d.incus.RestartService(ctx, svc.Name, svc.Unit()); err != nil {
 				return err
 			}
 		}
@@ -532,11 +532,11 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 				}
 			}
 		}
-		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Name, declaredEnv); err != nil {
+		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), declaredEnv); err != nil {
 			return err
 		} else if envChanged {
-			d.log("    Environment changed; restarting %s\n", svc.Name)
-			if err := d.incus.RestartService(ctx, svc.Name, svc.Name); err != nil {
+			d.log("    Environment changed; restarting %s\n", svc.Unit())
+			if err := d.incus.RestartService(ctx, svc.Name, svc.Unit()); err != nil {
 				return err
 			}
 			changed = true
