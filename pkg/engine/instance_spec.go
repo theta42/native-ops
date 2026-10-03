@@ -201,6 +201,9 @@ type UpdateRequest struct {
 	Image   string      `json:"image"`
 	Service string      `json:"service"`
 	Health  *HealthSpec `json:"health,omitempty"`
+	// Env sets these keys in the instance's carried-over /etc/default/<service> (e.g. RELEASE_TAG);
+	// every other key is kept. A rollback restores the file as it was.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // Validate reports why an update request cannot be accepted.
@@ -210,6 +213,17 @@ func (r *UpdateRequest) Validate() error {
 	}
 	if !incus.ValidName(r.Service) {
 		return fmt.Errorf("service (the unit whose environment is carried over) is required")
+	}
+	if len(r.Env) > 16 {
+		return fmt.Errorf("at most 16 environment variables in an update")
+	}
+	for k, v := range r.Env {
+		if !envKeyRe.MatchString(k) {
+			return fmt.Errorf("environment variable name %q is not allowed", k)
+		}
+		if len(v) > 4096 || strings.ContainsAny(v, "\r\n\x00") {
+			return fmt.Errorf("the value of %s is too long or has a line break", k)
+		}
 	}
 	if h := r.Health; h != nil {
 		if h.Port < 1 || h.Port > 65535 || h.Timeout < 0 || h.Timeout > 300 || (h.Path != "" && !healthRe.MatchString(h.Path)) {
@@ -304,7 +318,7 @@ func (i *Instances) Launch(ctx context.Context, name string, spec InstanceSpec, 
 
 // Update moves the instance to a new image through the safe update path.
 func (i *Instances) Update(ctx context.Context, name string, req UpdateRequest, logf func(string, ...any)) error {
-	opts := UpdateOptions{Service: req.Service}
+	opts := UpdateOptions{Service: req.Service, SetEnv: req.Env}
 	if req.Health != nil {
 		opts.HealthCheck = config.HealthCheckConfig{Path: req.Health.Path, Port: req.Health.Port, Timeout: req.Health.Timeout, Interval: 2}
 	}

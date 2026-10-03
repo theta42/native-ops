@@ -228,6 +228,10 @@ type UpdateOptions struct {
 	SkipSnapshot bool
 	// Force replaces the instance even when it already runs the requested image.
 	Force bool
+	// SetEnv sets these keys in the carried-over environment file on the new container (for example
+	// RELEASE_TAG, which a service reports as the release it runs). A rollback restores the file as it
+	// was. It does not, on its own, make an instance that already runs the image be replaced.
+	SetEnv map[string]string
 	// BeforeStart, when set, runs on the replacement after its volumes and
 	// environment file are in place and before its service is (re)started.
 	BeforeStart func(ctx context.Context, name string) error
@@ -327,7 +331,12 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		}
 	}
 
-	replace := func(image string, cfg map[string]string) error {
+	// The new container gets the carried-over file with SetEnv applied; a rollback gets it as it was.
+	newEnv, writeNewEnv := env, hadEnv
+	if len(opts.SetEnv) > 0 {
+		newEnv, writeNewEnv = incus.SetEnvKeys(env, opts.SetEnv), true
+	}
+	replace := func(image string, cfg map[string]string, envContent string, writeEnv bool) error {
 		if err := m.incus.StopAndDeleteContainer(ctx, name); err != nil {
 			return err
 		}
@@ -339,8 +348,8 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 				return err
 			}
 		}
-		if hadEnv {
-			if err := m.incus.PushFile(ctx, name, envPath, env, "0600"); err != nil {
+		if writeEnv {
+			if err := m.incus.PushFile(ctx, name, envPath, envContent, "0600"); err != nil {
 				return err
 			}
 		}
@@ -368,7 +377,7 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		forward[k] = v
 	}
 	forward[incus.ImageKey] = newImageRef // the rollback keeps the old recorded reference
-	updateErr := replace(target, forward)
+	updateErr := replace(target, forward, newEnv, writeNewEnv)
 	if updateErr == nil {
 		if err := m.repointRoute(ctx, name); err != nil {
 			return fmt.Errorf("%s was updated to %s, but its Caddy route could not be pointed at the new container: %w", name, newImageRef, err)
@@ -380,7 +389,7 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		return fmt.Errorf("update failed and the previous image is unknown, so no automatic rollback was possible (volume snapshots are named pre-update-*): %w", updateErr)
 	}
 	m.log("    Update failed (%v); rolling back to the previous image %s...\n", updateErr, st.BaseImage)
-	if rbErr := replace(st.BaseImage, st.Config); rbErr != nil {
+	if rbErr := replace(st.BaseImage, st.Config, env, hadEnv); rbErr != nil {
 		return fmt.Errorf("update failed: %v; rollback ALSO failed (volume snapshots are named pre-update-*): %w", updateErr, rbErr)
 	}
 	if err := m.repointRoute(ctx, name); err != nil {

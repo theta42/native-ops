@@ -353,3 +353,35 @@ func TestUpdateRecordsTheNewReferenceOnTheReplacementAndKeepsTheOldOneOnRollback
 		t.Fatalf("a rollback must restore the previous recorded reference: %v", launches)
 	}
 }
+
+func TestUpdateSetsEnvOnTheNewContainerAndARollbackRestoresIt(t *testing.T) {
+	ex := &scriptExec{rules: baseRules(oldFP)}
+	calls := 0
+	gate := func(context.Context, string, config.HealthCheckConfig) error {
+		calls++
+		if calls == 1 {
+			return errors.New("healthcheck failed")
+		}
+		return nil
+	}
+	hc := config.HealthCheckConfig{Path: "/health", Port: 8787}
+	err := newMgr(ex, gate).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{Service: "platform", HealthCheck: hc, SetEnv: map[string]string{"RELEASE_TAG": "v2"}})
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("want a rollback: %v", err)
+	}
+	var pushes []string
+	for i, c := range ex.cmds {
+		if strings.Contains(c, "incus file push") {
+			pushes = append(pushes, ex.stdins[i])
+		}
+	}
+	if len(pushes) != 2 {
+		t.Fatalf("want the env file pushed to the new container and on rollback: %d", len(pushes))
+	}
+	if !strings.Contains(pushes[0], "RELEASE_TAG=v2\n") || strings.Count(pushes[0], "=") < strings.Count(envTxt, "=") {
+		t.Fatalf("the new container must get the carried file with RELEASE_TAG set:\n%s", pushes[0])
+	}
+	if pushes[1] != envTxt {
+		t.Fatalf("a rollback must restore the file as it was:\n%s", pushes[1])
+	}
+}

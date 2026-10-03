@@ -634,3 +634,16 @@ func TestScopedTokenSeesOnlyItsOwnJobs(t *testing.T) {
 		t.Fatalf("an unscoped token sees every job: %s", body)
 	}
 }
+
+func TestUpdateEnvIsValidated(t *testing.T) {
+	for _, env := range []map[string]string{{"lower": "x"}, {"OK": "a\nb"}} {
+		r := engine.UpdateRequest{Image: "opsavor-platform:v2", Service: "platform", Env: env}
+		if err := r.Validate(); err == nil {
+			t.Errorf("%v must be refused", env)
+		}
+	}
+	r := engine.UpdateRequest{Image: "opsavor-platform:v2", Service: "platform", Env: map[string]string{"RELEASE_TAG": "v2"}}
+	if err := r.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}

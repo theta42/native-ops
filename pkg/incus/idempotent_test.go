@@ -368,3 +368,18 @@ func TestEnsurePathOwnerRejectsUnsafeInput(t *testing.T) {
 		})
 	}
 }
+
+func TestSetEnvKeysReplacesAppendsAndKeepsTheRest(t *testing.T) {
+	in := "# Managed by hand\nA=1\nRELEASE_TAG=v1\nB=2\nRELEASE_TAG=dup\n"
+	got := SetEnvKeys(in, map[string]string{"RELEASE_TAG": "v2", "Z": "26", "M": "13"})
+	want := "# Managed by hand\nA=1\nRELEASE_TAG=v2\nB=2\nM=13\nZ=26\n"
+	if got != want {
+		t.Fatalf("got\n%q\nwant\n%q", got, want)
+	}
+	if SetEnvKeys(in, nil) != in {
+		t.Fatal("no keys, no change")
+	}
+	if got := SetEnvKeys("", map[string]string{"K": "v"}); got != "K=v\n" {
+		t.Fatalf("an empty file gets the key: %q", got)
+	}
+}
