@@ -52,6 +52,8 @@ type Options struct {
 	// ImageBuild, with Jobs, enables POST /v1/images/build. A token with a scope may use it for an
 	// image its scope allows (see InstanceOps); one without a scope may build anything.
 	ImageBuild ImageBuildFunc
+	// ImagePrune, with Jobs, enables POST /v1/images/prune (deployer, unscoped): image retention.
+	ImagePrune ImagePruneFunc
 	// Recipes records which image recipes an admin has approved; required with ImageBuild, since a build
 	// runs the uploaded recipe's scripts on the host (see recipes.go).
 	Recipes *RecipeStore
@@ -117,7 +119,7 @@ func New(opts Options) (*Server, error) {
 	if opts.OIDC != nil && opts.Users == nil {
 		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
 	}
-	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.EdgeApply != nil ||
+	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.ImagePrune != nil || opts.EdgeApply != nil ||
 		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil || opts.Upgrade != nil
 	if opts.Deploy != nil && opts.Apply == nil {
 		return nil, errors.New("deploys need apply: a deploy applies the tagged commit")
@@ -422,6 +424,9 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("GET /v1/images/recipes", s.auth(RoleAdmin, s.handleRecipeList))
 		mux.Handle("POST /v1/images/recipes/{digest}/approve", s.auth(RoleAdmin, s.handleRecipeApprove))
 		mux.Handle("DELETE /v1/images/recipes/{digest}/approval", s.auth(RoleAdmin, s.handleRecipeRevoke))
+	}
+	if s.opts.ImagePrune != nil {
+		mux.Handle("POST /v1/images/prune", s.auth(RoleDeployer, s.handleImagePrune))
 	}
 	if s.opts.EdgeApply != nil {
 		mux.Handle("POST /v1/edge/apply", s.auth(RoleDeployer, s.handleEdgeApply))

@@ -57,6 +57,7 @@ type imageRig struct {
 	srv2     *Server
 	deployer string
 	scoped   string
+	prunes   chan bool // the dry_run of each prune job
 }
 
 func newImageRig(t *testing.T) *imageRig {
@@ -66,7 +67,7 @@ func newImageRig(t *testing.T) *imageRig {
 	admin, _, _ := tokens.Create("ci-admin", RoleAdmin)
 	viewer, _, _ := tokens.Create("dash", RoleViewer)
 	planner, _, _ := tokens.Create("pr-ci", RolePlanner)
-	rig := &imageRig{b: &fakeBuilder{}}
+	rig := &imageRig{b: &fakeBuilder{}, prunes: make(chan bool, 4)}
 	rig.deployer, _, _ = tokens.Create("ci-build", RoleDeployer)
 	var err error
 	rig.scoped, _, err = tokens.CreateScoped("fleet-manager", RoleDeployer, Scope{Names: []string{"demo-*"}, Images: []string{"opsavor-platform:*"}, Domains: []string{"*.opsavor.app"}})
@@ -89,6 +90,11 @@ func newImageRig(t *testing.T) *imageRig {
 		t.Fatal(err)
 	}
 	s, err := New(Options{Tokens: tokens, Audit: audit, Version: "test", Jobs: jobs, ImageBuild: rig.b.fn, Recipes: rig.recipes, ImagePrefix: "opsavor-",
+		ImagePrune: func(_ context.Context, dry bool, logf func(string, ...any)) error {
+			logf("image retention: 0 of 0 images")
+			rig.prunes <- dry
+			return nil
+		},
 		Status: func(context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil }})
 	if err != nil {
 		t.Fatal(err)
@@ -295,5 +301,35 @@ func TestImageBuildRunsOnlyAnApprovedRecipe(t *testing.T) {
 	}
 	if code, _ := rig.build(t, rig.scoped, "?app=platform&ref=main", recipeTree(t, "echo v1\n")); code != 403 {
 		t.Fatalf("a revoked recipe must be refused: %d", code)
+	}
+}
+
+func TestImagePruneIsAJobForAnUnscopedDeployer(t *testing.T) {
+	rig := newImageRig(t)
+	for name, tok := range map[string]string{"viewer": rig.viewer, "planner": rig.planner, "scoped deployer": rig.scoped} {
+		if res, _ := rig.post(t, "/v1/images/prune", tok, "", nil); res.StatusCode != http.StatusForbidden {
+			t.Fatalf("a %s must not prune every app's images: %d", name, res.StatusCode)
+		}
+	}
+	for _, c := range []struct {
+		query string
+		dry   bool
+	}{{"?dry_run=1", true}, {"", false}} {
+		res, body := rig.post(t, "/v1/images/prune"+c.query, rig.deployer, "", nil)
+		if res.StatusCode != http.StatusAccepted {
+			t.Fatalf("%d %s", res.StatusCode, body)
+		}
+		j := rig.waitJob(t, jobID(t, body), JobSucceeded)
+		if j.Kind != "image:prune" {
+			t.Fatalf("job: %+v", j)
+		}
+		select {
+		case dry := <-rig.prunes:
+			if dry != c.dry {
+				t.Fatalf("query %q ran with dry_run=%v", c.query, dry)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("the prune did not run")
+		}
 	}
 }

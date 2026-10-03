@@ -45,6 +45,8 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   secret-list                     the names in the daemon's secret store, never the values (admin)
   daemon-upgrade --version v --sha256 s
                                   upgrade the daemon to a pinned release and wait until it runs it (admin)
+  image-prune [--dry-run]         delete images no instance runs that retention does not keep: orphans
+                                  left by rebuilds, and old tags beyond --image-keep per app (deployer; no upload)
   token-create --name n --role r [--names g --images g --domains g]   (admin; no upload)
 
 Common flags: --url (NATIVE_OPS_URL), --token-env (default NATIVE_OPS_TOKEN), --config-dir (.),
@@ -83,6 +85,7 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	domains := flags.String("domains", "", "token-create: domain globs, comma separated")
 	upVersion := flags.String("version", "", "daemon-upgrade: the release tag, e.g. v1.56.0")
 	upSHA := flags.String("sha256", "", "daemon-upgrade: the SHA-256 of native-ops_<version>_linux_<arch>.tar.gz, from the release's checksums.txt")
+	dryRun := flags.Bool("dry-run", false, "image-prune: only report what would be deleted")
 	prune2 := flags.Bool("prune-secrets", false, "secret-sync: remove every secret on the daemon not named here (also --prune)")
 	_ = flags.Parse(args[1:])
 
@@ -195,6 +198,20 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		fmt.Printf("secrets synced: %d sent, changed: %s, removed: %s\n", len(set), listOrNone(out.Changed), listOrNone(out.Removed))
 	case "daemon-upgrade":
 		os.Exit(c.daemonUpgrade(ctx, *upVersion, strings.ToLower(*upSHA)))
+	case "image-prune":
+		path := "/v1/images/prune"
+		if *dryRun {
+			path += "?dry_run=1"
+		}
+		var out struct {
+			Job struct {
+				ID string `json:"id"`
+			} `json:"job"`
+		}
+		if code, raw := c.json(ctx, "POST", path, nil, &out); code != http.StatusAccepted {
+			fatalf("the daemon answered %d: %s", code, raw)
+		}
+		os.Exit(c.wait(ctx, out.Job.ID))
 	case "secret-list":
 		var out struct {
 			Secrets []struct {
