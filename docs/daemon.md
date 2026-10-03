@@ -12,6 +12,10 @@ truth, CI is the only control path, and the daemon is what CI talks to.
 - The same engine is in the CLI, so `native-ops apply`, `backup`, `dns sync` and the rest still
   work when run on the host itself -- for a host with no daemon yet, or to repair one.
 
+**Driving deploys from CI, scripts or AI agents** (preview a tag, deploy it, see what is live, follow
+jobs, the MCP endpoint): see [api.md](api.md). Every endpoint is described by the OpenAPI document the
+daemon serves at `/openapi.json`.
+
 The daemon is installed by cloud-init when `native-ops host create --daemon-version ...` creates
 the host, or by your IaC. It is not something a person sets up by hand.
 
@@ -29,12 +33,14 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `GET /v1/plans`, `GET /v1/plans/{hash}` | viewer | the plans that were made, and where each stands (pending, approved, used, expired, blocked) |
 | `POST /v1/plans/{hash}/approve`, `DELETE /v1/plans/{hash}/approval` | admin | approve one apply of exactly this plan, or take the approval back |
 | `POST /v1/apply` | deployer | apply an **approved** plan, as a job (only with `--enable-apply`) |
-| `GET /v1/jobs`, `GET /v1/jobs/{id}` | viewer | jobs and their outcome; the log is shown to deployers and admins only. A scoped token sees only jobs it started and jobs about instances its scope allows |
+| `GET /v1/jobs?kind=&status=&limit=`, `GET /v1/jobs/{id}?wait=` | viewer | jobs and their outcome, filtered by kind (or a family, `instance:`) and status; `wait` (up to 60 seconds) answers when a running job ends. The log is shown to deployers and admins only. A scoped token sees only jobs it started and jobs about instances its scope allows |
 | `POST /v1/edge/apply` | deployer | apply the uploaded tree's `edge/Caddyfile` to the edge container (validated, rolled back if Caddy rejects it), as a job (only with `--enable-edge-apply`) |
 | `POST /v1/backups?volume=&prune=1` | deployer | back up one volume, or every volume `fleet.yml` allows, then optionally apply retention, as a job (only with `--enable-backup`) |
 | `POST /v1/backups/restore?volume=&from=&as=&force=1` | admin | restore a volume in place (keeping a copy of the current one) or as a new volume, as a job (only with `--enable-backup`) |
 | `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (only with `--enable-dns-sync`) |
 | `POST /v1/deploy` | deployer | deploy the commit a protected deploy tag points at, read from the git server (`{"tag": ...}`), as a job (with `--enable-apply`, `--git-url` and `--deploy-repo`) |
+| `POST /v1/deploy/plan` | planner | what deploying a tag would change, read from the git server and planned against the host now, without a job and without changing anything (`{"tag": ...}`; with the same flags as deploys) |
+| `GET /v1/deploys?limit=` | viewer | what the host runs (`current`: the newest deploy that left it matching its tag), the deploy in progress, and the history, each with its tag, commit, result and plan counts |
 | `POST /v1/daemon/upgrade` | admin | upgrade this daemon to a pinned release (`{version, sha256}`), as a job; it then restarts on the new binary (when the binary is in `<state-dir>/bin`) |
 | `GET/PUT /v1/secrets`, `DELETE /v1/secrets/{name}` | admin | the daemon's own credentials, pushed from the git server's secret store; names only are ever returned |
 | `GET/POST /v1/tokens`, `DELETE /v1/tokens/{id}` | admin | list, create (the secret is returned once) and revoke API tokens |
@@ -47,6 +53,8 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/images/build` | deployer | build and publish an application image from an uploaded configuration tree, as a job (only with `--enable-image-build`) |
 | `POST /v1/images/prune` | deployer (unscoped) | image retention as a job: delete images no instance runs that are orphans or old tags (`?dry_run=1` reports only; with `--enable-image-build`) |
 | `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see |
+| `POST /mcp` (`GET`, `DELETE`: 405) | viewer, bearer token only | the Model Context Protocol server: the deploy, job, plan and status endpoints as tools for AI agents, with the caller's token and role ([api.md](api.md#mcp)) |
+| `GET /openapi.json`, `GET /openapi.yaml` | none | the OpenAPI 3.1 description of every endpoint here (the same on every daemon; no host data) |
 | `GET /` | none | the UI (Overview, Instances, Volumes, Network). It holds no data; it signs in (or takes a token) and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
@@ -212,6 +220,11 @@ git tag deploy-2026.10.03 && git push origin deploy-2026.10.03     # someone the
 # CI, on that tag:
 NATIVE_OPS_TOKEN=$DEPLOY_TOKEN native-ops remote deploy --tag deploy-2026.10.03
 ```
+
+Preview first with `native-ops remote deploy-plan --tag ...` (`POST /v1/deploy/plan`, planner: the same
+commit, planned against the host now, nothing changed), and see what is live with
+`native-ops remote deploys` (`GET /v1/deploys`). [api.md](api.md) has the recipes, the results a deploy
+ends with, and what to do when one fails.
 
 `POST /v1/deploy {"tag"}` (deployer) runs a job that:
 

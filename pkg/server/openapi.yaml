@@ -1,0 +1,1120 @@
+openapi: 3.1.0
+info:
+  title: native-ops daemon API
+  version: set-at-runtime
+  summary: Plan, deploy and inspect one Incus host from CI, an agent or a dashboard.
+  description: |
+    The native-ops daemon runs on the host it manages. Every change to the host is a **job** with a
+    record; one change runs at a time (a second gets `409 busy`).
+
+    **Deploys** are the normal way to change the host: push a protected `deploy-*` tag in the
+    configuration repository and call `POST /v1/deploy` with it. The daemon reads that commit from the
+    git server itself; nothing is uploaded, and the tag push is the approval. `POST /v1/deploy/plan`
+    shows what a tag would change first; `GET /v1/deploys` says what the host runs now.
+
+    **Roles** are ordered: viewer < planner < deployer < admin. Each operation names the least role it
+    needs in `x-native-ops-role`. A token with a **scope** (for a fleet manager) may only call the
+    operations marked `x-native-ops-scoped: true`, and only for instances its scope allows.
+
+    Some operations exist only when the daemon is started with the flag in `x-native-ops-enabled-by`;
+    otherwise they answer 404.
+
+    Errors are `{"error": "<message>", "code": "<code>"}`. A failure to read the host is a generic
+    `502 host_unavailable` that never echoes internal text.
+
+    The same operations are available to AI agents as MCP tools at `POST /mcp` (see docs/api.md).
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: "{daemon}"
+    description: Your daemon (its HTTPS URL, e.g. behind the edge).
+    variables:
+      daemon: { default: "https://native-ops.example.com" }
+externalDocs:
+  description: docs/api.md (deploys, from CI and agents) and docs/daemon.md (running the daemon)
+  url: https://github.com/theta42/native-ops/blob/main/docs/api.md
+security:
+  - bearer: []
+tags:
+  - name: deploys
+    description: Deploy a protected tag, preview it, and see what ran.
+  - name: jobs
+    description: Every change to the host is a job.
+  - name: plans
+    description: Plans made from uploaded trees, and the admin approvals an apply needs.
+  - name: host
+    description: What the host runs.
+  - name: instances
+    description: Tenant instances, for a fleet manager with a scoped token.
+  - name: images
+    description: Application image builds, recipe approval and retention.
+  - name: maintenance
+    description: Edge config, backups, restores and DNS.
+  - name: admin
+    description: Tokens, users, secrets and the daemon itself.
+  - name: session
+    description: UI sign-in. Not needed with an API token.
+  - name: meta
+    description: Liveness, this document, and MCP.
+
+paths:
+  /healthz:
+    get:
+      operationId: healthz
+      tags: [meta]
+      summary: Liveness
+      description: Answers without reading any state.
+      security: []
+      x-native-ops-role: none
+      responses:
+        "200":
+          description: The daemon is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  version: { type: string, examples: [v1.60.0] }
+
+  /openapi.json:
+    get:
+      operationId: openapiJSON
+      tags: [meta]
+      summary: This document, as JSON
+      security: []
+      x-native-ops-role: none
+      responses:
+        "200": { description: "The OpenAPI document.", content: { application/json: {} } }
+
+  /openapi.yaml:
+    get:
+      operationId: openapiYAML
+      tags: [meta]
+      summary: This document, as YAML
+      security: []
+      x-native-ops-role: none
+      responses:
+        "200": { description: "The OpenAPI document.", content: { application/yaml: {} } }
+
+  /mcp:
+    post:
+      operationId: mcp
+      tags: [meta]
+      summary: Model Context Protocol endpoint
+      description: |
+        A stateless MCP server (Streamable HTTP, JSON answers). It takes a bearer token only, never a
+        session cookie. Its tools call the operations here with the caller's token, so a tool can do
+        exactly what the token could; `tools/list` shows only the tools the token's role and scope can use.
+        Tools: whoami, host_status, list_deploys, plan_deploy, deploy, list_jobs, get_job, list_plans,
+        get_plan, list_instances, get_instance, prune_images.
+      x-native-ops-role: viewer
+      x-native-ops-scoped: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: One JSON-RPC 2.0 message (batches are refused).
+              required: [jsonrpc, method]
+              properties:
+                jsonrpc: { const: "2.0" }
+                id: { type: [string, integer] }
+                method: { type: string, examples: [initialize, tools/list, tools/call, ping] }
+                params: { type: object }
+      responses:
+        "200": { description: "The JSON-RPC response.", content: { application/json: {} } }
+        "202": { description: "A notification was accepted; there is no answer." }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "The request came from a browser page of another origin." }
+    get:
+      operationId: mcpStream
+      tags: [meta]
+      summary: Not offered (no event stream)
+      x-native-ops-role: none
+      security: []
+      responses:
+        "405": { description: "The server opens no event stream; use POST." }
+    delete:
+      operationId: mcpEndSession
+      tags: [meta]
+      summary: Not offered (no sessions)
+      x-native-ops-role: none
+      security: []
+      responses:
+        "405": { description: "The server keeps no sessions." }
+
+  /api/session:
+    get:
+      operationId: session
+      tags: [session]
+      summary: How to sign in, and who is signed in
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: --enable-auth or --oidc-issuer
+      responses:
+        "200": { description: "The sign-in methods and the current session, if any.", content: { application/json: {} } }
+  /api/login:
+    post:
+      operationId: login
+      tags: [session]
+      summary: Local sign-in (sets the session cookie)
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: --enable-auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              additionalProperties: false
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200": { description: "Signed in." }
+        "400": { description: "Local sign-in is not enabled (local_signin_off)." }
+        "401": { description: "Wrong username or password (bad_login)." }
+        "429": { description: "Too many failed sign-ins for this account (too_many_attempts)." }
+  /api/logout:
+    post:
+      operationId: logout
+      tags: [session]
+      summary: Sign out
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: --enable-auth or --oidc-issuer
+      responses:
+        "200": { description: "Signed out." }
+  /auth/oidc:
+    get:
+      operationId: oidcStart
+      tags: [session]
+      summary: Start OIDC sign-in (redirects to the provider)
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: --oidc-issuer
+      responses:
+        "302": { description: "To the identity provider." }
+  /auth/oidc/callback:
+    get:
+      operationId: oidcCallback
+      tags: [session]
+      summary: OIDC callback
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: --oidc-issuer
+      parameters:
+        - { name: state, in: query, required: true, schema: { type: string } }
+        - { name: code, in: query, required: true, schema: { type: string } }
+      responses:
+        "302": { description: "Back to the UI, signed in." }
+        "403": { description: "The provider's user has no access (with --oidc-role none, until it is granted)." }
+
+  /v1/whoami:
+    get:
+      operationId: whoami
+      tags: [meta]
+      summary: Which token and role you are
+      x-native-ops-role: viewer
+      x-native-ops-scoped: true
+      responses:
+        "200":
+          description: The caller.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  role: { $ref: "#/components/schemas/Role" }
+                  version: { type: string }
+                  scope: { $ref: "#/components/schemas/Scope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/status:
+    get:
+      operationId: status
+      tags: [host]
+      summary: The host's state
+      description: |
+        Instances, data volumes, images, host metrics (load, memory, swap, pool disk, uptime) and
+        warnings; with the edge and DNS configured, the edge's routes and certificates and the DNS
+        records. Instance config is reported by key name only. Cached for a few seconds.
+      x-native-ops-role: viewer
+      responses:
+        "200": { description: "The snapshot.", content: { application/json: { schema: { type: object } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/HostUnavailable" }
+
+  /v1/deploy:
+    post:
+      operationId: deploy
+      tags: [deploys]
+      summary: Deploy a protected tag
+      description: |
+        Starts a deploy job for the commit the tag points at. The job:
+
+        1. resolves the tag on the git server and checks a protection rule covers it (otherwise it fails
+           without fetching anything);
+        2. downloads that commit's tree from the git server;
+        3. if fleet.yml pins another daemon release, upgrades to it, restarts, and resumes the deploy as
+           a new job on the new binary (this job ends with result `daemon_upgraded`);
+        4. plans it; a blocked plan fails the job and nothing changes; nothing to change ends it with
+           result `no_changes`;
+        5. applies the plan (result `applied`).
+
+        Follow the job with `GET /v1/jobs/{id}?wait=60`, or see it in `GET /v1/deploys`.
+      x-native-ops-role: deployer
+      x-native-ops-enabled-by: --enable-apply, --git-url and --deploy-repo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TagRequest" }
+      responses:
+        "202":
+          description: The deploy job started. Location names the job.
+          headers:
+            Location: { schema: { type: string, examples: [/v1/jobs/j-1791054271-18f384d8] } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job: { $ref: "#/components/schemas/Job" }
+                  tag: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Busy" }
+
+  /v1/deploy/plan:
+    post:
+      operationId: planDeploy
+      tags: [deploys]
+      summary: What deploying a tag would change
+      description: |
+        Resolves the tag, reads its commit from the git server and plans it against the host now,
+        without changing anything and without starting a job. The plan is recorded (`GET /v1/plans`).
+
+        An unprotected tag is still planned, with `deployable: false` and the reason. When fleet.yml pins
+        a daemon release other than the running one, `daemon.upgrade` is true: the deploy would upgrade
+        first, and the pinned release makes the plan that is applied.
+      x-native-ops-role: planner
+      x-native-ops-enabled-by: --enable-apply, --git-url and --deploy-repo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TagRequest" }
+      responses:
+        "200":
+          description: The plan.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeployPlan" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422":
+          description: The git server could not resolve the tag (no such tag, or not a deploy tag).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "429": { description: "Too many plans are running; retry after the Retry-After header." }
+        "502":
+          description: The commit could not be read from the git server (git_unavailable), or the host could not be read (host_unavailable).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /v1/deploys:
+    get:
+      operationId: listDeploys
+      tags: [deploys]
+      summary: What the host runs, and the deploy history
+      description: |
+        `current` is the newest deploy that left the host matching its tag (result `applied` or
+        `no_changes`). Changes made since by other means (an apply, an instance change, an image build)
+        are in `GET /v1/jobs`. `running` is the deploy in progress, if any.
+      x-native-ops-role: viewer
+      x-native-ops-enabled-by: --enable-apply, --git-url and --deploy-repo
+      parameters:
+        - { name: limit, in: query, description: "How many deploys to list (default 50).", schema: { type: integer, minimum: 1, maximum: 200 } }
+      responses:
+        "200":
+          description: The deploys.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [current, running, deploys]
+                properties:
+                  current: { oneOf: [{ $ref: "#/components/schemas/Deploy" }, { type: "null" }] }
+                  running: { oneOf: [{ $ref: "#/components/schemas/Deploy" }, { type: "null" }] }
+                  deploys: { type: array, items: { $ref: "#/components/schemas/Deploy" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/jobs:
+    get:
+      operationId: listJobs
+      tags: [jobs]
+      summary: Jobs, newest first (without logs)
+      description: A scoped token sees only jobs it started and jobs about instances its scope allows.
+      x-native-ops-role: viewer
+      x-native-ops-scoped: true
+      parameters:
+        - name: kind
+          in: query
+          description: A job kind, or a family of kinds ending in a colon (`instance:`).
+          schema: { type: string, examples: [deploy, apply, "instance:", image:build, image:prune, edge:apply, backup, restore, dns:sync, daemon:upgrade] }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/JobStatus" } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200 } }
+      responses:
+        "200":
+          description: The jobs.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs: { type: array, items: { $ref: "#/components/schemas/Job" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/jobs/{id}:
+    get:
+      operationId: getJob
+      tags: [jobs]
+      summary: One job
+      description: |
+        The log is included for deployers and admins only. With `wait`, a running job is answered as soon
+        as it ends, or when the wait is over (still running), so a client need not poll.
+      x-native-ops-role: viewer
+      x-native-ops-scoped: true
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, pattern: "^j-[0-9]{9,12}-[0-9a-f]{8}$" } }
+        - { name: wait, in: query, description: "Seconds to wait for a running job to end.", schema: { type: integer, minimum: 0, maximum: 60 } }
+      responses:
+        "200": { description: "The job.", content: { application/json: { schema: { $ref: "#/components/schemas/Job" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/plan:
+    post:
+      operationId: plan
+      tags: [plans]
+      summary: Plan an uploaded configuration tree
+      description: What apply would change for the uploaded tree (never changes the host). The plan is recorded.
+      x-native-ops-role: planner
+      parameters:
+        - $ref: "#/components/parameters/Service"
+        - $ref: "#/components/parameters/Sha"
+      requestBody: { $ref: "#/components/requestBodies/Tree" }
+      responses:
+        "200":
+          description: The plan.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sha: { type: string }
+                  hash: { type: string }
+                  exit: { $ref: "#/components/schemas/PlanExit" }
+                  plan: { $ref: "#/components/schemas/FleetPlan" }
+                  text: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "415": { description: "The body must be a gzip-compressed tar (Content-Type application/gzip)." }
+        "429": { description: "Too many plans are running." }
+        "502": { $ref: "#/components/responses/HostUnavailable" }
+
+  /v1/plans:
+    get:
+      operationId: listPlans
+      tags: [plans]
+      summary: The plans that were made, and where each stands
+      x-native-ops-role: viewer
+      responses:
+        "200": { description: "The plans (pending, approved, used, expired, stale, blocked).", content: { application/json: {} } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/plans/{hash}:
+    get:
+      operationId: getPlan
+      tags: [plans]
+      summary: One plan, with its text
+      x-native-ops-role: viewer
+      parameters: [{ $ref: "#/components/parameters/PlanHash" }]
+      responses:
+        "200": { description: "The plan.", content: { application/json: {} } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/plans/{hash}/approve:
+    post:
+      operationId: approvePlan
+      tags: [plans]
+      summary: Approve one apply of exactly this plan
+      x-native-ops-role: admin
+      parameters: [{ $ref: "#/components/parameters/PlanHash" }]
+      responses:
+        "200": { description: "Approved." }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The plan cannot be approved: stale (made before the host last changed), not_approvable (blocked, or nothing to change) or approval_used." }
+  /v1/plans/{hash}/approval:
+    delete:
+      operationId: revokePlanApproval
+      tags: [plans]
+      summary: Take an approval back
+      x-native-ops-role: admin
+      parameters: [{ $ref: "#/components/parameters/PlanHash" }]
+      responses:
+        "200": { description: "Withdrawn." }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/apply:
+    post:
+      operationId: apply
+      tags: [plans]
+      summary: Apply an approved plan of an uploaded tree
+      description: |
+        The tree is planned again; the apply runs only when that plan has the hash `expect` names and an
+        admin approved it (each approval allows one apply). Prefer deploys, which need no upload and no
+        separate approval.
+      x-native-ops-role: deployer
+      x-native-ops-enabled-by: --enable-apply
+      parameters:
+        - { name: expect, in: query, required: true, description: "The hash of the approved plan.", schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+        - $ref: "#/components/parameters/Service"
+        - $ref: "#/components/parameters/Sha"
+      requestBody: { $ref: "#/components/requestBodies/Tree" }
+      responses:
+        "200": { description: "Nothing to change; no job was started." }
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: "Not approved, the approval was used, or it expired (codes not_approved, approval_used, approval_expired)." }
+        "409": { description: "busy, plan_changed (the plan is not the approved one; the new plan is in the answer) or blocked." }
+
+  /v1/instances:
+    get:
+      operationId: listInstances
+      tags: [instances]
+      summary: The tenant instances the token may see
+      x-native-ops-role: viewer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      responses:
+        "200": { description: "The instances.", content: { application/json: {} } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/instances/{name}:
+    get:
+      operationId: getInstance
+      tags: [instances]
+      summary: One tenant instance
+      x-native-ops-role: viewer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      responses:
+        "200": { description: "The instance.", content: { application/json: {} } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      operationId: putInstance
+      tags: [instances]
+      summary: Create (or resume) a tenant instance
+      description: Also republishes its normal route, which undoes a suspend.
+      x-native-ops-role: deployer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/InstanceSpec" } } }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Busy" }
+    delete:
+      operationId: deleteInstance
+      tags: [instances]
+      summary: Remove a tenant instance
+      x-native-ops-role: deployer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters:
+        - { $ref: "#/components/parameters/InstanceName" }
+        - { name: purge_volumes, in: query, description: "Also delete its data volumes.", schema: { type: string, enum: ["true"] } }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/instances/{name}/update:
+    post:
+      operationId: updateInstance
+      tags: [instances]
+      summary: Move a tenant instance to another image
+      description: Snapshot, replace, carry the environment over, health-check, roll back on failure. Tenant instances only (403 not_managed for services, which roll through deploys).
+      x-native-ops-role: deployer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image, service]
+              properties:
+                image: { type: string }
+                service: { type: string }
+                health: { $ref: "#/components/schemas/HealthSpec" }
+                env: { type: object, additionalProperties: { type: string } }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/instances/{name}/resize:
+    post:
+      operationId: resizeInstance
+      tags: [instances]
+      summary: Change limits.cpu / limits.memory live (no restart)
+      x-native-ops-role: deployer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [limits]
+              properties:
+                limits: { type: object, additionalProperties: { type: string }, examples: [{ limits.cpu: "2", limits.memory: 2GiB }] }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/instances/{name}/suspend:
+    post:
+      operationId: suspendInstance
+      tags: [instances]
+      summary: Replace the published route with a static 503
+      x-native-ops-role: deployer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain, reason]
+              properties:
+                domain: { type: string }
+                reason: { type: string }
+                route_directives: { type: array, items: { type: string } }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Busy" }
+
+  /v1/images/build:
+    post:
+      operationId: buildImage
+      tags: [images]
+      summary: Build and publish an application image from an uploaded tree
+      description: Runs the tree's approved build recipe; publishes <prefix><app>:<ref> and moves :latest. Deletes the image the build displaced.
+      x-native-ops-role: deployer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-image-build
+      parameters:
+        - { name: app, in: query, required: true, schema: { type: string } }
+        - { name: ref, in: query, required: true, schema: { type: string } }
+      requestBody: { $ref: "#/components/requestBodies/Tree" }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "403": { description: "The recipe is not approved (an admin approves its digest), or the scope does not allow the image." }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/images/recipes:
+    get:
+      operationId: listRecipes
+      tags: [images]
+      summary: Image recipes builds asked for, and their approval
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-image-build
+      responses:
+        "200": { description: "The recipes.", content: { application/json: {} } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/images/recipes/{digest}/approve:
+    post:
+      operationId: approveRecipe
+      tags: [images]
+      summary: Approve a recipe digest
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-image-build
+      parameters: [{ $ref: "#/components/parameters/Digest" }]
+      responses:
+        "200": { description: "Approved." }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/images/recipes/{digest}/approval:
+    delete:
+      operationId: revokeRecipe
+      tags: [images]
+      summary: Withdraw a recipe's approval
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-image-build
+      parameters: [{ $ref: "#/components/parameters/Digest" }]
+      responses:
+        "200": { description: "Withdrawn." }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/images/prune:
+    post:
+      operationId: pruneImages
+      tags: [images]
+      summary: Image retention, as a job
+      description: Deletes images no instance runs that are orphans or tags older than the newest --image-keep per app. The job's log lists each.
+      x-native-ops-role: deployer
+      x-native-ops-enabled-by: --enable-image-build
+      parameters:
+        - { name: dry_run, in: query, description: "Only report.", schema: { type: string, enum: ["1", "true"] } }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "409": { $ref: "#/components/responses/Busy" }
+
+  /v1/edge/apply:
+    post:
+      operationId: applyEdge
+      tags: [maintenance]
+      summary: Apply the tree's edge/Caddyfile to the edge container
+      description: Validated, and rolled back if Caddy rejects it. Never touches service containers.
+      x-native-ops-role: deployer
+      x-native-ops-enabled-by: --enable-edge-apply
+      requestBody: { $ref: "#/components/requestBodies/Tree" }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/backups:
+    post:
+      operationId: backup
+      tags: [maintenance]
+      summary: Back up one volume, or every volume fleet.yml allows
+      x-native-ops-role: deployer
+      x-native-ops-enabled-by: --enable-backup
+      parameters:
+        - { name: volume, in: query, schema: { type: string } }
+        - { name: prune, in: query, description: "Apply retention afterwards.", schema: { type: string, enum: ["1", "true"] } }
+      requestBody: { $ref: "#/components/requestBodies/Tree" }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/backups/restore:
+    post:
+      operationId: restore
+      tags: [maintenance]
+      summary: Restore a volume in place (keeping a copy) or as a new volume
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-backup
+      parameters:
+        - { name: volume, in: query, required: true, schema: { type: string } }
+        - { name: from, in: query, description: "The object key, or latest.", schema: { type: string, default: latest } }
+        - { name: as, in: query, description: "Restore under this new volume name.", schema: { type: string } }
+        - { name: force, in: query, description: "Stop the containers that mount the volume.", schema: { type: string, enum: ["1", "true"] } }
+      requestBody: { $ref: "#/components/requestBodies/Tree" }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/dns/sync:
+    post:
+      operationId: syncDNS
+      tags: [maintenance]
+      summary: Create or update fleet.yml's dns_records
+      x-native-ops-role: deployer
+      x-native-ops-enabled-by: --enable-dns-sync
+      requestBody: { $ref: "#/components/requestBodies/Tree" }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "409": { $ref: "#/components/responses/Busy" }
+
+  /v1/daemon/upgrade:
+    post:
+      operationId: upgradeDaemon
+      tags: [admin]
+      summary: Upgrade the daemon to a pinned release
+      description: Prefer fleet.yml's daemon pin, which a deploy follows. The daemon restarts on the new binary; whoami's version shows it landed.
+      x-native-ops-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, sha256]
+              properties:
+                version: { type: string, pattern: "^v[0-9]+\\.[0-9]+\\.[0-9]+$" }
+                sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/secrets:
+    get:
+      operationId: listSecrets
+      tags: [admin]
+      summary: The names in the daemon's secret store (never values)
+      x-native-ops-role: admin
+      responses:
+        "200": { description: "The names.", content: { application/json: {} } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    put:
+      operationId: syncSecrets
+      tags: [admin]
+      summary: Push secrets from the git server's secret store
+      x-native-ops-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                secrets: { type: object, additionalProperties: { type: string } }
+                prune: { type: boolean, description: "Remove every secret not named." }
+      responses:
+        "200": { description: "What changed, by name." }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/secrets/{name}:
+    delete:
+      operationId: deleteSecret
+      tags: [admin]
+      summary: Delete one secret
+      x-native-ops-role: admin
+      parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "Deleted." }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/tokens:
+    get:
+      operationId: listTokens
+      tags: [admin]
+      summary: API tokens (never their secrets)
+      x-native-ops-role: admin
+      responses:
+        "200": { description: "The tokens.", content: { application/json: {} } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      operationId: createToken
+      tags: [admin]
+      summary: Create a token; the secret is in the answer, once
+      x-native-ops-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, role]
+              properties:
+                name: { type: string }
+                role: { $ref: "#/components/schemas/Role" }
+                scope: { $ref: "#/components/schemas/Scope" }
+      responses:
+        "201": { description: "{token: {id, name, role, scope, created}, secret, note}: secret is the API token, shown only now." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/tokens/{id}:
+    delete:
+      operationId: revokeToken
+      tags: [admin]
+      summary: Revoke a token
+      x-native-ops-role: admin
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "Revoked." }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/users:
+    get:
+      operationId: listUsers
+      tags: [admin]
+      summary: UI users
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-auth or --oidc-issuer
+      responses:
+        "200": { description: "The users.", content: { application/json: {} } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      operationId: createUser
+      tags: [admin]
+      summary: Create a local user
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-auth or --oidc-issuer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, role, password]
+              properties:
+                username: { type: string }
+                name: { type: string }
+                role: { $ref: "#/components/schemas/Role" }
+                password: { type: string, format: password }
+      responses:
+        "201": { description: "{user}" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/users/{username}:
+    patch:
+      operationId: updateUser
+      tags: [admin]
+      summary: Change a user's role, disable them, or set a password
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-auth or --oidc-issuer
+      parameters: [{ name: username, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                role: { $ref: "#/components/schemas/Role" }
+                disabled: { type: boolean }
+                password: { type: string, format: password }
+      responses:
+        "200": { description: "Changed." }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/users/by-email/{email}:
+    put:
+      operationId: upsertUserByEmail
+      tags: [admin]
+      summary: Grant (or remove) access by email, before a first OIDC sign-in
+      description: How a directory grants access ahead of sign-in and takes it away after someone leaves.
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: --enable-auth or --oidc-issuer
+      parameters: [{ name: email, in: path, required: true, schema: { type: string, format: email } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { $ref: "#/components/schemas/Role" }
+                name: { type: string }
+                disabled: { type: boolean }
+      responses:
+        "200": { description: "{user, created: false}: an existing user was changed." }
+        "201": { description: "{user, created: true}: a user was created, to sign in over OIDC." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: An API token (nops_...), created by an admin (POST /v1/tokens or native-ops token create). The UI's session cookie also works, except at /mcp.
+
+  parameters:
+    Service:
+      { name: service, in: query, description: "Only this service.", schema: { type: string } }
+    Sha:
+      { name: sha, in: query, description: "The commit being sent (recorded in the audit log).", schema: { type: string, pattern: "^[0-9a-f]{7,64}$" } }
+    PlanHash:
+      { name: hash, in: path, required: true, schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+    InstanceName:
+      { name: name, in: path, required: true, schema: { type: string } }
+    Digest:
+      { name: digest, in: path, required: true, schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+
+  requestBodies:
+    Tree:
+      required: true
+      description: The configuration tree as a gzip-compressed tar (fleet.yml at its root, or in one top-level directory).
+      content:
+        application/gzip:
+          schema: { type: string, contentEncoding: binary }
+
+  responses:
+    JobStarted:
+      description: The job started. Location names it; follow it with GET /v1/jobs/{id}?wait=60.
+      headers:
+        Location: { schema: { type: string } }
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              job: { $ref: "#/components/schemas/Job" }
+    BadRequest:
+      description: The request is malformed (bad_request, bad_config).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: No valid token (unauthorized). WWW-Authenticate says how to authenticate.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: The token's role (or scope) cannot do that (forbidden).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: No such thing (not_found).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Busy:
+      description: Another change is running on this host (busy); the message names its job. Wait for it and retry.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    HostUnavailable:
+      description: The host could not be read (host_unavailable).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error: { type: string, description: "What went wrong, for a person." }
+        code:
+          type: string
+          description: Stable, for a program.
+          examples: [bad_request, bad_config, unauthorized, forbidden, not_found, busy, tag_unresolved, git_unavailable, host_unavailable, plan_changed, blocked, stale, not_approvable, not_approved, approval_used, approval_expired, not_managed, internal]
+    Role:
+      type: string
+      enum: [viewer, planner, deployer, admin]
+    Scope:
+      type: object
+      description: Limits a token to tenant instances (names, images and domains, as globs).
+      properties:
+        names: { type: array, items: { type: string } }
+        images: { type: array, items: { type: string } }
+        domains: { type: array, items: { type: string } }
+    TagRequest:
+      type: object
+      required: [tag]
+      additionalProperties: false
+      properties:
+        tag: { type: string, description: "A deploy tag pushed in the configuration repository.", examples: [deploy-2026.10.03] }
+    JobStatus:
+      type: string
+      enum: [running, succeeded, failed, interrupted]
+      description: interrupted means the daemon stopped while the job ran; run it again (applies converge).
+    Job:
+      type: object
+      required: [id, kind, status, actor, created]
+      properties:
+        id: { type: string, examples: [j-1791054271-18f384d8] }
+        kind: { type: string, examples: [deploy, apply, "instance:put", image:build] }
+        status: { $ref: "#/components/schemas/JobStatus" }
+        actor: { type: string, description: "The token or user that started it." }
+        sha: { type: string, description: "The commit (a deploy's, once resolved)." }
+        service: { type: string, description: "What the job is about; for a deploy, the tag." }
+        plan_hash: { type: string }
+        created: { type: string, format: date-time }
+        finished: { type: string, format: date-time }
+        error: { type: string }
+        result: { $ref: "#/components/schemas/DeployResult" }
+        log: { type: string, description: "For deployers and admins; not in lists." }
+        log_truncated: { type: boolean }
+    DeployResult:
+      type: string
+      enum: [applied, no_changes, daemon_upgraded]
+      description: How a deploy that succeeded ended. daemon_upgraded means it moved the daemon to fleet.yml's pin and resumed as a new deploy job.
+    Deploy:
+      type: object
+      required: [job, tag, status, actor, started]
+      properties:
+        job: { type: string }
+        tag: { type: string }
+        sha: { type: string }
+        status: { $ref: "#/components/schemas/JobStatus" }
+        result: { $ref: "#/components/schemas/DeployResult" }
+        actor: { type: string }
+        started: { type: string, format: date-time }
+        finished: { type: string, format: date-time }
+        error: { type: string }
+        plan_hash: { type: string }
+        counts: { $ref: "#/components/schemas/PlanCounts" }
+    DeployPlan:
+      type: object
+      required: [tag, sha, deployable, daemon, hash, exit, counts, plan, text]
+      properties:
+        tag: { type: string }
+        sha: { type: string }
+        deployable: { type: boolean, description: "Whether POST /v1/deploy would accept the tag (a protection rule covers it)." }
+        protected_by: { type: string, description: "The protection rule, when deployable." }
+        reason: { type: string, description: "Why not, when not deployable." }
+        daemon:
+          type: object
+          properties:
+            running: { type: string }
+            pinned: { type: string }
+            upgrade: { type: boolean, description: "The deploy would upgrade the daemon first." }
+        hash: { type: string }
+        exit: { $ref: "#/components/schemas/PlanExit" }
+        counts: { $ref: "#/components/schemas/PlanCounts" }
+        plan: { $ref: "#/components/schemas/FleetPlan" }
+        text: { type: string, description: "The plan, readable." }
+    PlanExit:
+      type: integer
+      enum: [0, 1, 2]
+      description: 0 nothing to change, 1 blocked (apply would fail), 2 changes pending.
+    PlanCounts:
+      type: object
+      description: Services per action.
+      additionalProperties: { type: integer }
+      examples: [{ none: 15, update: 1, create: 1 }]
+    FleetPlan:
+      type: object
+      description: One entry per service, with its action and the changes it would make.
+      properties:
+        services:
+          type: array
+          items:
+            type: object
+            properties:
+              service: { type: string }
+              action: { type: string, enum: [none, create, update, blocked] }
+              changes:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    kind: { type: string, examples: [create-instance, replace-image] }
+                    detail: { type: string }
+    HealthSpec:
+      type: object
+      required: [port]
+      properties:
+        path: { type: string }
+        port: { type: integer }
+        timeout: { type: integer, description: "Seconds (default 45)." }
+    InstanceSpec:
+      type: object
+      required: [template, image]
+      properties:
+        template: { type: string, description: "The label an instance is recorded with; only the same template may change it." }
+        image: { type: string }
+        profiles: { type: array, items: { type: string } }
+        limits: { type: object, additionalProperties: { type: string } }
+        volumes:
+          type: array
+          items:
+            type: object
+            required: [name, path]
+            properties:
+              name: { type: string }
+              path: { type: string }
+              shifted: { type: boolean, default: true }
+              owner: { type: string }
+        service: { type: string }
+        env: { type: object, additionalProperties: { type: string } }
+        health: { $ref: "#/components/schemas/HealthSpec" }
+        domain: { type: string }
+        route_directives: { type: array, items: { type: string } }

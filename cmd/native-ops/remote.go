@@ -34,6 +34,9 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   apply       --expect <hash>     apply an approved plan
   deploy      --tag <tag>         deploy the commit a protected deploy tag points at; the daemon reads it
                                   from the git server, nothing is uploaded
+  deploy-plan --tag <tag>         print what deploying the tag would change, changing nothing (planner;
+                                  no upload); exits 1 if the plan is blocked, 2 if the tag would not deploy
+  deploys     [--json]            what the host runs now and the recent deploys (no upload)
   edge-apply                      apply edge/Caddyfile to the edge container
   backup      [--volume v] [--prune]
   restore     --volume v [--from key|latest] [--as name] [--force]   (admin)
@@ -86,6 +89,7 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	upVersion := flags.String("version", "", "daemon-upgrade: the release tag, e.g. v1.56.0")
 	upSHA := flags.String("sha256", "", "daemon-upgrade: the SHA-256 of native-ops_<version>_linux_<arch>.tar.gz, from the release's checksums.txt")
 	dryRun := flags.Bool("dry-run", false, "image-prune: only report what would be deleted")
+	asJSON := flags.Bool("json", false, "deploys: print the daemon's answer as JSON")
 	prune2 := flags.Bool("prune-secrets", false, "secret-sync: remove every secret on the daemon not named here (also --prune)")
 	_ = flags.Parse(args[1:])
 
@@ -130,6 +134,13 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		}
 		fmt.Printf("deploying %s (job %s)\n", *tag, out.Job.ID)
 		os.Exit(c.wait(ctx, out.Job.ID))
+	case "deploy-plan":
+		if *tag == "" {
+			fatalf("deploy-plan needs --tag")
+		}
+		os.Exit(c.deployPlan(ctx, *tag))
+	case "deploys":
+		c.deploys(ctx, *asJSON)
 	case "edge-apply":
 		c.uploadAndWait(ctx, "/v1/edge/apply", *configDir, q)
 	case "backup":
@@ -280,6 +291,99 @@ func (c *remoteClient) plan(ctx context.Context, dir string, q url.Values) int {
 	return 0
 }
 
+// deployPlan prints what deploying a tag would change. It returns 1 when the plan is blocked, 2 when the
+// tag would not deploy (no protection rule covers it), else 0.
+func (c *remoteClient) deployPlan(ctx context.Context, tag string) int {
+	var out struct {
+		Sha        string `json:"sha"`
+		Text       string `json:"text"`
+		Hash       string `json:"hash"`
+		Exit       int    `json:"exit"`
+		Deployable bool   `json:"deployable"`
+		Reason     string `json:"reason"`
+		Daemon     struct {
+			Running string `json:"running"`
+			Pinned  string `json:"pinned"`
+			Upgrade bool   `json:"upgrade"`
+		} `json:"daemon"`
+	}
+	if code, raw := c.json(ctx, "POST", "/v1/deploy/plan", map[string]string{"tag": tag}, &out); code != http.StatusOK {
+		fatalf("the daemon answered %d: %s", code, raw)
+	}
+	fmt.Printf("%s is commit %s\n", tag, out.Sha[:12])
+	if out.Daemon.Upgrade {
+		fmt.Printf("the deploy would first upgrade the daemon from %s to %s, as fleet.yml pins; this plan was made by %s\n", out.Daemon.Running, out.Daemon.Pinned, out.Daemon.Running)
+	}
+	printLog(out.Text)
+	fmt.Printf("plan %s\n", out.Hash)
+	switch {
+	case out.Exit == 1:
+		fmt.Fprintln(os.Stderr, "the plan is blocked: the deploy would fail")
+		return 1
+	case !out.Deployable:
+		fmt.Fprintf(os.Stderr, "%s would not deploy: %s\n", tag, out.Reason)
+		return 2
+	}
+	return 0
+}
+
+// deploys prints what the host runs and the recent deploys.
+func (c *remoteClient) deploys(ctx context.Context, asJSON bool) {
+	type deploy struct {
+		Job     string         `json:"job"`
+		Tag     string         `json:"tag"`
+		Sha     string         `json:"sha"`
+		Status  string         `json:"status"`
+		Result  string         `json:"result"`
+		Actor   string         `json:"actor"`
+		Started time.Time      `json:"started"`
+		Error   string         `json:"error"`
+		Counts  map[string]int `json:"counts"`
+	}
+	var out struct {
+		Current *deploy  `json:"current"`
+		Running *deploy  `json:"running"`
+		Deploys []deploy `json:"deploys"`
+	}
+	code, raw := c.json(ctx, "GET", "/v1/deploys?limit=20", nil, &out)
+	if code != http.StatusOK {
+		fatalf("the daemon answered %d: %s", code, raw)
+	}
+	if asJSON {
+		fmt.Print(raw)
+		return
+	}
+	short := func(sha string) string {
+		if len(sha) > 12 {
+			return sha[:12]
+		}
+		return firstNonEmpty(sha, "-")
+	}
+	if out.Current != nil {
+		fmt.Printf("current: %s (%s), %s %s by %s\n", out.Current.Tag, short(out.Current.Sha), out.Current.Result, out.Current.Started.Local().Format("2006-01-02 15:04"), out.Current.Actor)
+	} else {
+		fmt.Println("current: none (no deploy has left the host matching its tag)")
+	}
+	if out.Running != nil {
+		fmt.Printf("running: %s (job %s)\n", out.Running.Tag, out.Running.Job)
+	}
+	for _, d := range out.Deploys {
+		outcome := firstNonEmpty(d.Result, d.Status)
+		if d.Status != "succeeded" {
+			outcome = d.Status
+		}
+		line := fmt.Sprintf("  %s  %-28s %-12s %-15s %s", d.Started.Local().Format("2006-01-02 15:04"), d.Tag, short(d.Sha), outcome, d.Job)
+		if d.Error != "" {
+			e := d.Error
+			if len(e) > 80 {
+				e = e[:77] + "..."
+			}
+			line += "  " + e
+		}
+		fmt.Println(line)
+	}
+}
+
 // uploadAndWait uploads the tree to an endpoint that starts a job, then waits for the job. It exits.
 func (c *remoteClient) uploadAndWait(ctx context.Context, path, dir string, q url.Values) {
 	var out struct {
@@ -314,7 +418,7 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 			Error  string `json:"error"`
 			Log    string `json:"log"`
 		}
-		code, raw := c.json(ctx, "GET", "/v1/jobs/"+url.PathEscape(id), nil, &job)
+		code, raw := c.json(ctx, "GET", "/v1/jobs/"+url.PathEscape(id)+"?wait=30", nil, &job)
 		if code != http.StatusOK {
 			fatalf("reading job %s: the daemon answered %d: %s", id, code, raw)
 		}

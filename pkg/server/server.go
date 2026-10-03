@@ -352,6 +352,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": s.opts.Version})
 	})
+	openapiYAML, openapiJSON := s.openapiHandlers()
+	mux.HandleFunc("GET /openapi.yaml", openapiYAML)
+	mux.HandleFunc("GET /openapi.json", openapiJSON)
 	if s.opts.Users != nil || s.opts.OIDC != nil {
 		mux.HandleFunc("GET /api/session", s.handleSession)
 		mux.HandleFunc("POST /api/login", s.handleLogin)
@@ -419,6 +422,8 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.Apply != nil && s.opts.Deploy != nil {
 		mux.Handle("POST /v1/deploy", s.auth(RoleDeployer, s.handleDeploy))
+		mux.Handle("POST /v1/deploy/plan", s.auth(RolePlanner, s.handleDeployPlan))
+		mux.Handle("GET /v1/deploys", s.auth(RoleViewer, s.handleDeploys))
 	}
 	if s.opts.ImageBuild != nil {
 		mux.Handle("POST /v1/images/build", s.authScoped(RoleDeployer, s.handleImageBuild))
@@ -444,6 +449,11 @@ func (s *Server) Handler() http.Handler {
 	if s.opts.DNSSync != nil {
 		mux.Handle("POST /v1/dns/sync", s.auth(RoleDeployer, s.handleDNSSync))
 	}
+	// The MCP endpoint's tools call the daemon's other endpoints through the whole handler (see mcp.go).
+	var handler http.Handler
+	mux.Handle("POST /mcp", s.mcpHandler(func() http.Handler { return handler }))
+	mux.HandleFunc("GET /mcp", mcpNoStream)
+	mux.HandleFunc("DELETE /mcp", mcpNoStream)
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)
 	mux.Handle("GET /index.html", ui)
@@ -459,7 +469,14 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
 	})
-	return s.audited(mux)
+	handler = s.audited(mux)
+	return handler
+}
+
+// mcpNoStream answers GET and DELETE /mcp: the server opens no event stream and keeps no sessions.
+func mcpNoStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Allow", "POST")
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "this MCP server is stateless and answers POST only")
 }
 
 // ListenAndServe serves until ctx is cancelled, then shuts down gracefully.

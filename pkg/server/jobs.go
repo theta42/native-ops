@@ -37,6 +37,7 @@ type Job struct {
 	Created      time.Time  `json:"created"`
 	Finished     *time.Time `json:"finished,omitempty"`
 	Error        string     `json:"error,omitempty"`
+	Result       string     `json:"result,omitempty"` // how a deploy ended: applied, no_changes or daemon_upgraded
 	Log          string     `json:"log,omitempty"`
 	LogTruncated bool       `json:"log_truncated,omitempty"`
 }
@@ -155,6 +156,16 @@ func (j *Jobs) CreateKind(kind, actor, sha, service, planHash string) (Job, erro
 	j.jobs[job.ID] = job
 	j.prune()
 	return *job, nil
+}
+
+// update changes a job's record (its commit, plan or result, once known) and saves it.
+func (j *Jobs) update(id JobID, change func(*Job)) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if job := j.jobs[id]; job != nil {
+		change(job)
+		_ = j.persist(job)
+	}
 }
 
 // Logf appends a timestamped line to a job's log (bounded), and saves it.

@@ -85,38 +85,27 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 	if resumed {
 		what += " (resumed on the upgraded daemon)"
 	}
+	result := func(r string) { s.opts.Jobs.update(job.ID, func(j *Job) { j.Result = r }) }
 	s.startJob(job.ID, actor, what, "deploy "+tag, cleanup, func(ctx context.Context, logf func(string, ...any)) error {
-		sha, err := s.opts.Deploy.Commit(ctx, tag)
+		sha, rule, err := s.resolveTag(ctx, tag)
 		if err != nil {
 			return err
 		}
-		rule, err := s.opts.Deploy.Protected(ctx, tag)
-		if err != nil {
-			return err
-		}
+		s.opts.Jobs.update(job.ID, func(j *Job) { j.Sha = sha })
 		logf("tag %s is commit %s, protected by the rule %q", tag, sha[:12], rule)
 
-		tmp, err = os.MkdirTemp("", "native-ops-deploy-")
+		var root string
+		tmp, root, err = s.fetchCommit(ctx, sha)
 		if err != nil {
 			return err
-		}
-		rc, err := s.opts.Deploy.Archive(ctx, sha)
-		if err != nil {
-			return err
-		}
-		err = ExtractTarGz(rc, tmp)
-		rc.Close()
-		if err != nil {
-			return fmt.Errorf("unpack commit %s: %w", sha[:12], err)
-		}
-		root, ok := configRoot(tmp)
-		if !ok {
-			return fmt.Errorf("commit %s has no fleet.yml", sha[:12])
 		}
 
 		// fleet.yml's daemon pin is the version the commit was written for: move to it first, so the
 		// plan and the apply run on that binary.
 		if upgraded, err := s.followPin(ctx, root, tag, actor, resumed, logf); err != nil || upgraded {
+			if upgraded && err == nil {
+				result(ResultDaemonUpgraded)
+			}
 			return err
 		}
 
@@ -128,20 +117,68 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 		}
 		hash := fp.Hash()
 		s.opts.Plans.Record(PlanSeen{Hash: hash, Actor: actor, Sha: sha, Service: "", Exit: fp.ExitStatus(), Counts: fp.Counts(), Text: fp.Render()})
+		s.opts.Jobs.update(job.ID, func(j *Job) { j.PlanHash = hash })
 		logf("plan %s:\n%s", hash[:12], fp.Render())
 		switch {
 		case fp.Blocked():
 			return errors.New("the plan is blocked: apply would fail, so nothing was changed")
 		case !fp.Pending():
 			logf("nothing to change: the host already matches %s", tag)
+			result(ResultNoChanges)
 			return nil
 		}
 		if err := s.opts.Plans.UseForDeploy(hash, "tag "+tag+" ("+sha[:12]+")", job.ID); err != nil {
 			return fmt.Errorf("record the deploy: %w", err)
 		}
-		return s.opts.Apply(ctx, root, fp, logf)
+		if err := s.opts.Apply(ctx, root, fp, logf); err != nil {
+			return err
+		}
+		result(ResultApplied)
+		return nil
 	})
 	return job, nil
+}
+
+// How a deploy that succeeded ended (Job.Result).
+const (
+	ResultApplied        = "applied"         // the plan's changes were applied: the host now matches the tag
+	ResultNoChanges      = "no_changes"      // the host already matched the tag
+	ResultDaemonUpgraded = "daemon_upgraded" // the daemon moved to fleet.yml's pin; the deploy resumes as a new job
+)
+
+// resolveTag resolves a deploy tag to its commit on the git server and names the protection rule that
+// covers it. A tag no rule protects is an error: anyone who can push could have made it.
+func (s *Server) resolveTag(ctx context.Context, tag string) (sha, rule string, err error) {
+	if sha, err = s.opts.Deploy.Commit(ctx, tag); err != nil {
+		return "", "", err
+	}
+	if rule, err = s.opts.Deploy.Protected(ctx, tag); err != nil {
+		return sha, "", err
+	}
+	return sha, rule, nil
+}
+
+// fetchCommit downloads a commit's tree from the git server into a new temporary directory, and finds
+// the configuration root (where fleet.yml is) in it. The caller removes dir, also on error.
+func (s *Server) fetchCommit(ctx context.Context, sha string) (dir, root string, err error) {
+	dir, err = os.MkdirTemp("", "native-ops-deploy-")
+	if err != nil {
+		return "", "", err
+	}
+	rc, err := s.opts.Deploy.Archive(ctx, sha)
+	if err != nil {
+		return dir, "", err
+	}
+	err = ExtractTarGz(rc, dir)
+	rc.Close()
+	if err != nil {
+		return dir, "", fmt.Errorf("unpack commit %s: %w", sha[:12], err)
+	}
+	root, ok := configRoot(dir)
+	if !ok {
+		return dir, "", fmt.Errorf("commit %s has no fleet.yml", sha[:12])
+	}
+	return dir, root, nil
 }
 
 // lastHostChange is when a job that changes what a plan compares against last finished: an apply, a

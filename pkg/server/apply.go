@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -178,21 +179,37 @@ func (s *Server) startJob(id JobID, actor, what, audit string, cleanup func(), w
 	}()
 }
 
-// handleJobs is GET /v1/jobs: the recent jobs, newest first, without logs. A token with a scope
-// sees only its own jobs (see scopeSees).
+// handleJobs is GET /v1/jobs?kind=&status=&limit=: the recent jobs, newest first, without logs. kind is a
+// job kind ("deploy", "apply", "image:build"), or a family of them ending in a colon ("instance:");
+// status is running, succeeded, failed or interrupted. A token with a scope sees only its own jobs (see
+// scopeSees).
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
-	actor, scope := s.actorScope(r)
-	jobs := s.opts.Jobs.List()
-	if scope != nil {
-		mine := jobs[:0]
-		for _, j := range jobs {
-			if scopeSees(scope, actor, j) {
-				mine = append(mine, j)
-			}
-		}
-		jobs = mine
+	q := r.URL.Query()
+	kind, status := q.Get("kind"), JobStatus(q.Get("status"))
+	switch status {
+	case "", JobRunning, JobSucceeded, JobFailed, JobInterrupted:
+	default:
+		writeError(w, http.StatusBadRequest, "bad_request", "status must be running, succeeded, failed or interrupted")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	limit, ok := queryLimit(w, r, keepJobs)
+	if !ok {
+		return
+	}
+	actor, scope := s.actorScope(r)
+	out := []Job{}
+	for _, j := range s.opts.Jobs.List() {
+		switch {
+		case scope != nil && !scopeSees(scope, actor, j),
+			kind != "" && j.Kind != kind && !(strings.HasSuffix(kind, ":") && strings.HasPrefix(j.Kind, kind)),
+			status != "" && j.Status != status:
+			continue
+		}
+		if out = append(out, j); len(out) == limit {
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": out})
 }
 
 // scopeSees reports whether a token limited to scope, named actor, may see a job: one it started
@@ -205,15 +222,36 @@ func scopeSees(scope *Scope, actor string, j Job) bool {
 	return strings.HasPrefix(j.Kind, "instance:") && scope.AllowsName(j.Service)
 }
 
-// handleJob is GET /v1/jobs/{id}. The log (which can hold whatever a hook printed) is for
-// deployers and admins; a viewer sees the outcome.
+// maxJobWait bounds GET /v1/jobs/{id}?wait=, well inside the server's write timeout.
+const maxJobWait = 60 * time.Second
+
+// handleJob is GET /v1/jobs/{id}?wait=<seconds>. The log (which can hold whatever a hook printed) is for
+// deployers and admins; a viewer sees the outcome. With wait (up to 60), a running job is answered when it
+// ends or when the wait is over, whichever is first, so a client need not poll.
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validJobID(id) {
 		writeError(w, http.StatusNotFound, "not_found", "no such job")
 		return
 	}
+	var wait time.Duration
+	if v := r.URL.Query().Get("wait"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || time.Duration(n)*time.Second > maxJobWait {
+			writeError(w, http.StatusBadRequest, "bad_request", "wait must be a number of seconds from 0 to 60")
+			return
+		}
+		wait = time.Duration(n) * time.Second
+	}
 	job, ok := s.opts.Jobs.Get(JobID(id))
+	for deadline := time.Now().Add(wait); ok && job.Status == JobRunning && time.Now().Before(deadline); {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+		job, ok = s.opts.Jobs.Get(JobID(id))
+	}
 	if actor, scope := s.actorScope(r); ok && scope != nil && !scopeSees(scope, actor, job) {
 		ok = false // the same answer as a job that does not exist
 	}
