@@ -325,7 +325,7 @@ type ServiceConfig struct {
 	Env         map[string]string `yaml:"env,omitempty"`
 	EnvFile     string            `yaml:"env_file,omitempty"`
 	Service     string            `yaml:"service,omitempty"` // systemd unit + /etc/default/<service> when it differs from the instance name
-	Limits      map[string]string `yaml:"limits,omitempty"` // e.g. limits.cpu: 2
+	Limits      map[string]string `yaml:"limits,omitempty"`  // e.g. limits.cpu: 2
 	HealthCheck HealthCheckConfig `yaml:"healthcheck,omitempty"`
 	Routing     *RoutingConfig    `yaml:"routing,omitempty"`
 	Forwards    []PortForward     `yaml:"forwards,omitempty"`
