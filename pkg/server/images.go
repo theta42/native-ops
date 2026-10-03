@@ -88,3 +88,40 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
 	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
 }
+
+// ImagePruneFunc applies image retention on the host (see engine.ImageRetention); with dryRun it only
+// reports what it would delete.
+type ImagePruneFunc func(ctx context.Context, dryRun bool, logf func(string, ...any)) error
+
+// handleImagePrune is POST /v1/images/prune[?dry_run=1] (deployer, not a scoped token: it acts on every
+// app's images). It deletes, as a job, the images no instance runs that retention does not keep: orphans
+// left by rebuilds, and tags older than the newest few per app. Builds already clean up after
+// themselves; this is for a scheduled maintenance job and for images left before that.
+func (s *Server) handleImagePrune(w http.ResponseWriter, r *http.Request) {
+	dry := r.URL.Query().Get("dry_run") == "1" || r.URL.Query().Get("dry_run") == "true"
+	if !s.applyMu.TryLock() {
+		msg := "another change is already running on this host"
+		if j, ok := s.opts.Jobs.Running(); ok {
+			msg += " (" + string(j.ID) + ")"
+		}
+		writeError(w, http.StatusConflict, "busy", msg)
+		return
+	}
+	actor, _ := s.actorScope(r)
+	what := "image prune"
+	if dry {
+		what += " (dry run)"
+	}
+	job, err := s.opts.Jobs.CreateKind("image:prune", actor, "", "", "")
+	if err != nil {
+		s.applyMu.Unlock()
+		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was deleted")
+		return
+	}
+	auditDetail(r, "%s job=%s", what, job.ID)
+	s.startJob(job.ID, actor, what, what, nil, func(ctx context.Context, logf func(string, ...any)) error {
+		return s.opts.ImagePrune(ctx, dry, logf)
+	})
+	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
+	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "dry_run": dry})
+}

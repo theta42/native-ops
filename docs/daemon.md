@@ -44,6 +44,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
 | `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
 | `POST /v1/images/build` | deployer | build and publish an application image from an uploaded configuration tree, as a job (only with `--enable-image-build`) |
+| `POST /v1/images/prune` | deployer (unscoped) | image retention as a job: delete images no instance runs that are orphans or old tags (`?dry_run=1` reports only; with `--enable-image-build`) |
 | `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see |
 | `GET /` | none | the UI (Overview, Instances, Volumes, Network). It holds no data; it signs in (or takes a token) and calls `/v1/status` |
 
@@ -313,6 +314,25 @@ recipe needs nothing, while any change to a build script waits for an admin -- t
 follows for its plan. **After upgrading a daemon to a version with this check, approve the current
 recipe once**, or the next build is refused.
 
+### Image retention
+
+Each build moves `<prefix><app>:<ref>` (and `:latest`) to the image it publishes. Rebuilding a ref
+would leave the previous image with no alias and nothing to delete it, and every release tag keeps an
+image of its own; a host that builds on every merge would fill its disk. So the daemon keeps them in
+check, deleting only images that no instance runs (`volatile.base_image`):
+
+- **After every build**, the image the build displaced is deleted if it now has no alias and no
+  instance runs it, and that app's tagged images beyond the newest `--image-keep` (default 5) go too.
+  `:latest` is always kept.
+- **`POST /v1/images/prune`** (deployer; not a scoped token, since it acts on every app) does the same
+  for every app, and also deletes images with no alias older than `--image-orphan-age` (default 24h),
+  such as those left before this existed. `?dry_run=1` only reports. From CI:
+  `native-ops remote image-prune [--dry-run]`, nightly in `ci-examples/maintenance.yml`.
+
+Images whose aliases are not all `<prefix><app>:<ref>` (a base image, one named by hand) and cached
+copies of remote images are never touched. A deleted tag can be built again from its git ref.
+`--image-keep 0` keeps every tag.
+
 ## Tokens and bootstrapping
 
 Tokens are managed over the API by an admin, so nobody needs a shell on the host:
@@ -576,6 +596,8 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--instance-route-imports` | | none | Caddy snippets a tenant route may import |
 | `--enable-image-build` | | off | `POST /v1/images/build` and the recipe endpoints |
 | `--image-prefix` | `NATIVE_OPS_IMAGE_PREFIX` | `app-` | what the recipe names images before `<app>:<ref>` |
+| `--image-keep` | `NATIVE_OPS_IMAGE_KEEP` | `5` | tagged images kept per app by image retention (0: every tag) |
+| `--image-orphan-age` | | `24h` | how old an unaliased image no instance runs must be before a prune deletes it |
 | `--enable-edge-apply` | | off | `POST /v1/edge/apply` |
 | `--git-url` | `NATIVE_OPS_GIT_URL` | none | the git server (Gitea) holding the configuration repository; with `--deploy-repo` and `--enable-apply`, `POST /v1/deploy` |
 | `--deploy-repo` | `NATIVE_OPS_DEPLOY_REPO` | none | the configuration repository there, as `owner/name` |

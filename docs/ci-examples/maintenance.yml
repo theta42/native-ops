@@ -34,3 +34,9 @@ jobs:
         env:
           NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_DEPLOY_TOKEN }}
         run: native-ops remote dns-sync --config-dir .
+      # Needs --enable-image-build. Deletes images no instance runs: orphans left by rebuilds and old tags
+      # beyond --image-keep per app (builds already clean up after themselves; this catches the rest).
+      - name: Prune images
+        env:
+          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_DEPLOY_TOKEN }}
+        run: native-ops remote image-prune

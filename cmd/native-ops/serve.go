@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/gitsource"
+	"github.com/theta42/native-ops/pkg/incus"
 	"github.com/theta42/native-ops/pkg/provider"
 	"github.com/theta42/native-ops/pkg/provider/digitalocean"
 	"github.com/theta42/native-ops/pkg/remote"
@@ -118,6 +120,8 @@ func handleServeCommand(ctx context.Context, args []string) {
 	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
 	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as the uploaded fleet.yml's backup section says, only to the destination pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT/_BUCKET). The keys and pins come from the secret store (synced from the git server), else the environment")
 	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded fleet.yml's dns_records in the allowed zones (--dns-domains or NATIVE_OPS_DNS_ZONES) through the built-in provider (DO_API_TOKEN from the secret store, else the environment). Script plugins are not run from an upload")
+	imageKeep := flags.Int("image-keep", envInt("NATIVE_OPS_IMAGE_KEEP", 5), "Image retention: tagged images kept per app (<prefix><app>:<ref>; :latest and any image an instance runs are always kept); 0 keeps every tag. Env: NATIVE_OPS_IMAGE_KEEP")
+	imageOrphanAge := flags.Duration("image-orphan-age", 24*time.Hour, "Image retention: how old an image with no alias that no instance runs must be before POST /v1/images/prune deletes it (an image a build displaces goes at once); 0 keeps them")
 	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "app-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
 	gitURL := flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server (Gitea) holding the configuration repository, e.g. https://git.example.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
 	deployRepo := flags.String("deploy-repo", envOr("NATIVE_OPS_DEPLOY_REPO", ""), "The configuration repository on --git-url, as owner/name: a protected deploy tag there deploys its commit. Env: NATIVE_OPS_DEPLOY_REPO")
@@ -157,6 +161,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
 		EnableImageBuild: *enableImageBuild,
 		ImagePrefix:      *imagePrefix,
+		ImageRetention:   engine.ImageRetention{Prefix: *imagePrefix, KeepTags: *imageKeep, OrphanAge: *imageOrphanAge},
 		EnableEdgeApply:  *enableEdgeApply,
 		GitURL:           *gitURL,
 		DeployRepo:       *deployRepo,
@@ -223,6 +228,7 @@ type daemonConfig struct {
 	InstancePolicy       engine.InstancePolicy
 	EnableImageBuild     bool
 	ImagePrefix          string
+	ImageRetention       engine.ImageRetention
 	EnableEdgeApply      bool
 	// GitURL, DeployRepo and DeployTags, with EnableApply, enable POST /v1/deploy (see pkg/gitsource);
 	// the git server's token is the secret NATIVE_OPS_GIT_TOKEN.
@@ -330,7 +336,8 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 				audit.Close()
 				return nil, nil, fmt.Errorf("--image-prefix %q: lowercase letters, digits, dots and dashes", cfg.ImagePrefix)
 			}
-			opts.ImageBuild = imageBuildSource(cfg.Exec, cfg.ImagePrefix)
+			opts.ImageBuild = imageBuildSource(cfg.Exec, cfg.ImagePrefix, cfg.ImageRetention)
+			opts.ImagePrune = imagePruneSource(cfg.Exec, cfg.ImageRetention)
 		}
 		if cfg.SelfUpgradeDir != "" {
 			up := &selfupdate.Updater{Dir: cfg.SelfUpgradeDir, ReleaseBase: cfg.ReleaseBase}
@@ -401,6 +408,14 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 }
 
 // envOr returns an environment value, or a default when it is empty.
+// envInt is envOr for a number; a value that is not one falls back to def.
+func envInt(key string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
+		return v
+	}
+	return def
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -447,9 +462,28 @@ func applySource(exec remote.Executor) server.ApplyFunc {
 }
 
 // imageBuildSource is what POST /v1/images/build builds with.
-func imageBuildSource(exec remote.Executor, prefix string) server.ImageBuildFunc {
+func imageBuildSource(exec remote.Executor, prefix string, keep engine.ImageRetention) server.ImageBuildFunc {
 	return func(ctx context.Context, dir, app, ref string, logf func(string, ...any)) error {
-		return engine.BuildImagePrefixed(ctx, exec, dir, app, ref, prefix, logf)
+		// The build moves <prefix><app>:<ref> to the new image; the one it pointed at is then deleted if
+		// nothing else names or runs it, and the app's tags beyond the newest few go too.
+		displaced, _ := incus.NewClient(exec).ResolveImageFingerprint(ctx, prefix+app+":"+ref)
+		if err := engine.BuildImagePrefixed(ctx, exec, dir, app, ref, prefix, logf); err != nil {
+			return err
+		}
+		r := keep
+		r.Prefix, r.App, r.Displaced = prefix, app, displaced
+		if _, err := engine.PruneImages(ctx, exec, r, false, logf); err != nil {
+			logf("image retention after the build failed (the build itself succeeded): %v", err)
+		}
+		return nil
+	}
+}
+
+// imagePruneSource is what POST /v1/images/prune runs.
+func imagePruneSource(exec remote.Executor, keep engine.ImageRetention) server.ImagePruneFunc {
+	return func(ctx context.Context, dryRun bool, logf func(string, ...any)) error {
+		_, err := engine.PruneImages(ctx, exec, keep, dryRun, logf)
+		return err
 	}
 }
 
