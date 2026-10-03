@@ -3,14 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/theta42/native-ops/pkg/server"
 	"github.com/theta42/native-ops/pkg/status"
@@ -216,5 +219,81 @@ func TestEveryServeFlagIsInTheConfigurationReference(t *testing.T) {
 		if !strings.Contains(string(doc), "| `--"+m[1]+"` |") {
 			t.Errorf("--%s is not in docs/daemon.md's configuration reference", m[1])
 		}
+	}
+}
+
+// The daemon exits to restart on the new binary as soon as the install job succeeds, so daemon-upgrade
+// must ride out connections being refused and report the version that comes back.
+func TestDaemonUpgradeRidesOutTheRestart(t *testing.T) {
+	upgradeWindow, upgradePoll = 10*time.Second, 20*time.Millisecond
+	t.Cleanup(func() { upgradeWindow, upgradePoll = 5*time.Minute, 3*time.Second })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	restarting := make(chan struct{})
+	var once sync.Once
+	old := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/daemon/upgrade":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"job":{"id":"j-1-abcdef12"},"from":"v1.0.0"}`))
+		case "/v1/jobs/j-1-abcdef12":
+			_, _ = w.Write([]byte(`{"status":"running"}`))
+			once.Do(func() { close(restarting) })
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})}
+	go func() { _ = old.Serve(ln) }()
+
+	go func() {
+		<-restarting
+		_ = old.Close() // connections are refused from here
+		time.Sleep(200 * time.Millisecond)
+		ln2, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/healthz" {
+				_, _ = w.Write([]byte(`{"version":"v1.0.1"}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		})}
+		t.Cleanup(func() { _ = srv.Close() })
+		_ = srv.Serve(ln2)
+	}()
+
+	c := &remoteClient{base: "http://" + addr, token: "tok", http: &http.Client{Timeout: time.Second}}
+	sha := strings.Repeat("a", 64)
+	if code := c.daemonUpgrade(context.Background(), "v1.0.1", sha); code != 0 {
+		t.Fatalf("an upgrade whose daemon restarts onto the new version must exit 0, got %d", code)
+	}
+}
+
+func TestDaemonUpgradeReportsARollback(t *testing.T) {
+	upgradeWindow, upgradePoll = 300*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { upgradeWindow, upgradePoll = 5*time.Minute, 3*time.Second })
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/daemon/upgrade":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"job":{"id":"j-1-abcdef12"},"from":"v1.0.0"}`))
+		case "/v1/jobs/j-1-abcdef12":
+			_, _ = w.Write([]byte(`{"status":"succeeded"}`))
+		case "/healthz":
+			_, _ = w.Write([]byte(`{"version":"v1.0.0"}`))
+		}
+	}))
+	defer ts.Close()
+	c := &remoteClient{base: ts.URL, token: "tok", http: ts.Client()}
+	if code := c.daemonUpgrade(context.Background(), "v1.0.1", strings.Repeat("a", 64)); code != 1 {
+		t.Fatalf("a daemon still on the old version must exit 1, got %d", code)
 	}
 }
