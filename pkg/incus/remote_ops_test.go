@@ -181,3 +181,36 @@ func (f *fnExec) Run(_ context.Context, cmd string) (string, error) {
 func (f *fnExec) RunWithInput(context.Context, string, io.Reader) (string, error) { return "", nil }
 func (f *fnExec) WriteFile(context.Context, string, []byte, os.FileMode) error    { return nil }
 func (f *fnExec) Close() error                                                    { return nil }
+
+func TestEnsureVolumeCreatesShiftedVolumesAndLeavesExistingOnesAlone(t *testing.T) {
+	missing := func(cmd string) (string, error) {
+		if strings.HasPrefix(cmd, "incus storage volume show") {
+			return "", errors.New("not found")
+		}
+		return "", nil
+	}
+	for _, c := range []struct {
+		shifted bool
+		want    string
+	}{
+		{true, "incus storage volume create 'default' 'web-data' security.shifted=true"},
+		{false, "incus storage volume create 'default' 'web-data'"},
+	} {
+		ex := &fnExec{fn: missing}
+		if err := NewClient(ex).EnsureVolume(context.Background(), "default", "web-data", c.shifted); err != nil {
+			t.Fatal(err)
+		}
+		if last := ex.cmds[len(ex.cmds)-1]; last != c.want {
+			t.Fatalf("shifted=%v created with %q, want %q", c.shifted, last, c.want)
+		}
+	}
+	ex := &fnExec{fn: func(string) (string, error) { return "name: web-data\n", nil }}
+	if err := NewClient(ex).EnsureVolume(context.Background(), "default", "web-data", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range ex.cmds {
+		if strings.Contains(cmd, "create") || strings.Contains(cmd, "security.shifted") {
+			t.Fatalf("an existing volume must not be created or changed: %q", cmd)
+		}
+	}
+}

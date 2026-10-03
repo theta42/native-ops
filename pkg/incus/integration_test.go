@@ -129,10 +129,10 @@ func TestIntegrationClientHelpers(t *testing.T) {
 	}
 
 	// Volumes: create, attach (twice), list.
-	if err := c.EnsureVolume(ctx, "default", vol); err != nil {
+	if err := c.EnsureVolume(ctx, "default", vol, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.EnsureVolume(ctx, "default", vol); err != nil {
+	if err := c.EnsureVolume(ctx, "default", vol, true); err != nil {
 		t.Fatalf("EnsureVolume must be repeatable: %v", err)
 	}
 	vols, err := c.CustomVolumes(ctx, "local", "default")

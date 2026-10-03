@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadFleetConfig(t *testing.T) {
@@ -224,5 +226,15 @@ func TestDNSRecordsByZone(t *testing.T) {
 	}
 	if _, err := (&FleetConfig{DNSRecords: []DNSRecordConfig{{Type: "MX", Name: "inbound", Value: "x."}}}).DNSRecordsByZone(); err == nil {
 		t.Fatal("a record with no zone and no fleet.domain must be refused")
+	}
+}
+
+func TestVolumeShiftedDefaultsToTrue(t *testing.T) {
+	var svc ServiceConfig
+	if err := yaml.Unmarshal([]byte("name: web\nvolumes:\n  - name: a\n    path: /a\n  - name: b\n    path: /b\n    shifted: false\n"), &svc); err != nil {
+		t.Fatal(err)
+	}
+	if len(svc.Volumes) != 2 || !svc.Volumes[0].Shifted || svc.Volumes[1].Shifted || svc.Volumes[0].Name != "a" || svc.Volumes[1].Path != "/b" {
+		t.Fatalf("volumes: %+v (an omitted shifted is true, an explicit false is kept)", svc.Volumes)
 	}
 }

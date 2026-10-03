@@ -188,6 +188,14 @@ func TestLaunchingATenantThroughTheAdapterIsComplete(t *testing.T) {
 		t.Fatalf("the route, with the snippet the operator allowed:\n%s", site)
 	}
 
+	shifted := false
+	for _, m := range sim.mutations() {
+		shifted = shifted || strings.Contains(m, "incus storage volume create 'default' 'demo-multi-data' security.shifted=true")
+	}
+	if !shifted {
+		t.Fatalf("the tenant's volume must be created with security.shifted=true:\n%s", strings.Join(sim.mutations(), "\n"))
+	}
+
 	// Running it again changes nothing.
 	sim.reset()
 	if _, err := in.Launch(ctx, "demo-multi", spec, nil); err != nil {
