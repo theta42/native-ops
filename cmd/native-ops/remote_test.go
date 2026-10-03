@@ -297,3 +297,29 @@ func TestDaemonUpgradeReportsARollback(t *testing.T) {
 		t.Fatalf("a daemon still on the old version must exit 1, got %d", code)
 	}
 }
+
+func TestDeployPlanExitsByWhatTheTagWouldDo(t *testing.T) {
+	answer := ""
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/v1/deploy/plan" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(answer))
+	}))
+	defer ts.Close()
+	c := &remoteClient{base: ts.URL, token: "tok", http: ts.Client()}
+	sha := `"sha":"0123456789abcdef0123456789abcdef01234567","hash":"h","text":"web: update\n"`
+	for body, want := range map[string]int{
+		`{` + sha + `,"exit":2,"deployable":true}`:                           0,
+		`{` + sha + `,"exit":0,"deployable":true}`:                           0,
+		`{` + sha + `,"exit":1,"deployable":true}`:                           1,
+		`{` + sha + `,"exit":2,"deployable":false,"reason":"not protected"}`: 2,
+	} {
+		answer = body
+		if got := c.deployPlan(context.Background(), "deploy-1"); got != want {
+			t.Errorf("%s: exit %d, want %d", body, got, want)
+		}
+	}
+}

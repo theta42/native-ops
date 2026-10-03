@@ -63,6 +63,13 @@ apply as a job with a record. The daemon holds the host's credentials (Incus, th
 DNS provider); CI holds only scoped API tokens. See [docs/daemon.md](docs/daemon.md) and the example
 pipelines in [docs/ci-examples](docs/ci-examples).
 
+**Deploys, from CI or an AI agent.** Pushing a protected deploy tag is the approval; the daemon reads
+that commit from the git server and applies it as a job. The API previews a tag (`POST /v1/deploy/plan`),
+says what is live (`GET /v1/deploys`) and waits on jobs; the same operations are MCP tools at `/mcp`, so
+an agent (`claude mcp add --transport http native-ops https://<daemon>/mcp --header "Authorization:
+Bearer ..."`) can preview and run deploys with no more power than its token. Every endpoint is in the
+OpenAPI document the daemon serves at `/openapi.json`. See [docs/api.md](docs/api.md).
+
 ---
 
 ## Installation
@@ -462,7 +469,7 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
   keys, OIDC secret) go into the git server's secret store; CI pushes them to the daemon
   (`native-ops remote secret-sync`), which keeps them on the host. Nobody logs in to put them there.
 
-See [docs/daemon.md](docs/daemon.md).
+See [docs/daemon.md](docs/daemon.md), and [docs/api.md](docs/api.md) for deploys over the API and MCP.
 
 ---
 
