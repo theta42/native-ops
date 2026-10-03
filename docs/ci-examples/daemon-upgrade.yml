@@ -1,4 +1,7 @@
 name: Upgrade the daemon
+# Usually not needed: bump fleet.yml's `daemon:` pin and push a deploy tag, and the deploy upgrades the
+# daemon with no admin token in CI (docs/daemon.md). This is for a one-off upgrade outside a deploy.
+#
 # Moves the host's daemon to a pinned release. It needs an admin token, so it runs in a protected
 # environment. The checksum is the release's checksums.txt line for native-ops_<version>_linux_amd64.tar.gz.
 on:

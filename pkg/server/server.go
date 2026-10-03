@@ -65,6 +65,9 @@ type Options struct {
 	// own binary with a pinned release and restarts on it (see upgrade.go and pkg/selfupdate).
 	Upgrade UpgradeFunc
 	Restart RestartFunc
+	// ResumeFile, with Upgrade and Deploy, lets a deploy move the daemon to fleet.yml's `daemon` pin:
+	// the deploy upgrades, records itself here, restarts, and the new binary resumes it (see pin.go).
+	ResumeFile string
 	// Deploy, with Apply, enables POST /v1/deploy: apply the commit a protected deploy tag points at,
 	// read from the git server, with the tag as the approval (see deploy.go). DeployTags is the tag
 	// pattern, for the UI.

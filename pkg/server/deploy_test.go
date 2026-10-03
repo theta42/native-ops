@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -125,5 +127,175 @@ func TestAPlanMadeBeforeTheHostChangedIsStaleAndCannotBeApproved(t *testing.T) {
 	_, list := rig.do(t, "GET", "/v1/plans", rig.viewer)
 	if !strings.Contains(list, `"apply_enabled":true`) || !strings.Contains(list, `"state":"stale"`) {
 		t.Fatalf("plans list: %s", list)
+	}
+}
+
+const pinSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// pinRig is a deploy rig whose daemon runs version and can upgrade itself; upgrades and restarts are
+// recorded, not done.
+type pinRig struct {
+	*applyRig
+	src      *fakeSource
+	resume   string
+	upgrades []string
+	restarts chan struct{}
+}
+
+func newPinRig(t *testing.T, version, pinned string, canUpgrade bool) *pinRig {
+	fleet := "name: f\n"
+	if pinned != "" {
+		fleet += "daemon:\n  version: " + pinned + "\n  sha256: " + pinSHA + "\n"
+	}
+	p := &pinRig{
+		src:      &fakeSource{protected: true, tree: tgz(t, entry{name: "conf/fleet.yml", body: fleet}, entry{name: "conf/services/web/service.yml", body: "image: x\n"})},
+		resume:   filepath.Join(t.TempDir(), "deploy-resume.json"),
+		restarts: make(chan struct{}, 4),
+	}
+	p.applyRig = newApplyRigWith(t, func(o *Options) {
+		o.Deploy, o.DeployTags, o.Version = p.src, "deploy-*", version
+		if canUpgrade {
+			o.ResumeFile = p.resume
+			o.Upgrade = func(_ context.Context, v, sha string, _ func(string, ...any)) error {
+				p.upgrades = append(p.upgrades, v+" "+sha[:4])
+				return nil
+			}
+			o.Restart = func() { p.restarts <- struct{}{} }
+		}
+	})
+	return p
+}
+
+func (p *pinRig) deploy(t *testing.T, want JobStatus) Job {
+	t.Helper()
+	res, body := p.post(t, "/v1/deploy", p.deployerToken, "application/json", []byte(`{"tag":"deploy-1"}`))
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("%d %s", res.StatusCode, body)
+	}
+	return p.waitJob(t, jobID(t, body), want)
+}
+
+func (p *pinRig) appliedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.applied)
+}
+
+func TestADeployMovesTheDaemonToFleetYmlsPinFirst(t *testing.T) {
+	p := newPinRig(t, "v1.58.0", "v1.59.0", true)
+	j := p.deploy(t, JobSucceeded)
+	select {
+	case <-p.restarts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the daemon must restart onto the pinned version")
+	}
+	if len(p.upgrades) != 1 || p.upgrades[0] != "v1.59.0 aaaa" {
+		t.Fatalf("upgrades: %v", p.upgrades)
+	}
+	if p.appliedCount() != 0 {
+		t.Fatal("nothing may be applied by the old binary: the deploy resumes on the new one")
+	}
+	if !strings.Contains(j.Log, "pins the daemon at v1.59.0") {
+		t.Fatalf("log: %s", j.Log)
+	}
+	b, err := os.ReadFile(p.resume)
+	if err != nil || !strings.Contains(string(b), `"tag":"deploy-1"`) || !strings.Contains(string(b), `"version":"v1.59.0"`) {
+		t.Fatalf("resume record: %s %v", b, err)
+	}
+}
+
+func TestTheUpgradedDaemonResumesTheDeploy(t *testing.T) {
+	p := newPinRig(t, "v1.59.0", "v1.59.0", true)
+	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.59.0","actor":"ci-deploy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.serverUnderTest.ResumeDeploy()
+	j := p.waitLatest(t, JobSucceeded)
+	if p.appliedCount() != 1 || len(p.upgrades) != 0 || !strings.Contains(j.Log, "resumed on the upgraded daemon") {
+		t.Fatalf("applied %d, upgrades %v, log: %s", p.appliedCount(), p.upgrades, j.Log)
+	}
+	if _, err := os.Stat(p.resume); !os.IsNotExist(err) {
+		t.Fatal("the resume record is used once")
+	}
+}
+
+func TestARolledBackUpgradeRecordsTheDeployAsFailed(t *testing.T) {
+	p := newPinRig(t, "v1.58.0", "v1.59.0", true)
+	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.59.0","actor":"ci-deploy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.serverUnderTest.ResumeDeploy()
+	j := p.waitLatest(t, JobFailed)
+	if p.appliedCount() != 0 || len(p.upgrades) != 0 || !strings.Contains(j.Error, "rolled back") {
+		t.Fatalf("the old binary must not deploy or upgrade again: applied %d, upgrades %v, %+v", p.appliedCount(), p.upgrades, j)
+	}
+	if _, err := os.Stat(p.resume); !os.IsNotExist(err) {
+		t.Fatal("the resume record is used once")
+	}
+}
+
+func TestADeployOnThePinnedVersionJustDeploys(t *testing.T) {
+	p := newPinRig(t, "v1.59.0", "v1.59.0", true)
+	p.deploy(t, JobSucceeded)
+	if p.appliedCount() != 1 || len(p.upgrades) != 0 {
+		t.Fatalf("applied %d, upgrades %v", p.appliedCount(), p.upgrades)
+	}
+}
+
+func TestAPinTheDaemonCannotFollowDeploysNothing(t *testing.T) {
+	p := newPinRig(t, "v1.58.0", "v1.59.0", false)
+	j := p.deploy(t, JobFailed)
+	if p.appliedCount() != 0 || !strings.Contains(j.Error, "cannot upgrade itself") {
+		t.Fatalf("applied %d, %+v", p.appliedCount(), j)
+	}
+}
+
+func TestADevBuildIgnoresThePin(t *testing.T) {
+	p := newPinRig(t, "dev", "v1.59.0", true)
+	p.deploy(t, JobSucceeded)
+	if p.appliedCount() != 1 || len(p.upgrades) != 0 {
+		t.Fatalf("applied %d, upgrades %v", p.appliedCount(), p.upgrades)
+	}
+}
+
+func TestABadPinDeploysNothing(t *testing.T) {
+	p := newPinRig(t, "v1.58.0", "latest", true)
+	j := p.deploy(t, JobFailed)
+	if p.appliedCount() != 0 || len(p.upgrades) != 0 || !strings.Contains(j.Error, "daemon pin") {
+		t.Fatalf("applied %d, upgrades %v, %+v", p.appliedCount(), p.upgrades, j)
+	}
+}
+
+// waitLatest waits for the newest job to reach want (a resumed deploy is started by the daemon, not a
+// request, so there is no answer naming it).
+func (p *pinRig) waitLatest(t *testing.T, want JobStatus) Job {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if jobs := p.serverUnderTest.opts.Jobs.List(); len(jobs) > 0 {
+			return p.waitJob(t, string(jobs[0].ID), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no job was started")
+	return Job{}
+}
+
+func TestAPinOlderThanResumingDeploysNothing(t *testing.T) {
+	p := newPinRig(t, "v1.58.0", "v1.57.1", true)
+	j := p.deploy(t, JobFailed)
+	if p.appliedCount() != 0 || len(p.upgrades) != 0 || !strings.Contains(j.Error, "older than v1.58.0") {
+		t.Fatalf("applied %d, upgrades %v, %+v", p.appliedCount(), p.upgrades, j)
+	}
+}
+
+func TestReleaseBefore(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{{"v1.57.1", "v1.58.0", true}, {"v1.58.0", "v1.58.0", false}, {"v1.100.0", "v1.58.0", false}, {"v2.0.0", "v1.99.9", false}, {"dev", "v1.58.0", false}} {
+		if got := releaseBefore(c.a, c.b); got != c.want {
+			t.Errorf("releaseBefore(%s, %s) = %v", c.a, c.b, got)
+		}
 	}
 }

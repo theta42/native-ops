@@ -14,7 +14,7 @@ talks to the daemon with `native-ops remote`; none of them holds an SSH key or a
 | `edge.yml` | a change to `edge/`: apply the edge Caddyfile | `deployer` |
 | `maintenance.yml` | nightly: back up volumes with retention, sync DNS | `deployer` |
 | `deploy.yml` | a pushed `deploy-*` tag: deploy that commit (the daemon fetches it) | `deployer` |
-| `daemon-upgrade.yml` | manual: move the daemon to a pinned release | admin (protected environment) |
+| `daemon-upgrade.yml` | manual, one-off: move the daemon to a release. Usually not needed: bump `fleet.yml`'s `daemon:` pin and push a deploy tag (docs/daemon.md) | admin (protected environment) |
 
 Create the tokens once with the bootstrap admin token (no shell on the host needed):
 
