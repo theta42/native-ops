@@ -501,6 +501,8 @@ records the deploy as failed instead of running it. So a daemon upgrade is a rev
 - A daemon that cannot upgrade itself (its binary is not in `<state-dir>/bin`) refuses a deploy that
   pins another version, rather than deploy a commit written for a different release.
 - A development build (`dev`, not a release tag) leaves the pin alone.
+- A pin older than v1.58.0 is refused: those releases cannot resume the deploy. Move an older daemon
+  with `remote daemon-upgrade` once.
 - Without a `daemon:` section, deploys never change the daemon.
 
 For a one-off upgrade outside a deploy, an admin can call the endpoint directly:

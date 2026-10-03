@@ -182,31 +182,31 @@ func (p *pinRig) appliedCount() int {
 }
 
 func TestADeployMovesTheDaemonToFleetYmlsPinFirst(t *testing.T) {
-	p := newPinRig(t, "v1.0.0", "v1.1.0", true)
+	p := newPinRig(t, "v1.58.0", "v1.59.0", true)
 	j := p.deploy(t, JobSucceeded)
 	select {
 	case <-p.restarts:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the daemon must restart onto the pinned version")
 	}
-	if len(p.upgrades) != 1 || p.upgrades[0] != "v1.1.0 aaaa" {
+	if len(p.upgrades) != 1 || p.upgrades[0] != "v1.59.0 aaaa" {
 		t.Fatalf("upgrades: %v", p.upgrades)
 	}
 	if p.appliedCount() != 0 {
 		t.Fatal("nothing may be applied by the old binary: the deploy resumes on the new one")
 	}
-	if !strings.Contains(j.Log, "pins the daemon at v1.1.0") {
+	if !strings.Contains(j.Log, "pins the daemon at v1.59.0") {
 		t.Fatalf("log: %s", j.Log)
 	}
 	b, err := os.ReadFile(p.resume)
-	if err != nil || !strings.Contains(string(b), `"tag":"deploy-1"`) || !strings.Contains(string(b), `"version":"v1.1.0"`) {
+	if err != nil || !strings.Contains(string(b), `"tag":"deploy-1"`) || !strings.Contains(string(b), `"version":"v1.59.0"`) {
 		t.Fatalf("resume record: %s %v", b, err)
 	}
 }
 
 func TestTheUpgradedDaemonResumesTheDeploy(t *testing.T) {
-	p := newPinRig(t, "v1.1.0", "v1.1.0", true)
-	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.1.0","actor":"ci-deploy"}`), 0o600); err != nil {
+	p := newPinRig(t, "v1.59.0", "v1.59.0", true)
+	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.59.0","actor":"ci-deploy"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	p.serverUnderTest.ResumeDeploy()
@@ -220,8 +220,8 @@ func TestTheUpgradedDaemonResumesTheDeploy(t *testing.T) {
 }
 
 func TestARolledBackUpgradeRecordsTheDeployAsFailed(t *testing.T) {
-	p := newPinRig(t, "v1.0.0", "v1.1.0", true)
-	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.1.0","actor":"ci-deploy"}`), 0o600); err != nil {
+	p := newPinRig(t, "v1.58.0", "v1.59.0", true)
+	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.59.0","actor":"ci-deploy"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	p.serverUnderTest.ResumeDeploy()
@@ -235,7 +235,7 @@ func TestARolledBackUpgradeRecordsTheDeployAsFailed(t *testing.T) {
 }
 
 func TestADeployOnThePinnedVersionJustDeploys(t *testing.T) {
-	p := newPinRig(t, "v1.1.0", "v1.1.0", true)
+	p := newPinRig(t, "v1.59.0", "v1.59.0", true)
 	p.deploy(t, JobSucceeded)
 	if p.appliedCount() != 1 || len(p.upgrades) != 0 {
 		t.Fatalf("applied %d, upgrades %v", p.appliedCount(), p.upgrades)
@@ -243,7 +243,7 @@ func TestADeployOnThePinnedVersionJustDeploys(t *testing.T) {
 }
 
 func TestAPinTheDaemonCannotFollowDeploysNothing(t *testing.T) {
-	p := newPinRig(t, "v1.0.0", "v1.1.0", false)
+	p := newPinRig(t, "v1.58.0", "v1.59.0", false)
 	j := p.deploy(t, JobFailed)
 	if p.appliedCount() != 0 || !strings.Contains(j.Error, "cannot upgrade itself") {
 		t.Fatalf("applied %d, %+v", p.appliedCount(), j)
@@ -251,7 +251,7 @@ func TestAPinTheDaemonCannotFollowDeploysNothing(t *testing.T) {
 }
 
 func TestADevBuildIgnoresThePin(t *testing.T) {
-	p := newPinRig(t, "dev", "v1.1.0", true)
+	p := newPinRig(t, "dev", "v1.59.0", true)
 	p.deploy(t, JobSucceeded)
 	if p.appliedCount() != 1 || len(p.upgrades) != 0 {
 		t.Fatalf("applied %d, upgrades %v", p.appliedCount(), p.upgrades)
@@ -259,7 +259,7 @@ func TestADevBuildIgnoresThePin(t *testing.T) {
 }
 
 func TestABadPinDeploysNothing(t *testing.T) {
-	p := newPinRig(t, "v1.0.0", "latest", true)
+	p := newPinRig(t, "v1.58.0", "latest", true)
 	j := p.deploy(t, JobFailed)
 	if p.appliedCount() != 0 || len(p.upgrades) != 0 || !strings.Contains(j.Error, "daemon pin") {
 		t.Fatalf("applied %d, upgrades %v, %+v", p.appliedCount(), p.upgrades, j)
@@ -279,4 +279,23 @@ func (p *pinRig) waitLatest(t *testing.T, want JobStatus) Job {
 	}
 	t.Fatal("no job was started")
 	return Job{}
+}
+
+func TestAPinOlderThanResumingDeploysNothing(t *testing.T) {
+	p := newPinRig(t, "v1.58.0", "v1.57.1", true)
+	j := p.deploy(t, JobFailed)
+	if p.appliedCount() != 0 || len(p.upgrades) != 0 || !strings.Contains(j.Error, "older than v1.58.0") {
+		t.Fatalf("applied %d, upgrades %v, %+v", p.appliedCount(), p.upgrades, j)
+	}
+}
+
+func TestReleaseBefore(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{{"v1.57.1", "v1.58.0", true}, {"v1.58.0", "v1.58.0", false}, {"v1.100.0", "v1.58.0", false}, {"v2.0.0", "v1.99.9", false}, {"dev", "v1.58.0", false}} {
+		if got := releaseBefore(c.a, c.b); got != c.want {
+			t.Errorf("releaseBefore(%s, %s) = %v", c.a, c.b, got)
+		}
+	}
 }

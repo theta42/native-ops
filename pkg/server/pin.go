@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/theta42/native-ops/pkg/config"
@@ -25,7 +26,27 @@ import (
 // run on the version the commit pins. If the new binary does not stay up, the unit's guard puts the old
 // one back, and that one records the deploy as failed instead of running it.
 
-var releaseRe = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+var releaseRe = regexp.MustCompile(`^v([0-9]+)\.([0-9]+)\.([0-9]+)$`)
+
+// firstResumingRelease is the first release that resumes a deploy after upgrading to a pin. A pin to an
+// older one is refused: that binary would never resume the deploy.
+const firstResumingRelease = "v1.58.0"
+
+// releaseBefore reports whether release a is older than b (both vX.Y.Z).
+func releaseBefore(a, b string) bool {
+	ma, mb := releaseRe.FindStringSubmatch(a), releaseRe.FindStringSubmatch(b)
+	if ma == nil || mb == nil {
+		return false
+	}
+	for i := 1; i <= 3; i++ {
+		x, _ := strconv.Atoi(ma[i])
+		y, _ := strconv.Atoi(mb[i])
+		if x != y {
+			return x < y
+		}
+	}
+	return false
+}
 
 type deployResume struct {
 	Tag     string    `json:"tag"`
@@ -56,6 +77,8 @@ func (s *Server) followPin(ctx context.Context, root, tag, actor string, resumed
 	case !releaseRe.MatchString(running):
 		logf("fleet.yml pins the daemon at %s; this daemon is a %q build, which is left as it is", pin.Version, running)
 		return false, nil
+	case releaseBefore(pin.Version, firstResumingRelease):
+		return false, fmt.Errorf("fleet.yml pins the daemon at %s, older than %s, the first release that resumes a deploy after upgrading; raise the pin (or remove it), so nothing was deployed", pin.Version, firstResumingRelease)
 	case resumed:
 		return false, fmt.Errorf("fleet.yml pins the daemon at %s, but after upgrading it is %s, so nothing was deployed", pin.Version, running)
 	case s.opts.Upgrade == nil || s.opts.ResumeFile == "":
