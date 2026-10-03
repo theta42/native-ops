@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -175,6 +176,22 @@ func (s *TokenStore) reload(force bool) error {
 	return nil
 }
 
+// ownerOf returns the uid/gid that should own the token file: the existing file's owner when it exists,
+// else the parent directory's (the daemon's state dir, owned by the daemon's user). ok is false when
+// neither can be read.
+func ownerOf(paths ...string) (uid, gid int, ok bool) {
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			return int(st.Uid), int(st.Gid), true
+		}
+	}
+	return 0, 0, false
+}
+
 func (s *TokenStore) save() error {
 	data, err := json.MarshalIndent(struct {
 		Tokens []Token `json:"tokens"`
@@ -189,6 +206,13 @@ func (s *TokenStore) save() error {
 	defer os.Remove(tmp.Name())
 	if err := tmp.Chmod(0o600); err != nil {
 		return err
+	}
+	// The temp file is owned by whoever runs this (root, for a token command on the host). Keep the
+	// file's ownership in step with the daemon that must read it: the existing file's owner, else the
+	// state directory's. Otherwise a root write leaves a 0600 file the native-ops user cannot read, and
+	// the daemon crash-loops on the next restart.
+	if uid, gid, ok := ownerOf(s.path, filepath.Dir(s.path)); ok {
+		_ = tmp.Chown(uid, gid) // best effort: a non-root writer to its own file is already correct
 	}
 	if _, err := tmp.Write(data); err != nil {
 		return err
