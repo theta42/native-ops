@@ -410,15 +410,40 @@ func (c *remoteClient) uploadAndWait(ctx context.Context, path, dir string, q ur
 }
 
 // wait polls a job until it ends and prints its log (when the token may read it). It returns 0 when the
-// job succeeded.
+// job succeeded. A deploy that upgrades the daemon ends as succeeded (ResultDaemonUpgraded) just before
+// the daemon restarts, so the wait tolerates the restart: transport errors and 5xx (the proxy's 502 while
+// the daemon is down) are retried for a few minutes rather than failing the deploy.
 func (c *remoteClient) wait(ctx context.Context, id string) int {
+	const maxTransient = 80 // ~4 minutes at 3s: the daemon restarts and resumes within seconds
+	transient := 0
 	for {
 		var job struct {
 			Status string `json:"status"`
 			Error  string `json:"error"`
 			Log    string `json:"log"`
 		}
-		code, raw := c.json(ctx, "GET", "/v1/jobs/"+url.PathEscape(id)+"?wait=30", nil, &job)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/jobs/"+url.PathEscape(id)+"?wait=30", nil)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		code, raw, err := c.try(req, &job)
+		if err != nil || code >= 500 {
+			transient++
+			if transient > maxTransient {
+				if err != nil {
+					fatalf("reading job %s: %v", id, err)
+				}
+				fatalf("reading job %s: the daemon answered %d: %s", id, code, raw)
+			}
+			select {
+			case <-ctx.Done():
+				fmt.Fprintf(os.Stderr, "gave up waiting for job %s (the daemon is unreachable)\n", id)
+				return 1
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+		transient = 0
 		if code != http.StatusOK {
 			fatalf("reading job %s: the daemon answered %d: %s", id, code, raw)
 		}
