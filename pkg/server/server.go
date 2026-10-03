@@ -390,6 +390,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("GET /v1/users", s.auth(RoleAdmin, s.handleUserList))
 		mux.Handle("POST /v1/users", s.auth(RoleAdmin, s.handleUserCreate))
 		mux.Handle("PATCH /v1/users/{username}", s.auth(RoleAdmin, s.handleUserUpdate))
+		mux.Handle("PUT /v1/users/by-email/{email}", s.auth(RoleAdmin, s.handleUserUpsertByEmail))
 	}
 	if s.opts.Plan != nil {
 		mux.Handle("POST /v1/plan", s.auth(RolePlanner, s.handlePlan))

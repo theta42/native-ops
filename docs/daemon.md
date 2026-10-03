@@ -39,6 +39,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `GET/PUT /v1/secrets`, `DELETE /v1/secrets/{name}` | admin | the daemon's own credentials, pushed from the git server's secret store; names only are ever returned |
 | `GET/POST /v1/tokens`, `DELETE /v1/tokens/{id}` | admin | list, create (the secret is returned once) and revoke API tokens |
 | `GET/POST /v1/users`, `PATCH /v1/users/{username}` | admin | list and create local users; change a role, disable, or set a password (with `--enable-auth` or OIDC) |
+| `PUT /v1/users/by-email/{email}` | admin | give the user with this email a role (and `disabled`), creating it to sign in over OIDC if there is none: how a directory grants access before a first sign-in and removes it after someone leaves |
 | `GET /v1/images/recipes`, `POST /v1/images/recipes/{digest}/approve`, `DELETE /v1/images/recipes/{digest}/approval` | admin | the image recipes builds were asked for, and approving or withdrawing one (with `--enable-image-build`) |
 | `PUT /v1/instances/{name}`, `POST /v1/instances/{name}/update`, `DELETE /v1/instances/{name}` | deployer | create, move to another image, or remove a tenant instance, as a job (only with `--enable-instances`) |
 | `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
@@ -454,7 +455,9 @@ on instead, so people reach the console without holding a token:
   `--oidc-client-secret`, `--oidc-redirect-url`, and optional `--oidc-allowed-domain`, `--oidc-role` and
   `--oidc-label`. Discovery, the authorization redirect, the code exchange and the userinfo call are all
   the daemon's; a person is matched to a local user by their verified email (created at `--oidc-role` on
-  first sight).
+  first sight). With `--oidc-role none` nobody is created: only a user that already exists may sign in,
+  so access is granted ahead of time, by an admin or by a directory such as a staff app, with
+  `PUT /v1/users/by-email/{email} {"role": "deployer"}` (and taken away with `"disabled": true`).
 
 Either way a sign-in sets an HttpOnly session cookie (HMAC-signed with a key in the state dir), and the
 UI calls the API with it. API tokens keep working unchanged, for CI and machines.

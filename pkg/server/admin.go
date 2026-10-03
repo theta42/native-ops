@@ -102,6 +102,46 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"user": PublicUser(u)})
 }
 
+// handleUserUpsertByEmail is PUT /v1/users/by-email/{email} {role, name?, disabled?} (admin): the user
+// with this email gets this role (and disabled flag), and is created, with no password, to sign in over
+// OIDC if there is none. A directory that owns who may sign in (crew, say) keeps everyone's access in step
+// with it this way, before their first sign-in and after they leave. An admin may not demote or disable
+// the account they are signed in with.
+func (s *Server) handleUserUpsertByEmail(w http.ResponseWriter, r *http.Request) {
+	email := strings.ToLower(strings.TrimSpace(r.PathValue("email")))
+	var body struct {
+		Role     Role   `json:"role"`
+		Name     string `json:"name,omitempty"`
+		Disabled *bool  `json:"disabled,omitempty"`
+	}
+	if !readJSON(w, r, &body) {
+		return
+	}
+	if self, _, ok := s.sessionUser(r); ok && (body.Role != RoleAdmin || (body.Disabled != nil && *body.Disabled)) {
+		if users, err := s.opts.Users.List(); err == nil {
+			for _, u := range users {
+				if u.Username == self && u.Email == email {
+					writeError(w, http.StatusConflict, "self", "you cannot demote or disable the account you are signed in with")
+					return
+				}
+			}
+		}
+	}
+	u, created, err := s.opts.Users.UpsertByEmail(email, body.Name, body.Role, body.Disabled)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	verb, code := "updated", http.StatusOK
+	if created {
+		verb, code = "created", http.StatusCreated
+	}
+	auditDetail(r, "user %s by email %s role=%s disabled=%v", verb, u.Username, u.Role, u.Disabled)
+	out := PublicUser(u)
+	out["email"], out["disabled"] = u.Email, u.Disabled
+	writeJSON(w, code, map[string]any{"user": out, "created": created})
+}
+
 // handleUserUpdate is PATCH /v1/users/{username}. An admin may not demote or disable the account they
 // are signed in with, so the last way in is never closed by accident.
 func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request) {

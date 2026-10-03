@@ -265,8 +265,13 @@ func (s *UserStore) SetDisabled(username string, disabled bool) error {
 	return s.save()
 }
 
+// ErrNoAccount is FindOrCreateOIDC's answer for an email with no user when new users are not created
+// (the OIDC role is "none": only accounts an admin, or a directory such as crew, made may sign in).
+var ErrNoAccount = errors.New("no account for this email")
+
 // FindOrCreateOIDC returns the OIDC user with this verified email, creating one at the given role on
 // first sight. An email that already belongs to a local user is linked to OIDC rather than duplicated.
+// With the role OIDCRoleNone nobody is created: an unknown email is ErrNoAccount.
 func (s *UserStore) FindOrCreateOIDC(email, name string, role Role) (User, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	username := usernameForEmail(email)
@@ -289,11 +294,10 @@ func (s *UserStore) FindOrCreateOIDC(email, name string, role Role) (User, error
 			return u, nil
 		}
 	}
-	base := username
-	for n := 2; s.find(base) >= 0; n++ {
-		base = fmt.Sprintf("%s-%d", username, n)
+	if role == OIDCRoleNone {
+		return User{}, ErrNoAccount
 	}
-	u := User{Username: base, Name: name, Role: role, Provider: ProviderOIDC, Email: email, Created: time.Now().UTC()}
+	u := User{Username: s.freeUsername(username), Name: name, Role: role, Provider: ProviderOIDC, Email: email, Created: time.Now().UTC()}
 	s.users = append(s.users, u)
 	if err := s.save(); err != nil {
 		return User{}, err
@@ -301,6 +305,61 @@ func (s *UserStore) FindOrCreateOIDC(email, name string, role Role) (User, error
 	u.Hash = ""
 	return u, nil
 }
+
+// freeUsername is base, or base-2, base-3... if it is taken. The caller holds the lock.
+func (s *UserStore) freeUsername(base string) string {
+	name := base
+	for n := 2; s.find(name) >= 0; n++ {
+		name = fmt.Sprintf("%s-%d", base, n)
+	}
+	return name
+}
+
+// UpsertByEmail makes the user with this email have role (and, when disabled is set, that disabled
+// flag), creating an OIDC user with no password if there is none. It is how an admin, or a directory
+// that owns who may sign in, grants access before the person's first sign-in. It reports whether the
+// user was created.
+func (s *UserStore) UpsertByEmail(email, name string, role Role, disabled *bool) (User, bool, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if !emailRe.MatchString(email) {
+		return User{}, false, fmt.Errorf("%q is not an email address", email)
+	}
+	if !ValidRole(role) {
+		return User{}, false, fmt.Errorf("role must be viewer, planner, deployer or admin")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.reload(false); err != nil {
+		return User{}, false, err
+	}
+	created := false
+	i := -1
+	for j := range s.users {
+		if s.users[j].Email == email {
+			i = j
+			break
+		}
+	}
+	if i < 0 {
+		s.users = append(s.users, User{Username: s.freeUsername(usernameForEmail(email)), Name: strings.TrimSpace(name), Provider: ProviderOIDC, Email: email, Created: time.Now().UTC()})
+		i, created = len(s.users)-1, true
+	}
+	s.users[i].Role = role
+	if name = strings.TrimSpace(name); name != "" {
+		s.users[i].Name = name
+	}
+	if disabled != nil {
+		s.users[i].Disabled = *disabled
+	}
+	if err := s.save(); err != nil {
+		return User{}, false, err
+	}
+	u := s.users[i]
+	u.Hash = ""
+	return u, created, nil
+}
+
+var emailRe = regexp.MustCompile(`^[^@\s]{1,64}@[a-z0-9.-]{1,190}\.[a-z]{2,}$`)
 
 func usernameForEmail(email string) string {
 	local := email

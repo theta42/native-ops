@@ -136,7 +136,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	oidcClientSecret := flags.String("oidc-client-secret", os.Getenv("NATIVE_OPS_OIDC_CLIENT_SECRET"), "OIDC client secret; better synced to the secret store as NATIVE_OPS_OIDC_CLIENT_SECRET (read at each sign-in). Env: NATIVE_OPS_OIDC_CLIENT_SECRET")
 	oidcRedirectURL := flags.String("oidc-redirect-url", os.Getenv("NATIVE_OPS_OIDC_REDIRECT_URL"), "OIDC redirect URL (e.g. https://native-ops.example/auth/oidc/callback). Env: NATIVE_OPS_OIDC_REDIRECT_URL")
 	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. example.com). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
-	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin. Env: NATIVE_OPS_OIDC_ROLE")
+	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin; none creates nobody, so only users that already exist (PUT /v1/users/by-email) may sign in. Env: NATIVE_OPS_OIDC_ROLE")
 	oidcLabel := flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
 	edgeContainer := flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
 	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from for the status page, e.g. digitalocean (DO_API_TOKEN from the secret store, else the environment). Env: NATIVE_OPS_DNS_PROVIDER")
@@ -396,7 +396,9 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		opts.OIDC = oidc
 		if cfg.OIDC.AllowedDomain == "" {
-			log.Printf("warning: OIDC sign-in has no --oidc-allowed-domain: anyone the identity provider vouches for may sign in, as %s", oidc.Role)
+			if oidc.Role != server.OIDCRoleNone {
+				log.Printf("warning: OIDC sign-in has no --oidc-allowed-domain: anyone the identity provider vouches for may sign in, as %s", oidc.Role)
+			}
 		}
 	}
 	srv, err := server.New(opts)
