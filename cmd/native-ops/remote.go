@@ -370,17 +370,37 @@ func (c *remoteClient) json(ctx context.Context, method, path string, in, out an
 }
 
 func (c *remoteClient) do(req *http.Request, out any) (int, string) {
+	code, raw, err := c.try(req, out)
+	if err != nil {
+		fatalf("%s %s: %v", req.Method, req.URL.Path, err)
+	}
+	return code, raw
+}
+
+// try is do without giving up on a request that does not reach the daemon, for the waits that expect it
+// to be restarting.
+func (c *remoteClient) try(req *http.Request, out any) (int, string, error) {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	res, err := c.http.Do(req)
 	if err != nil {
-		fatalf("%s %s: %v", req.Method, req.URL.Path, err)
+		return 0, "", err
 	}
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if out != nil {
 		_ = json.Unmarshal(raw, out)
 	}
-	return res.StatusCode, strings.TrimSpace(string(raw))
+	return res.StatusCode, strings.TrimSpace(string(raw)), nil
+}
+
+// tryGet is a GET through try.
+func (c *remoteClient) tryGet(ctx context.Context, path string, out any) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
+	if err != nil {
+		return 0, err
+	}
+	code, _, err := c.try(req, out)
+	return code, err
 }
 
 // packTree makes the gzip-compressed tar the daemon accepts: the regular files and directories under
@@ -469,34 +489,65 @@ func (c *remoteClient) daemonUpgrade(ctx context.Context, version, sha string) i
 		fatalf("the daemon answered %d: %s", code, raw)
 	}
 	fmt.Printf("upgrading the daemon from %s to %s (job %s)\n", out.From, version, out.Job.ID)
-	if rc := c.wait(ctx, out.Job.ID); rc != 0 {
-		return rc
-	}
-	// The guard gives a new binary a few starts before it restores the old one, so wait long enough to
-	// see either outcome, and report the version that is actually running.
-	deadline := time.Now().Add(3 * time.Minute)
-	last := ""
+
+	// The daemon exits to restart on the new binary as soon as the install job succeeds, so from here a
+	// request that cannot reach it means it is restarting, not that anything failed. Follow the job while
+	// it answers; then wait for /healthz to report a version. The unit's guard gives a new binary a few
+	// starts before it restores the old one, so the window is long enough to see either outcome.
+	deadline := time.Now().Add(upgradeWindow)
+	jobDone, last := false, ""
 	for time.Now().Before(deadline) {
-		var h struct {
-			Version string `json:"version"`
-		}
-		if code, _ := c.json(ctx, "GET", "/healthz", nil, &h); code == http.StatusOK {
-			if h.Version == version {
-				fmt.Printf("the daemon is running %s\n", version)
-				return 0
+		if !jobDone {
+			var job struct {
+				Status string `json:"status"`
+				Error  string `json:"error"`
+				Log    string `json:"log"`
 			}
-			last = h.Version
+			code, err := c.tryGet(ctx, "/v1/jobs/"+url.PathEscape(out.Job.ID), &job)
+			switch {
+			case err != nil || code == http.StatusServiceUnavailable || code == http.StatusBadGateway:
+				fmt.Println("the daemon is restarting")
+				jobDone = true
+			case code != http.StatusOK:
+				fmt.Fprintf(os.Stderr, "reading job %s: the daemon answered %d\n", out.Job.ID, code)
+				return 1
+			case job.Status == "succeeded":
+				printLog(job.Log)
+				jobDone = true
+			case job.Status == "failed" || job.Status == "interrupted":
+				printLog(job.Log)
+				fmt.Fprintf(os.Stderr, "job %s %s: %s\n", out.Job.ID, job.Status, job.Error)
+				return 1
+			}
+		}
+		if jobDone {
+			var h struct {
+				Version string `json:"version"`
+			}
+			if code, err := c.tryGet(ctx, "/healthz", &h); err == nil && code == http.StatusOK && h.Version != "" {
+				if h.Version == version {
+					fmt.Printf("the daemon is running %s\n", version)
+					return 0
+				}
+				last = h.Version
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return 1
-		case <-time.After(3 * time.Second):
+		case <-time.After(upgradePoll):
 		}
 	}
 	if last == out.From {
 		fmt.Fprintf(os.Stderr, "the daemon is still on %s: the new binary did not stay up and was rolled back (see journalctl -u native-ops-serve)\n", last)
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "the daemon did not report %s within 3 minutes\n", version)
+	fmt.Fprintf(os.Stderr, "the daemon did not report %s within %s\n", version, upgradeWindow)
 	return 1
 }
+
+// How daemon-upgrade waits for the restart (variables so tests can shorten them).
+var (
+	upgradeWindow = 5 * time.Minute
+	upgradePoll   = 3 * time.Second
+)
