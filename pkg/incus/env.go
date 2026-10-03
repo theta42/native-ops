@@ -75,3 +75,42 @@ func MergeEnv(live, declared map[string]string) (merged map[string]string, chang
 	}
 	return merged, changed
 }
+
+// SetEnvKeys returns an environment file with the given keys set: a line for a key that is already there
+// is replaced (and any later duplicate dropped), keys that are not there are appended in sorted order, and
+// every other line -- comments, keys not mentioned -- is kept as it was.
+func SetEnvKeys(text string, set map[string]string) string {
+	if len(set) == 0 {
+		return text
+	}
+	done := map[string]bool{}
+	var out []string
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	if text == "" {
+		lines = nil
+	}
+	for _, line := range lines {
+		k, _, ok := strings.Cut(strings.TrimSpace(line), "=")
+		k = strings.TrimSpace(k)
+		if v, want := set[k]; ok && want && !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			if done[k] {
+				continue
+			}
+			out = append(out, k+"="+v)
+			done[k] = true
+			continue
+		}
+		out = append(out, line)
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		if !done[k] {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+set[k])
+	}
+	return strings.Join(out, "\n") + "\n"
+}

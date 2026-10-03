@@ -256,7 +256,7 @@ curl -X PUT "$URL/v1/instances/demo-one" -H "Authorization: Bearer $TOKEN" -d '{
 `/etc/default/<service>`, the unit started once the environment is there, health gate, route), or resumes and
 converges the one an earlier call created, so it is safe to repeat. `update` moves it to another image through
 the safe path (volume snapshot first, environment carried over, health-gated, rolled back on failure).
-`resize` is a live `limits.cpu`/`limits.memory` change (no restart, no image change). `suspend` (`{domain,
+`update` (`{image, service, health?, env?}`) may also set keys in the carried-over environment file -- `env: {"RELEASE_TAG": "v1.2.3"}` for a service that reports the release it runs -- keeping every other key; a rollback restores the file as it was. `resize` is a live `limits.cpu`/`limits.memory` change (no restart, no image change). `suspend` (`{domain,
 reason,route_directives?}`) replaces the published route with a static 503 naming `reason`, without
 stopping or otherwise touching the instance; there is deliberately no `unsuspend` -- `PUT` always
 republishes the normal route, whatever was there before, so asking for the instance again is how a
