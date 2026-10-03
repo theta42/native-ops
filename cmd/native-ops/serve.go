@@ -184,7 +184,13 @@ func handleServeCommand(ctx context.Context, args []string) {
 	defer cancel()
 	go func() { <-restartCtx.Done(); cancel() }()
 	if managedBinDir(binDir) != "" {
-		go selfupdate.Commit(ctx, binDir, log.Printf)
+		go func() {
+			// A deploy that upgraded the daemon to fleet.yml's pin resumes once the upgrade has committed.
+			selfupdate.Commit(ctx, binDir, log.Printf)
+			if ctx.Err() == nil {
+				srv.ResumeDeploy()
+			}
+		}()
 	}
 	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v, self-upgrade: %v)", Version, *addr, *stateDir, *enableApply, managedBinDir(binDir) != "")
 	if err := srv.ListenAndServe(ctx); err != nil {
@@ -329,6 +335,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		if cfg.SelfUpgradeDir != "" {
 			up := &selfupdate.Updater{Dir: cfg.SelfUpgradeDir, ReleaseBase: cfg.ReleaseBase}
 			opts.Upgrade, opts.Restart = up.Install, cfg.Restart
+			opts.ResumeFile = filepath.Join(cfg.StateDir, "deploy-resume.json")
 		}
 		if cfg.EnableBackup {
 			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup), restoreSource(cfg.Exec, cfg.Pool, lookup)

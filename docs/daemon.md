@@ -221,6 +221,9 @@ NATIVE_OPS_TOKEN=$DEPLOY_TOKEN native-ops remote deploy --tag deploy-2026.10.03
 3. plans it, refusing a blocked plan, and records the plan as approved by the tag and used by the job;
 4. applies it. A plan with nothing to change ends the job without applying.
 
+If the commit's `fleet.yml` pins another daemon version (`daemon:`), the job upgrades the daemon to it
+first and the deploy resumes on the new binary (see [Upgrading the daemon](#upgrading-the-daemon-from-ci)).
+
 The protected tag is the approval, in place of an admin approving a plan in the UI (which still works
 for one-off applies). The daemon reads the repository with a token synced as `NATIVE_OPS_GIT_TOKEN`:
 it needs to read the repository and its tag protections, which on Gitea means a user who is an admin of
@@ -476,7 +479,31 @@ with the daemon bound to the bridge address, or `127.0.0.1` if Caddy runs on the
 
 ### Upgrading the daemon (from CI)
 
-The daemon upgrades itself, so nobody logs in to the host for that either:
+The daemon upgrades itself, so nobody logs in to the host for that either. The usual way is **the
+`daemon:` pin in `fleet.yml`, deployed with a tag**:
+
+```yaml
+# fleet.yml
+daemon:
+  version: v1.58.0
+  sha256: <the linux_amd64 tarball's line in the release's checksums.txt>
+```
+
+The same pin is what cloud-init installs on a host that `reconcile` creates. On a running daemon, a
+deploy whose commit pins another version upgrades first: it installs the pinned release (steps 2 to 4
+below), records the deploy in `<state-dir>/deploy-resume.json`, and restarts. Once the new binary's
+upgrade has committed, it resumes the deploy as a new job, so the plan and the apply run on the version
+the commit pins. If the new binary does not stay up, the guard puts the old one back, and that one
+records the deploy as failed instead of running it. So a daemon upgrade is a reviewed change to
+`fleet.yml` and a protected tag, like any other change, and no CI job needs an admin token for it.
+
+- The deploy's job log says what it did; the resumed job is a second `deploy` job for the same tag.
+- A daemon that cannot upgrade itself (its binary is not in `<state-dir>/bin`) refuses a deploy that
+  pins another version, rather than deploy a commit written for a different release.
+- A development build (`dev`, not a release tag) leaves the pin alone.
+- Without a `daemon:` section, deploys never change the daemon.
+
+For a one-off upgrade outside a deploy, an admin can call the endpoint directly:
 
 ```bash
 NATIVE_OPS_TOKEN=$ADMIN_TOKEN native-ops remote daemon-upgrade --version v1.56.0 --sha256 <from checksums.txt>
@@ -525,6 +552,7 @@ Everything the daemon keeps is in `--state-dir` (default `/var/lib/native-ops`, 
 | `recipes.json` | image recipes asked for, and which an admin approved |
 | `audit.log` | one JSON line per request and per finished job (never a value or credential) |
 | `bin/` | the daemon's binary, the previous one, and the upgrade markers (see above) |
+| `deploy-resume.json` | a deploy that upgraded the daemon to `fleet.yml`'s pin, until the new binary resumes it |
 
 All files are 0600. Back the directory up if losing approvals, job history or users matters to you;
 tokens and secrets can be re-created from the git server.

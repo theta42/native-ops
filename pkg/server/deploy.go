@@ -40,30 +40,52 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "tag is required")
 		return
 	}
+	actor, _ := s.actorScope(r)
+	job, err := s.startDeploy(body.Tag, actor, false)
+	var busy errBusy
+	switch {
+	case errors.As(err, &busy):
+		writeError(w, http.StatusConflict, "busy", busy.Error())
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was deployed")
+		return
+	}
+	auditDetail(r, "deploy %s job=%s", body.Tag, job.ID)
+	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
+	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "tag": body.Tag})
+}
+
+type errBusy string
+
+func (e errBusy) Error() string { return string(e) }
+
+// startDeploy starts the deploy job for a tag. resumed is a deploy that an upgrade to fleet.yml's
+// daemon pin interrupted, now running on the new binary: it never upgrades again.
+func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 	if !s.applyMu.TryLock() {
 		msg := "another change is already running on this host"
 		if j, ok := s.opts.Jobs.Running(); ok {
 			msg += " (" + string(j.ID) + ")"
 		}
-		writeError(w, http.StatusConflict, "busy", msg)
-		return
+		return Job{}, errBusy(msg)
 	}
-	actor, _ := s.actorScope(r)
-	job, err := s.opts.Jobs.CreateKind("deploy", actor, "", body.Tag, "")
+	job, err := s.opts.Jobs.CreateKind("deploy", actor, "", tag, "")
 	if err != nil {
 		s.applyMu.Unlock()
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was deployed")
-		return
+		return Job{}, err
 	}
-	auditDetail(r, "deploy %s job=%s", body.Tag, job.ID)
-	tag := body.Tag
 	var tmp string
 	cleanup := func() {
 		if tmp != "" {
 			_ = os.RemoveAll(tmp)
 		}
 	}
-	s.startJob(job.ID, actor, "deploy of "+tag, "deploy "+tag, cleanup, func(ctx context.Context, logf func(string, ...any)) error {
+	what := "deploy of " + tag
+	if resumed {
+		what += " (resumed on the upgraded daemon)"
+	}
+	s.startJob(job.ID, actor, what, "deploy "+tag, cleanup, func(ctx context.Context, logf func(string, ...any)) error {
 		sha, err := s.opts.Deploy.Commit(ctx, tag)
 		if err != nil {
 			return err
@@ -92,6 +114,12 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 			return fmt.Errorf("commit %s has no fleet.yml", sha[:12])
 		}
 
+		// fleet.yml's daemon pin is the version the commit was written for: move to it first, so the
+		// plan and the apply run on that binary.
+		if upgraded, err := s.followPin(ctx, root, tag, actor, resumed, logf); err != nil || upgraded {
+			return err
+		}
+
 		pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		fp, err := s.opts.Plan(pctx, root, "")
 		cancel()
@@ -113,8 +141,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		}
 		return s.opts.Apply(ctx, root, fp, logf)
 	})
-	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "tag": tag})
+	return job, nil
 }
 
 // lastHostChange is when a job that changes what a plan compares against last finished: an apply, a
