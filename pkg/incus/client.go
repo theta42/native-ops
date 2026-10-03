@@ -243,8 +243,12 @@ func (c *Client) StopAndDeleteContainer(ctx context.Context, name string) error 
 	return nil
 }
 
-// EnsureVolume creates a storage volume if it does not already exist.
-func (c *Client) EnsureVolume(ctx context.Context, pool, volumeName string) error {
+// EnsureVolume creates the custom volume unless it exists. A volume created with shifted has
+// security.shifted=true, so the files on it are stored with the instance's own IDs and it can be attached
+// to another instance (a restore, a replacement container) without its ownership changing. An existing
+// volume is left as it is: flipping security.shifted on a volume that has data would show that data as
+// owned by nobody, so that is a migration, never a side effect.
+func (c *Client) EnsureVolume(ctx context.Context, pool, volumeName string, shifted bool) error {
 	if pool == "" {
 		pool = "default"
 	}
@@ -254,7 +258,11 @@ func (c *Client) EnsureVolume(ctx context.Context, pool, volumeName string) erro
 	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume show %s %s", ShQuote(pool), ShQuote(volumeName))); err == nil {
 		return nil // already exists
 	}
-	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume create %s %s", ShQuote(pool), ShQuote(volumeName))); err != nil {
+	cmd := fmt.Sprintf("incus storage volume create %s %s", ShQuote(pool), ShQuote(volumeName))
+	if shifted {
+		cmd += " security.shifted=true"
+	}
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("create storage volume %s on pool %s: %w", volumeName, pool, err)
 	}
 	return nil

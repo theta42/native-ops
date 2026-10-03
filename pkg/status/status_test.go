@@ -111,9 +111,12 @@ func TestAnalyzeFlagsWhatAnOperatorNeedsToSee(t *testing.T) {
 			{Name: "noshift", UsedBy: []string{"x"}, LatestDaily: "daily-20260926-060000"},
 			{Name: "unused-noshift", LatestDaily: "daily-20260926-060000"},
 		},
-		Images: ImageSummary{Count: 60, Unaliased: 40, TotalBytes: 14_000_000_000}}
+		Images: ImageSummary{Count: 60, Unaliased: 5, TotalBytes: 14_000_000_000, unaliased: []unaliasedImage{
+			{"aaaaaaaaaaa1", 100_000_000}, {"aaaaaaaaaaa2", 100_000_000}, {"aaaaaaaaaaa3", 100_000_000}, {"aaaaaaaaaaa4", 100_000_000},
+			{ins[0].BaseImage, 900_000_000}, // an instance runs it: not counted
+		}}}
 	joined := strings.Join(Analyze(s, now), "\n")
-	for _, want := range []string{"instance old is Stopped", "mounts the host path /var/lib/incus", "volume stale: newest daily snapshot", "volume none has no daily snapshot", "volume noshift does not have security.shifted", "40 unaliased images"} {
+	for _, want := range []string{"instance old is Stopped", "mounts the host path /var/lib/incus", "volume stale: newest daily snapshot", "volume none has no daily snapshot", "volume noshift does not have security.shifted", "4 images have no alias and no instance runs them (400 MB)"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing warning %q in:\n%s", want, joined)
 		}

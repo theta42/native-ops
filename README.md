@@ -309,7 +309,7 @@ volumes:
   - name: gitea-data
     path: /var/lib/gitea
     pool: default
-    shifted: true
+    shifted: true        # the default: the volume is created with security.shifted=true
 limits:
   limits.cpu: 2
   limits.memory: 2GB
@@ -327,6 +327,11 @@ forwards:
     listen: 2222    # host port, or "address:port" (default 0.0.0.0)
     target: 2222    # instance port, or "address:port" (default 127.0.0.1)
 ```
+
+A volume's `shifted` defaults to true: native-ops creates it with `security.shifted=true`, so its files
+keep the instance's own IDs and it can be attached to a replacement or restored instance unchanged. An
+existing volume is never changed (flipping the setting on a volume that has data would show that data as
+owned by nobody); `native-ops status` warns about attached volumes without it.
 
 ### `templates/platform/template.yml`
 ```yaml

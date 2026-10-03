@@ -179,12 +179,24 @@ type VolumeMount struct {
 	Name     string `yaml:"name"`
 	Path     string `yaml:"path"`
 	Pool     string `yaml:"pool,omitempty"`
-	Shifted  bool   `yaml:"shifted"` // default: true (security.shifted=true)
+	Shifted  bool   `yaml:"shifted"` // default true: a new volume gets security.shifted=true (see UnmarshalYAML)
 	ReadOnly bool   `yaml:"read_only"`
 	// Owner, if set, is a user inside the instance that the mount point is handed to once attached (a
 	// fresh volume attaches root-owned regardless of the image, so a service that runs as another user
 	// otherwise cannot write to its own data directory). Empty leaves it as Incus attaches it.
 	Owner string `yaml:"owner,omitempty"`
+}
+
+// UnmarshalYAML makes `shifted` default to true when a manifest leaves it out, as documented; a plain
+// bool field would default to false.
+func (v *VolumeMount) UnmarshalYAML(value *yaml.Node) error {
+	type plain VolumeMount
+	p := plain{Shifted: true}
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	*v = VolumeMount(p)
+	return nil
 }
 
 // HealthCheckConfig defines how to verify a container after launch.

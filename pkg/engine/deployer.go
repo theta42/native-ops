@@ -277,7 +277,7 @@ func (d *Deployer) profilesOf(svc *config.ServiceConfig) []string {
 func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, configDir, deployRef string) error {
 	d.log("    %s does not exist yet; launching\n", svc.Name)
 	for _, vol := range svc.Volumes {
-		if err := d.incus.EnsureVolume(ctx, vol.Pool, vol.Name); err != nil {
+		if err := d.incus.EnsureVolume(ctx, vol.Pool, vol.Name, vol.Shifted); err != nil {
 			return fmt.Errorf("ensure volume %s: %w", vol.Name, err)
 		}
 	}
@@ -520,7 +520,7 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 			changed = true
 		}
 		for _, vol := range svc.Volumes {
-			if err := d.incus.EnsureVolume(ctx, vol.Pool, vol.Name); err != nil {
+			if err := d.incus.EnsureVolume(ctx, vol.Pool, vol.Name, vol.Shifted); err != nil {
 				return fmt.Errorf("ensure volume %s: %w", vol.Name, err)
 			}
 			if err := d.incus.EnsureVolumeAttached(ctx, svc.Name, servicePool(vol.Pool), vol.Name, vol.Path, vol.Shifted); err != nil {

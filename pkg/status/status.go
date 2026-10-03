@@ -85,6 +85,14 @@ type ImageSummary struct {
 	TotalBytes int64   `json:"total_bytes"`
 	Unaliased  int     `json:"unaliased"`
 	Aliases    []Alias `json:"aliases"`
+	// unaliased are the images with no alias that are not cached copies of remote images, for Analyze
+	// to tell which of them no instance runs.
+	unaliased []unaliasedImage
+}
+
+type unaliasedImage struct {
+	fp12 string
+	size int64
 }
 
 // ---- parsing (pure) ----
@@ -228,6 +236,7 @@ func ParseImages(out string) (ImageSummary, error) {
 		Fingerprint string `json:"fingerprint"`
 		Size        int64  `json:"size"`
 		UploadedAt  string `json:"uploaded_at"`
+		Cached      bool   `json:"cached"`
 		Aliases     []struct {
 			Name string `json:"name"`
 		} `json:"aliases"`
@@ -240,6 +249,9 @@ func ParseImages(out string) (ImageSummary, error) {
 		sum.TotalBytes += i.Size
 		if len(i.Aliases) == 0 {
 			sum.Unaliased++
+			if !i.Cached {
+				sum.unaliased = append(sum.unaliased, unaliasedImage{fp12: i.Fingerprint[:min(12, len(i.Fingerprint))], size: i.Size})
+			}
 		}
 		for _, a := range i.Aliases {
 			sum.Aliases = append(sum.Aliases, Alias{Name: a.Name, Fingerprint: i.Fingerprint[:min(12, len(i.Fingerprint))], UploadedAt: i.UploadedAt})
@@ -278,8 +290,24 @@ func Analyze(s *Snapshot, now time.Time) []string {
 			}
 		}
 	}
-	if s.Images.Unaliased > 10 {
-		w = append(w, fmt.Sprintf("%d unaliased images (%d MB in total across %d) could be pruned", s.Images.Unaliased, s.Images.TotalBytes/1_000_000, s.Images.Count))
+	// Images with no alias that no instance runs are what an image prune can delete (once they are a day
+	// old; builds delete the image they displace themselves). Ones an instance runs are not counted.
+	running := map[string]bool{}
+	for _, in := range s.Instances {
+		if in.BaseImage != "" {
+			running[in.BaseImage] = true
+		}
+	}
+	var orphans int
+	var orphanBytes int64
+	for _, img := range s.Images.unaliased {
+		if !running[img.fp12] {
+			orphans++
+			orphanBytes += img.size
+		}
+	}
+	if orphans >= 3 {
+		w = append(w, fmt.Sprintf("%d images have no alias and no instance runs them (%d MB): `native-ops remote image-prune` deletes those older than a day", orphans, orphanBytes/1_000_000))
 	}
 	return w
 }

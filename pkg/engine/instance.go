@@ -111,7 +111,7 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 	// 4. Attach persistent data volume
 	for _, vol := range p.Template.Volumes {
 		actualVolName := strings.ReplaceAll(vol.Name, "{slug}", p.Slug)
-		if err := m.incus.EnsureVolume(ctx, vol.Pool, actualVolName); err != nil {
+		if err := m.incus.EnsureVolume(ctx, vol.Pool, actualVolName, vol.Shifted); err != nil {
 			return "", fmt.Errorf("ensure volume %s: %w", actualVolName, err)
 		}
 		pool := vol.Pool
