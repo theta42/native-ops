@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -154,6 +155,11 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.opts.Users.FindOrCreateOIDC(id.Email, id.Name, s.opts.OIDC.Role)
+	if errors.Is(err, ErrNoAccount) {
+		auditDetail(r, "oidc sign-in refused: no account for %s", id.Email)
+		fail("you have no account here yet: ask an admin to grant you access")
+		return
+	}
 	if err != nil {
 		fail("could not record the user")
 		return

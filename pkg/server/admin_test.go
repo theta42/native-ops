@@ -184,3 +184,85 @@ func TestAdminManagesUsersOverTheAPI(t *testing.T) {
 }
 
 func toJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+func TestUpsertByEmailGrantsAccessBeforeTheFirstSignIn(t *testing.T) {
+	rig := newAdminRig(t)
+	code, out, _ := rig.call(t, "PUT", "/v1/users/by-email/Sam@Acme.test", rig.admin, map[string]any{"role": "deployer", "name": "Sam"})
+	if code != http.StatusCreated || out["created"] != true {
+		t.Fatalf("create: %d %v", code, out)
+	}
+	if code, out, _ := rig.call(t, "PUT", "/v1/users/by-email/sam@acme.test", rig.admin, map[string]any{"role": "planner", "disabled": true}); code != 200 || out["created"] != false {
+		t.Fatalf("update: %d %v", code, out)
+	}
+	users, _ := rig.users.List()
+	var sam User
+	for _, u := range users {
+		if u.Email == "sam@acme.test" {
+			sam = u
+		}
+	}
+	if sam.Role != RolePlanner || !sam.Disabled || sam.Provider != ProviderOIDC || sam.Name != "Sam" || len(users) != 1 {
+		t.Fatalf("one OIDC user, planner, disabled, its name kept: %+v (of %d)", sam, len(users))
+	}
+
+	for _, bad := range []map[string]any{{"role": "root"}, {"role": ""}} {
+		if code, _, _ := rig.call(t, "PUT", "/v1/users/by-email/x@acme.test", rig.admin, bad); code != http.StatusBadRequest {
+			t.Fatalf("role %v must be refused: %d", bad["role"], code)
+		}
+	}
+	if code, _, _ := rig.call(t, "PUT", "/v1/users/by-email/not-an-email", rig.admin, map[string]any{"role": "viewer"}); code != http.StatusBadRequest {
+		t.Fatalf("a malformed email must be refused: %d", code)
+	}
+	viewer, _, _ := rig.tokens.Create("dash", RoleViewer)
+	if code, _, _ := rig.call(t, "PUT", "/v1/users/by-email/y@acme.test", viewer, map[string]any{"role": "admin"}); code != http.StatusForbidden {
+		t.Fatalf("only an admin may grant access: %d", code)
+	}
+}
+
+func TestOIDCRoleNoneLetsOnlyExistingUsersSignIn(t *testing.T) {
+	rig := newAdminRig(t)
+	idp := fakeIdP(t, map[string]any{"email": "new@opsavor.ai", "email_verified": true, "name": "New"})
+	oidc, err := NewOIDC(OIDCSettings{Issuer: idp.URL, ClientID: "c", ClientSecret: "s", RedirectURL: idp.URL + "/cb", AllowedDomain: "opsavor.ai", Role: OIDCRoleNone})
+	if err != nil || oidc.Role != OIDCRoleNone {
+		t.Fatalf("none must be kept as the role: %v %v", err, oidc.Role)
+	}
+	rig.srv.opts.OIDC = oidc
+	rig.reload(t)
+	signIn := func() (*http.Response, bool) {
+		t.Helper()
+		req, _ := http.NewRequest("GET", rig.url+"/auth/oidc/callback?state=st&code=good", nil)
+		req.AddCookie(&http.Cookie{Name: oidcStateCookie, Value: "st"})
+		req.AddCookie(&http.Cookie{Name: oidcVerifierCookie, Value: "the-verifier"})
+		res, err := (&http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		for _, c := range res.Cookies() {
+			if c.Name == SessionCookie && c.Value != "" {
+				return res, true
+			}
+		}
+		return res, false
+	}
+	res, ok := signIn()
+	if ok || !strings.Contains(res.Header.Get("Location"), "no+account") {
+		t.Fatalf("an unknown email must be refused, not created: signed in=%v, went to %s", ok, res.Header.Get("Location"))
+	}
+	if users, _ := rig.users.List(); len(users) != 0 {
+		t.Fatalf("nobody may be created: %+v", users)
+	}
+	if _, _, err := rig.users.UpsertByEmail("new@opsavor.ai", "", RoleDeployer, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := signIn(); !ok {
+		t.Fatal("a user granted access must be able to sign in")
+	}
+	f := false
+	tr := true
+	_, _, _ = rig.users.UpsertByEmail("new@opsavor.ai", "", RoleDeployer, &tr)
+	if _, ok := signIn(); ok {
+		t.Fatal("a disabled user must not sign in")
+	}
+	_, _, _ = rig.users.UpsertByEmail("new@opsavor.ai", "", RoleDeployer, &f)
+}

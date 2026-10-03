@@ -24,7 +24,7 @@ type OIDCSettings struct {
 	ClientSecret  string
 	RedirectURL   string
 	AllowedDomain string // every email must be at this domain (e.g. example.com); empty allows any
-	Role          Role   // the role a newly seen user is created with
+	Role          Role   // the role a newly seen user is created with; OIDCRoleNone creates nobody
 	Scopes        []string
 	Label         string // what the sign-in button says, e.g. "Google Workspace"
 	// ClientSecretFrom, when set and ClientSecret is empty, is asked for the client secret at each
@@ -54,7 +54,7 @@ func NewOIDC(s OIDCSettings) (*OIDCConfig, error) {
 	if strings.TrimSpace(s.Issuer) == "" || s.ClientID == "" || (s.ClientSecret == "" && s.ClientSecretFrom == nil) || s.RedirectURL == "" {
 		return nil, errors.New("OIDC needs an issuer, client id, client secret and redirect url")
 	}
-	if !ValidRole(s.Role) {
+	if s.Role != OIDCRoleNone && !ValidRole(s.Role) {
 		s.Role = RoleViewer
 	}
 	if len(s.Scopes) == 0 {
@@ -241,3 +241,7 @@ func PKCEChallenge(verifier string) string {
 	sum := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
+
+// OIDCRoleNone as the OIDC role means nobody is created on first sign-in: only a user that already
+// exists (made by an admin, or by a directory over PUT /v1/users/by-email/{email}) may sign in.
+const OIDCRoleNone Role = "none"
