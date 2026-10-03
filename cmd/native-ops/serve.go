@@ -22,6 +22,7 @@ import (
 	"github.com/theta42/native-ops/pkg/backup"
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/engine"
+	"github.com/theta42/native-ops/pkg/gitsource"
 	"github.com/theta42/native-ops/pkg/provider"
 	"github.com/theta42/native-ops/pkg/provider/digitalocean"
 	"github.com/theta42/native-ops/pkg/remote"
@@ -118,6 +119,9 @@ func handleServeCommand(ctx context.Context, args []string) {
 	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as the uploaded fleet.yml's backup section says, only to the destination pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT/_BUCKET). The keys and pins come from the secret store (synced from the git server), else the environment")
 	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded fleet.yml's dns_records in the allowed zones (--dns-domains or NATIVE_OPS_DNS_ZONES) through the built-in provider (DO_API_TOKEN from the secret store, else the environment). Script plugins are not run from an upload")
 	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "app-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
+	gitURL := flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server (Gitea) holding the configuration repository, e.g. https://git.example.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
+	deployRepo := flags.String("deploy-repo", envOr("NATIVE_OPS_DEPLOY_REPO", ""), "The configuration repository on --git-url, as owner/name: a protected deploy tag there deploys its commit. Env: NATIVE_OPS_DEPLOY_REPO")
+	deployTags := flags.String("deploy-tags", envOr("NATIVE_OPS_DEPLOY_TAGS", "deploy-*"), "Glob of the tags that deploy; the repository must protect them. Env: NATIVE_OPS_DEPLOY_TAGS")
 	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Serve POST /v1/edge/apply: apply the config repo's edge/Caddyfile to the edge container (validated, with rollback). Changes the host, so it runs as a job")
 	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
 	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
@@ -154,6 +158,9 @@ func handleServeCommand(ctx context.Context, args []string) {
 		EnableImageBuild: *enableImageBuild,
 		ImagePrefix:      *imagePrefix,
 		EnableEdgeApply:  *enableEdgeApply,
+		GitURL:           *gitURL,
+		DeployRepo:       *deployRepo,
+		DeployTags:       *deployTags,
 		EnableBackup:     *enableBackup,
 		EnableDNSSync:    *enableDNSSync,
 		EnableAuth:       *enableAuth,
@@ -211,8 +218,13 @@ type daemonConfig struct {
 	EnableImageBuild     bool
 	ImagePrefix          string
 	EnableEdgeApply      bool
-	EnableBackup         bool
-	EnableDNSSync        bool
+	// GitURL, DeployRepo and DeployTags, with EnableApply, enable POST /v1/deploy (see pkg/gitsource);
+	// the git server's token is the secret NATIVE_OPS_GIT_TOKEN.
+	GitURL        string
+	DeployRepo    string
+	DeployTags    string
+	EnableBackup  bool
+	EnableDNSSync bool
 	// DNSProviderName ("digitalocean") lists DNS records for the status page with the provider's token
 	// read through the secret store at each listing; DNS, when set, is used instead (tests).
 	DNSProviderName string
@@ -323,6 +335,19 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		if cfg.EnableDNSSync {
 			opts.DNSSync = dnsSyncSource(lookup, cfg.DNSDomains)
+		}
+		if cfg.GitURL != "" || cfg.DeployRepo != "" {
+			if !cfg.EnableApply {
+				audit.Close()
+				return nil, nil, errors.New("--git-url/--deploy-repo deploy tags by applying them: they need --enable-apply")
+			}
+			src := &gitsource.Source{BaseURL: cfg.GitURL, Repo: cfg.DeployRepo, TagPattern: cfg.DeployTags,
+				Token: func() string { return lookup("NATIVE_OPS_GIT_TOKEN") }}
+			if err := src.Validate(); err != nil {
+				audit.Close()
+				return nil, nil, err
+			}
+			opts.Deploy, opts.DeployTags = src, cfg.DeployTags
 		}
 		if cfg.EnableEdgeApply {
 			opts.EdgeApply = edgeApplySource(cfg.Exec, cfg.EdgeContainer)

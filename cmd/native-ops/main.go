@@ -110,8 +110,8 @@ The daemon (runs on each host; CI drives it over HTTPS):
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
   remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
-                   token-create, recipe-approve, secret-sync, daemon-upgrade (uploads the
-                   checked-out tree; NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
+                   token-create, recipe-approve, secret-sync, daemon-upgrade, deploy
+                   (NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
 
 Core Commands:
   host create      Provision a new cloud host (DigitalOcean; Proxmox is experimental)
