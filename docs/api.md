@@ -8,7 +8,8 @@ itself (flags, tokens, the state directory, upgrades) see [daemon.md](daemon.md)
   at `GET /openapi.json` (and `/openapi.yaml`), with no token. Load it into any OpenAPI viewer or client
   generator. Its source is [`pkg/server/openapi.yaml`](../pkg/server/openapi.yaml); a test fails the
   build when it and the daemon's routes disagree.
-- **Agents:** the same operations are MCP tools at `POST /mcp`. See [MCP](#mcp).
+- **Agents:** the same operations are MCP tools at `POST /mcp`; an agent connects by having its person
+  sign in (OAuth), or with an API token. See [MCP](#mcp).
 - **CLI:** `native-ops remote deploy | deploy-plan | deploys | wait` wraps all of this for CI.
 
 ## Contents
@@ -223,9 +224,44 @@ token, through the same handler and the same audit log (as the endpoint it calle
 exactly what the token could do with curl, and `tools/list` shows only the tools the token's role and
 scope can use (and that the daemon has enabled).
 
-### Connect
+### Connect by signing in (OAuth)
 
-Claude Code:
+With sign-in on (`--oidc-issuer` or `--enable-auth`), a person connects an agent by signing in. Nobody
+creates, copies or pastes a token:
+
+```bash
+claude mcp add --transport http native-ops https://native-ops.example.com/mcp
+```
+
+The first call gets a `401` whose `WWW-Authenticate` names the daemon's OAuth metadata. The client
+registers itself, opens a browser at the daemon's sign-in (the same as the UI's: your identity provider,
+or a local account), shows a consent page naming the client and your role, and receives tokens. In
+Claude Code, `/mcp` shows the server and runs the sign-in.
+
+What the agent gets:
+
+- **Your access, live.** It acts as you, with your role as the user store holds it **at each request**.
+  If a directory (crew, `PUT /v1/users/by-email`) changes your role or disables you, your agents follow
+  at once. The audit log and job records name you, `alice (via Claude Code)`.
+- **`/mcp` only.** The tokens are not accepted anywhere else in the API, and the MCP tools never include
+  approvals, tokens, users or secrets, whatever your role.
+- **Short-lived tokens.** An access token lasts an hour; the client refreshes it. Refresh tokens last 30
+  days and rotate on every use; if a spent one is ever presented again (a copy exists), the grant is
+  revoked.
+- **Revocable.** Admins see every grant (who, which client, when last used) on the UI's **Tokens** page
+  or at `GET /v1/oauth/grants`, and revoke one with `DELETE /v1/oauth/grants/{id}`. A client can end its
+  own grant at `POST /oauth/revoke`.
+
+The flow is the MCP authorization spec's: protected resource metadata (RFC 9728), authorization server
+metadata (RFC 8414), dynamic client registration (RFC 7591, public clients only), the authorization code
+flow with PKCE S256 (required), resource indicators (RFC 8707), refresh tokens and revocation (RFC 7009).
+Redirect URIs must be `https`, or `http` to `127.0.0.1`, `::1` or `localhost`. The daemon names its
+public origin from `--public-url`, else from `--oidc-redirect-url`'s origin, else from each request.
+Turn the whole thing off with `--mcp-oauth=false`.
+
+### Connect with an API token
+
+For an agent with no browser (a scheduled job, a server-side bot), use an API token instead:
 
 ```bash
 claude mcp add --transport http native-ops "$NATIVE_OPS_URL/mcp" \

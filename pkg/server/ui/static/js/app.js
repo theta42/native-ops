@@ -373,7 +373,28 @@ function tokensView(d) {
     card("key", "API tokens",
       h("div", {}, rows.length ? table(["Name", "Role", "Scope", "Created", "Id", ""], rows) : empty("No tokens yet (the bootstrap token is not listed)."), form),
       h("span", { class: "badge text-bg-secondary" }, rows.length)),
+    d.grants ? grantsCard(d.grants) : null,
     d.secrets ? secretsCard(d.secrets) : null);
+}
+
+// MCP clients a person let act for them by signing in (OAuth). Each acts with its person's current role,
+// at /mcp only; revoking one ends its access at once.
+function grantsCard(list) {
+  const rows = list.map((g) => {
+    const revoke = h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("trash", "me-1"), "Revoke");
+    revoke.addEventListener("click", () => {
+      if (confirm(`Revoke "${g.client_name}" for ${g.username}? It stops working at once; they can sign it in again.`)) {
+        act("DELETE", `/v1/oauth/grants/${encodeURIComponent(g.id)}`, `Access for "${g.client_name}" (${g.username}) revoked.`);
+      }
+    });
+    return [g.client_name, g.username, when(g.created), when(g.last_used), revoke];
+  });
+  return card("robot", "Agent sign-ins",
+    h("div", {},
+      h("div", { class: "card-body pb-0" }, h("p", { class: "text-muted small mb-2" },
+        "MCP clients people connected by signing in. Each acts as its person, with their role as it is now, and only at /mcp.")),
+      rows.length ? table(["Client", "Person", "Signed in", "Last used", ""], rows) : empty("No agent has been signed in.")),
+    h("span", { class: "badge text-bg-secondary" }, rows.length));
 }
 
 // The daemon's own credentials, pushed from the git server's secret store by CI. Names only: a value
@@ -476,8 +497,8 @@ const pages = [
   { re: /^\/jobs$/, nav: "/jobs", load: () => api("/v1/jobs").catch((e) => { if (e.status === 404) return { disabled: true }; throw e; }), render: jobsView },
   { re: /^\/jobs\/(j-[0-9]+-[0-9a-f]{8})$/, nav: "/jobs", load: (m) => api("/v1/jobs/" + m[1]), render: jobView },
   { re: /^\/recipes$/, nav: "/recipes", load: () => api("/v1/images/recipes"), render: recipesView },
-  { re: /^\/tokens$/, nav: "/tokens", load: () => Promise.all([api("/v1/tokens"), api("/v1/secrets").catch(() => null)])
-      .then(([t, s]) => ({ ...t, secrets: s ? s.secrets : null })), render: tokensView },
+  { re: /^\/tokens$/, nav: "/tokens", load: () => Promise.all([api("/v1/tokens"), api("/v1/secrets").catch(() => null), api("/v1/oauth/grants").catch(() => null)])
+      .then(([t, s, g]) => ({ ...t, secrets: s ? s.secrets : null, grants: g ? g.grants : null })), render: tokensView },
 ];
 
 const routes = { "/": overviewView, "/instances": instancesView, "/volumes": volumesView, "/network": networkView };

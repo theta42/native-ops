@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -138,6 +139,8 @@ func handleServeCommand(ctx context.Context, args []string) {
 	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. example.com). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
 	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin; none creates nobody, so only users that already exist (PUT /v1/users/by-email) may sign in. Env: NATIVE_OPS_OIDC_ROLE")
 	oidcLabel := flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
+	mcpOAuth := flags.Bool("mcp-oauth", envOr("NATIVE_OPS_MCP_OAUTH", "true") != "false", "With sign-in on (--enable-auth or --oidc-issuer), let MCP clients connect by signing their person in (OAuth), acting with that person's role, instead of with a pasted API token; --mcp-oauth=false turns it off. Env: NATIVE_OPS_MCP_OAUTH=false")
+	publicURL := flags.String("public-url", os.Getenv("NATIVE_OPS_PUBLIC_URL"), "The daemon's public origin (e.g. https://native-ops.example.com), named in the OAuth metadata; default: the origin of --oidc-redirect-url, else each request's. Env: NATIVE_OPS_PUBLIC_URL")
 	edgeContainer := flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
 	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from for the status page, e.g. digitalocean (DO_API_TOKEN from the secret store, else the environment). Env: NATIVE_OPS_DNS_PROVIDER")
 	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for, and that a DNS sync may change, e.g. 'example.com,example.net'. Env: NATIVE_OPS_DNS_DOMAINS")
@@ -169,6 +172,8 @@ func handleServeCommand(ctx context.Context, args []string) {
 		EnableBackup:     *enableBackup,
 		EnableDNSSync:    *enableDNSSync,
 		EnableAuth:       *enableAuth,
+		MCPOAuth:         *mcpOAuth,
+		PublicURL:        *publicURL,
 		OIDC: server.OIDCSettings{Issuer: *oidcIssuer, ClientID: *oidcClientID, ClientSecret: *oidcClientSecret,
 			RedirectURL: *oidcRedirectURL, AllowedDomain: *oidcAllowedDomain, Role: server.Role(*oidcRole), Label: *oidcLabel},
 		EdgeContainer:        *edgeContainer,
@@ -254,6 +259,10 @@ type daemonConfig struct {
 	// OpenID Connect sign-in; either implies a user store and a session signer.
 	EnableAuth bool
 	OIDC       server.OIDCSettings
+	// MCPOAuth, with sign-in on, makes the daemon an OAuth authorization server for /mcp. PublicURL is the
+	// public origin it names; empty takes the OIDC redirect URL's origin, else each request's.
+	MCPOAuth  bool
+	PublicURL string
 	// Host observability: the edge container whose routes and certificates are reported (empty skips),
 	// and an optional DNS provider plus the zones to list records from.
 	EdgeContainer string
@@ -384,6 +393,25 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			return nil, nil, fmt.Errorf("users: %w", err)
 		}
 		opts.Users, opts.Sessions = users, sess
+		if cfg.MCPOAuth {
+			oauthKey, err := loadOrCreateKey(filepath.Join(cfg.StateDir, "oauth.key"))
+			if err != nil {
+				audit.Close()
+				return nil, nil, err
+			}
+			store, err := server.OpenOAuthStore(filepath.Join(cfg.StateDir, "oauth.json"), oauthKey)
+			if err != nil {
+				audit.Close()
+				return nil, nil, fmt.Errorf("oauth: %w", err)
+			}
+			opts.OAuth = store
+			opts.PublicURL = cfg.PublicURL
+			if opts.PublicURL == "" && cfg.OIDC.RedirectURL != "" {
+				if u, err := url.Parse(cfg.OIDC.RedirectURL); err == nil && u.Scheme != "" && u.Host != "" {
+					opts.PublicURL = u.Scheme + "://" + u.Host
+				}
+			}
+		}
 	}
 	if cfg.OIDC.Issuer != "" {
 		if cfg.OIDC.ClientSecret == "" {

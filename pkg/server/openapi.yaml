@@ -57,6 +57,8 @@ tags:
     description: UI sign-in. Not needed with an API token.
   - name: meta
     description: Liveness, this document, and MCP.
+  - name: oauth
+    description: Sign-in for MCP clients, so an agent acts as its person without a pasted token.
 
 paths:
   /healthz:
@@ -105,7 +107,9 @@ paths:
       summary: Model Context Protocol endpoint
       description: |
         A stateless MCP server (Streamable HTTP, JSON answers). It takes a bearer token only, never a
-        session cookie. Its tools call the operations here with the caller's token, so a tool can do
+        session cookie: an API token, or (with sign-in on) an OAuth access token from a person's sign-in,
+        which acts with that person's current role. Without a token, the 401's WWW-Authenticate names the
+        protected resource metadata, where an MCP client finds how to sign in. Its tools call the operations here with the caller's token, so a tool can do
         exactly what the token could; `tools/list` shows only the tools the token's role and scope can use.
         Tools: whoami, host_status, list_deploys, plan_deploy, deploy, list_jobs, get_job, list_plans,
         get_plan, list_instances, get_instance, prune_images.
@@ -145,6 +149,197 @@ paths:
       security: []
       responses:
         "405": { description: "The server keeps no sessions." }
+
+  /.well-known/oauth-protected-resource:
+    get:
+      operationId: oauthProtectedResource
+      tags: [oauth]
+      summary: Protected resource metadata for /mcp (RFC 9728)
+      description: Names /mcp as the resource and this daemon as its authorization server. An MCP client finds it from /mcp's 401.
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in (--enable-auth or --oidc-issuer) and --mcp-oauth (on by default)
+      responses:
+        "200": { description: "{resource, authorization_servers, bearer_methods_supported, scopes_supported}", content: { application/json: {} } }
+  /.well-known/oauth-protected-resource/mcp:
+    get:
+      operationId: oauthProtectedResourceMCP
+      tags: [oauth]
+      summary: The same, at the path-specific location
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      responses:
+        "200": { description: "The protected resource metadata.", content: { application/json: {} } }
+  /.well-known/oauth-authorization-server:
+    get:
+      operationId: oauthServerMetadata
+      tags: [oauth]
+      summary: Authorization server metadata (RFC 8414)
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      responses:
+        "200": { description: "The endpoints, and what they support: the code flow with PKCE S256, refresh tokens, public clients.", content: { application/json: {} } }
+  /oauth/register:
+    post:
+      operationId: oauthRegister
+      tags: [oauth]
+      summary: Register a client (RFC 7591)
+      description: Open to anyone; a client is useless until a person consents. Clients are public (token_endpoint_auth_method none). Redirect URIs must be https, or http to 127.0.0.1, ::1 or localhost.
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uris]
+              properties:
+                client_name: { type: string }
+                redirect_uris: { type: array, items: { type: string, format: uri }, minItems: 1, maxItems: 10 }
+      responses:
+        "201": { description: "{client_id, client_name, redirect_uris, grant_types, response_types, token_endpoint_auth_method: none}", content: { application/json: {} } }
+        "400": { description: "invalid_redirect_uri or invalid_client_metadata." }
+  /oauth/authorize:
+    get:
+      operationId: oauthAuthorize
+      tags: [oauth]
+      summary: Sign in and consent (a browser page)
+      description: Without a session, offers the daemon's sign-in and returns here; signed in, shows a consent page naming the client and the person's role. A bad client or redirect URI is shown to the person, never redirected to.
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      parameters:
+        - { name: response_type, in: query, required: true, schema: { const: code } }
+        - { name: client_id, in: query, required: true, schema: { type: string } }
+        - { name: redirect_uri, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge_method, in: query, required: true, schema: { const: S256 } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: resource, in: query, description: "If given, <daemon>/mcp (RFC 8707).", schema: { type: string } }
+        - { name: scope, in: query, description: "Ignored; the grant is always mcp.", schema: { type: string } }
+      responses:
+        "200": { description: "The sign-in or consent page.", content: { text/html: {} } }
+        "302": { description: "An error back to the client (unsupported_response_type, invalid_request, invalid_target)." }
+        "400": { description: "Unknown client or unregistered redirect URI (a page)." }
+    post:
+      operationId: oauthConsent
+      tags: [oauth]
+      summary: The consent form's answer
+      description: Needs the session and the signed token the consent page carries (10 minutes). Allow sends a single-use code (1 minute) to the redirect URI; deny sends error=access_denied.
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      requestBody:
+        required: true
+        content: { application/x-www-form-urlencoded: { schema: { type: object } } }
+      responses:
+        "302": { description: "To the client's redirect URI, with code and state (or an error)." }
+        "403": { description: "No session, or the consent token is missing, expired or not this person's." }
+  /oauth/login:
+    post:
+      operationId: oauthLogin
+      tags: [oauth]
+      summary: Local sign-in from the authorize page
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [username, password, next]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+                next: { type: string, description: "An /oauth/authorize request on this daemon; nothing else is accepted." }
+      responses:
+        "303": { description: "Signed in; back to the authorize request." }
+        "400": { description: "next is not an authorize request here." }
+        "401": { description: "Wrong username or password (the page again)." }
+        "429": { description: "Too many failed sign-ins for this account." }
+  /oauth/token:
+    post:
+      operationId: oauthToken
+      tags: [oauth]
+      summary: Exchange a code (with its PKCE verifier) or a refresh token for tokens
+      description: |
+        Access tokens (nopa_..., 1 hour) work at /mcp only and act as the person with their role at each
+        request. Refresh tokens (nopr_..., 30 days) rotate on every use; presenting a spent one revokes the
+        grant. No tokens are issued for a person who is disabled or removed.
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type, client_id]
+              properties:
+                grant_type: { type: string, enum: [authorization_code, refresh_token] }
+                client_id: { type: string }
+                code: { type: string }
+                redirect_uri: { type: string }
+                code_verifier: { type: string }
+                refresh_token: { type: string }
+                resource: { type: string }
+      responses:
+        "200":
+          description: The tokens.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  token_type: { const: Bearer }
+                  expires_in: { type: integer }
+                  refresh_token: { type: string }
+                  scope: { const: mcp }
+        "400": { description: "invalid_grant, invalid_request, invalid_target or unsupported_grant_type ({error, error_description})." }
+        "401": { description: "invalid_client." }
+  /oauth/revoke:
+    post:
+      operationId: oauthRevoke
+      tags: [oauth]
+      summary: End a grant by one of its tokens (RFC 7009)
+      security: []
+      x-native-ops-role: none
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      requestBody:
+        required: true
+        content: { application/x-www-form-urlencoded: { schema: { type: object, properties: { token: { type: string } } } } }
+      responses:
+        "200": { description: "Done (also for an unknown token)." }
+  /v1/oauth/grants:
+    get:
+      operationId: listOAuthGrants
+      tags: [oauth]
+      summary: Who has let which MCP client act for them
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      responses:
+        "200": { description: "{grants: [{id, client_id, client_name, username, created, last_used, expires}]}", content: { application/json: {} } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/oauth/grants/{id}:
+    delete:
+      operationId: revokeOAuthGrant
+      tags: [oauth]
+      summary: Revoke a grant (its tokens stop working at once)
+      x-native-ops-role: admin
+      x-native-ops-enabled-by: sign-in and --mcp-oauth
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "Revoked." }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/session:
     get:
@@ -923,7 +1118,7 @@ components:
     bearer:
       type: http
       scheme: bearer
-      description: An API token (nops_...), created by an admin (POST /v1/tokens or native-ops token create). The UI's session cookie also works, except at /mcp.
+      description: An API token (nops_...), created by an admin (POST /v1/tokens or native-ops token create). The UI's session cookie also works, except at /mcp. At /mcp only, an OAuth access token (nopa_...) from /oauth/token works too.
 
   parameters:
     Service:

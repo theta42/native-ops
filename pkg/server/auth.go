@@ -12,6 +12,7 @@ import (
 const (
 	oidcStateCookie    = "nops_oidc_state"
 	oidcVerifierCookie = "nops_oidc_pkce"
+	oidcNextCookie     = "nops_oidc_next" // an OAuth authorize request to return to after signing in
 )
 
 func randomHex(n int) (string, error) {
@@ -97,7 +98,11 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "could not start the sign-in")
 		return
 	}
-	for name, value := range map[string]string{oidcStateCookie: state, oidcVerifierCookie: verifier} {
+	cookies := map[string]string{oidcStateCookie: state, oidcVerifierCookie: verifier}
+	if next := r.URL.Query().Get("next"); next != "" && safeNext(next) {
+		cookies[oidcNextCookie] = next
+	}
+	for name, value := range cookies {
 		http.SetCookie(w, &http.Cookie{
 			Name: name, Value: value, Path: "/auth/oidc", HttpOnly: true,
 			SameSite: http.SameSiteLaxMode, Secure: isHTTPS(r), MaxAge: 600,
@@ -115,7 +120,7 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 // the provider, find-or-create the matching user, and set the session cookie.
 func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	clearState := func() {
-		for _, name := range []string{oidcStateCookie, oidcVerifierCookie} {
+		for _, name := range []string{oidcStateCookie, oidcVerifierCookie, oidcNextCookie} {
 			http.SetCookie(w, &http.Cookie{
 				Name: name, Value: "", Path: "/auth/oidc", HttpOnly: true,
 				SameSite: http.SameSiteLaxMode, Secure: isHTTPS(r), MaxAge: -1,
@@ -170,10 +175,14 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opts.Sessions.SetCookie(w, r, s.opts.Sessions.Issue(u.Username, u.Role))
 	_ = s.opts.Users.TouchLogin(u.Username)
+	back := "/"
+	if c, err := r.Cookie(oidcNextCookie); err == nil && safeNext(c.Value) {
+		back = c.Value // an MCP client's authorize request: on to the consent page
+	}
 	clearState()
 	s.setActor(r, u.Username)
 	auditDetail(r, "signed in via oidc")
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, back, http.StatusFound)
 }
 
 // setActor records who acted for the audit line (the middleware reads it after the handler returns).

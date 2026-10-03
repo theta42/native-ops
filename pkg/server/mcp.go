@@ -23,7 +23,8 @@ import (
 // secrets, restores and daemon upgrades are deliberately not tools: those are the human gates.
 //
 // /mcp takes a bearer token only, never the UI's session cookie, and refuses a request from a browser
-// page of another origin (the transport's DNS rebinding rule).
+// page of another origin (the transport's DNS rebinding rule). The token is an API token, or, with OAuth
+// on, an access token from a person's sign-in (oauth.go), which acts with that person's current role.
 
 // mcpVersions are the protocol revisions spoken, newest first.
 var mcpVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
@@ -303,15 +304,51 @@ func (s *Server) mcpHandler(inner func() http.Handler) http.Handler {
 				return
 			}
 		}
-		if bearer(r) == "" {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="native-ops"`)
-			writeError(w, http.StatusUnauthorized, "unauthorized", "a valid API token is required")
+		tok := bearer(r)
+		if tok == "" {
+			w.Header().Set("WWW-Authenticate", s.mcpChallenge(r, ""))
+			writeError(w, http.StatusUnauthorized, "unauthorized", "a valid API token, or an OAuth sign-in, is required")
 			return
 		}
 		r.Header.Del("Cookie") // a token, never a browser session
+		if strings.HasPrefix(tok, oauthAccessPrefix) && s.opts.OAuth != nil {
+			// An OAuth access token acts as its person, with the role they have now.
+			g, ok := s.opts.OAuth.VerifyAccess(tok)
+			var (
+				username string
+				role     Role
+			)
+			if ok {
+				username, role, ok = s.oauthUser(g)
+			}
+			if !ok {
+				w.Header().Set("WWW-Authenticate", s.mcpChallenge(r, "invalid_token"))
+				writeError(w, http.StatusUnauthorized, "unauthorized", "the access token is invalid, expired or revoked, or its person may no longer sign in")
+				return
+			}
+			if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
+				h.name, h.role = username+" (via "+g.ClientName+")", role
+			}
+			s.serveMCP(w, r, inner())
+			return
+		}
+		if _, ok := s.opts.Tokens.Verify(tok); !ok {
+			w.Header().Set("WWW-Authenticate", s.mcpChallenge(r, "invalid_token"))
+			writeError(w, http.StatusUnauthorized, "unauthorized", "a valid API token is required")
+			return
+		}
 		serve.ServeHTTP(w, r)
 	})
 }
+
+// mcpCaller is the caller /mcp authenticated, handed to the requests its tools make (see authWith).
+type mcpCaller struct {
+	name  string
+	role  Role
+	scope *Scope
+}
+
+type mcpCallerKey struct{}
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -430,8 +467,14 @@ func (s *Server) mcpAllows(t mcpTool, h *actorHolder) bool {
 	return h != nil && t.enabled(&s.opts) && h.role.Allows(t.min) && (h.scope == nil || t.scoped)
 }
 
-// mcpDo runs one request through the daemon's own handler, as the caller (their token, their address).
+// mcpDo runs one request through the daemon's own handler, as the caller: the identity /mcp verified
+// (an API token's, or an OAuth grant's person), and their address.
 func (s *Server) mcpDo(outer *http.Request, inner http.Handler) mcpDo {
+	h, _ := outer.Context().Value(actorKey{}).(*actorHolder)
+	caller := mcpCaller{}
+	if h != nil {
+		caller = mcpCaller{name: h.name, role: h.role, scope: h.scope}
+	}
 	return func(ctx context.Context, method, path string, body any) (int, []byte) {
 		var rd *bytes.Reader
 		if body != nil {
@@ -440,11 +483,10 @@ func (s *Server) mcpDo(outer *http.Request, inner http.Handler) mcpDo {
 		} else {
 			rd = bytes.NewReader(nil)
 		}
-		req, err := http.NewRequestWithContext(ctx, method, path, rd)
+		req, err := http.NewRequestWithContext(context.WithValue(ctx, mcpCallerKey{}, caller), method, path, rd)
 		if err != nil {
 			return http.StatusBadRequest, []byte(`{"error":"bad request","code":"bad_request"}`)
 		}
-		req.Header.Set("Authorization", outer.Header.Get("Authorization"))
 		req.Header.Set("Content-Type", "application/json")
 		req.RemoteAddr = outer.RemoteAddr
 		req.Host = outer.Host
