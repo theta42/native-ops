@@ -311,6 +311,10 @@ func splitPort(value PortRef, defaultAddr string) (addr, port string, err error)
 	return addr, port, nil
 }
 
+// serviceUnitRe matches a safe systemd unit / /etc/default file name (the shape incus.ValidName
+// accepts): a service's `service:` override must be one.
+var serviceUnitRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+
 // ServiceConfig defines a static infrastructure service (e.g. gitea, plane, edge).
 type ServiceConfig struct {
 	Name        string            `yaml:"name"`
@@ -320,11 +324,22 @@ type ServiceConfig struct {
 	Volumes     []VolumeMount     `yaml:"volumes"`
 	Env         map[string]string `yaml:"env,omitempty"`
 	EnvFile     string            `yaml:"env_file,omitempty"`
-	Limits      map[string]string `yaml:"limits,omitempty"` // e.g. limits.cpu: 2
+	Service     string            `yaml:"service,omitempty"` // systemd unit + /etc/default/<service> when it differs from the instance name
+	Limits      map[string]string `yaml:"limits,omitempty"`  // e.g. limits.cpu: 2
 	HealthCheck HealthCheckConfig `yaml:"healthcheck,omitempty"`
 	Routing     *RoutingConfig    `yaml:"routing,omitempty"`
 	Forwards    []PortForward     `yaml:"forwards,omitempty"`
 	Hooks       ServiceHooks      `yaml:"hooks,omitempty"`
+}
+
+// Unit is the systemd unit (and /etc/default/<name>) this service runs: Service when set, else the
+// instance Name. A service whose unit is not named after its instance (env file, restart) declares
+// `service:` so apply converges the right unit instead of one that does not exist.
+func (s ServiceConfig) Unit() string {
+	if s.Service != "" {
+		return s.Service
+	}
+	return s.Name
 }
 
 type ServiceHooks struct {
@@ -405,6 +420,9 @@ func LoadServiceConfig(path string) (*ServiceConfig, error) {
 	}
 	if svc.EnvFile != "" && !RelativeInside(svc.EnvFile) {
 		return nil, fmt.Errorf("service config %s: env_file %q must be a relative path inside the config directory", path, svc.EnvFile)
+	}
+	if svc.Service != "" && !serviceUnitRe.MatchString(svc.Service) {
+		return nil, fmt.Errorf("service config %s: service %q is not a valid unit name", path, svc.Service)
 	}
 
 	return &svc, nil
