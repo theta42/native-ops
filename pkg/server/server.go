@@ -90,6 +90,12 @@ type Options struct {
 	Users    *UserStore
 	Sessions *Sessions
 	OIDC     *OIDCConfig
+	// OAuth, with Sessions and Users, makes the daemon an OAuth authorization server for /mcp, so an MCP
+	// client connects by signing its person in instead of holding an API token (see oauth.go). PublicURL
+	// is the daemon's public origin (e.g. https://native-ops.example.com), named in the OAuth metadata;
+	// empty takes it from each request.
+	OAuth     *OAuthStore
+	PublicURL string
 	// JobDrain is how long a shutdown waits for a running apply to finish (default 5 minutes).
 	JobDrain  time.Duration
 	Version   string
@@ -115,6 +121,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if (opts.Users != nil || opts.OIDC != nil) && opts.Sessions == nil {
 		return nil, errors.New("local users and OIDC sign-in need a session signer")
+	}
+	if opts.OAuth != nil && (opts.Sessions == nil || opts.Users == nil) {
+		return nil, errors.New("OAuth for MCP needs sign-in (a user store and a session signer): its tokens act as a signed-in person")
 	}
 	if opts.OIDC != nil && opts.Users == nil {
 		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
@@ -204,6 +213,22 @@ func (s *Server) authScoped(min Role, next http.HandlerFunc) http.Handler {
 
 func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A request an MCP tool makes carries the caller /mcp already authenticated (see mcpDo): only
+		// code in this process can put it there.
+		if c, ok := r.Context().Value(mcpCallerKey{}).(mcpCaller); ok {
+			if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
+				h.name, h.role, h.scope = c.name, c.role, c.scope
+			}
+			switch {
+			case !c.role.Allows(min):
+				writeError(w, http.StatusForbidden, "forbidden", "this caller's role cannot do that")
+			case c.scope != nil && !allowScoped:
+				writeError(w, http.StatusForbidden, "forbidden", "this token is limited to managing its own instances")
+			default:
+				next(w, r)
+			}
+			return
+		}
 		// A person signed in through the UI first: the session cookie carries a username and role, and a
 		// session is never scoped, so it may call any endpoint its role allows.
 		if s.opts.Sessions != nil {
@@ -448,6 +473,21 @@ func (s *Server) Handler() http.Handler {
 	}
 	if s.opts.DNSSync != nil {
 		mux.Handle("POST /v1/dns/sync", s.auth(RoleDeployer, s.handleDNSSync))
+	}
+	if s.opts.OAuth != nil {
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource", oauthPublic(s.handleProtectedResource))
+		mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", oauthPublic(s.handleProtectedResource))
+		mux.HandleFunc("GET /.well-known/oauth-authorization-server", oauthPublic(s.handleAuthServerMetadata))
+		mux.HandleFunc("OPTIONS /.well-known/", oauthPublic(nil))
+		mux.HandleFunc("POST /oauth/register", oauthPublic(s.handleOAuthRegister))
+		mux.HandleFunc("POST /oauth/token", oauthPublic(s.handleOAuthToken))
+		mux.HandleFunc("POST /oauth/revoke", oauthPublic(s.handleOAuthRevoke))
+		mux.HandleFunc("OPTIONS /oauth/", oauthPublic(nil))
+		mux.HandleFunc("GET /oauth/authorize", s.handleOAuthAuthorize)
+		mux.HandleFunc("POST /oauth/authorize", s.handleOAuthConsent)
+		mux.HandleFunc("POST /oauth/login", s.handleOAuthLogin)
+		mux.Handle("GET /v1/oauth/grants", s.auth(RoleAdmin, s.handleOAuthGrants))
+		mux.Handle("DELETE /v1/oauth/grants/{id}", s.auth(RoleAdmin, s.handleOAuthGrantRevoke))
 	}
 	// The MCP endpoint's tools call the daemon's other endpoints through the whole handler (see mcp.go).
 	var handler http.Handler

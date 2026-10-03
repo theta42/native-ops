@@ -30,6 +30,9 @@ func TestTheOpenAPIDocumentMatchesTheRoutes(t *testing.T) {
 	re := regexp.MustCompile(`mux\.Handle(?:Func)?\("([A-Z]+) (/[^"]*)"`)
 	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
 		method, path := strings.ToLower(m[1]), m[2]
+		if method == "options" { // CORS preflight for the OAuth endpoints, not an operation
+			continue
+		}
 		if path == "/{$}" || path == "/index.html" || strings.HasPrefix(path, "/static") {
 			continue
 		}

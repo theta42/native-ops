@@ -54,6 +54,9 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/images/prune` | deployer (unscoped) | image retention as a job: delete images no instance runs that are orphans or old tags (`?dry_run=1` reports only; with `--enable-image-build`) |
 | `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see |
 | `POST /mcp` (`GET`, `DELETE`: 405) | viewer, bearer token only | the Model Context Protocol server: the deploy, job, plan and status endpoints as tools for AI agents, with the caller's token and role ([api.md](api.md#mcp)) |
+| `GET /.well-known/oauth-protected-resource` (and `/.well-known/oauth-protected-resource/mcp`), `GET /.well-known/oauth-authorization-server` | none | OAuth discovery for `/mcp` (RFC 9728, RFC 8414), with sign-in on and `--mcp-oauth` (the default) |
+| `POST /oauth/register`, `GET`/`POST /oauth/authorize`, `POST /oauth/login`, `POST /oauth/token`, `POST /oauth/revoke` | none (a sign-in, then consent) | an MCP client registers, sends its person through the daemon's sign-in and a consent page, and gets tokens that act as that person, at `/mcp` only ([api.md](api.md#connect-by-signing-in-oauth)) |
+| `GET /v1/oauth/grants`, `DELETE /v1/oauth/grants/{id}` | admin | which MCP clients people signed in, and revoking one (also on the UI's Tokens page) |
 | `GET /openapi.json`, `GET /openapi.yaml` | none | the OpenAPI 3.1 description of every endpoint here (the same on every daemon; no host data) |
 | `GET /` | none | the UI (Overview, Instances, Volumes, Network). It holds no data; it signs in (or takes a token) and calls `/v1/status` |
 
@@ -631,6 +634,8 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--oidc-allowed-domain` | `NATIVE_OPS_OIDC_ALLOWED_DOMAIN` | any | only emails at this domain may sign in |
 | `--oidc-role` | `NATIVE_OPS_OIDC_ROLE` | `viewer` | the role a newly seen OIDC user gets |
 | `--oidc-label` | `NATIVE_OPS_OIDC_LABEL` | `single sign-on` | the sign-in button's text |
+| `--mcp-oauth` | `NATIVE_OPS_MCP_OAUTH` | on (with sign-in) | MCP clients connect by signing their person in (OAuth), acting with that person's role; `false` turns it off ([api.md](api.md#connect-by-signing-in-oauth)) |
+| `--public-url` | `NATIVE_OPS_PUBLIC_URL` | the origin of `--oidc-redirect-url` | the daemon's public origin, named in the OAuth metadata (else each request's) |
 
 Environment only: `NATIVE_OPS_BOOTSTRAP_TOKEN` or `NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256` (the first admin
 token). Read through the secret store, then the environment: the names in the credentials table above.
