@@ -53,6 +53,49 @@ func (e *EdgeManager) Container() string { return e.edgeContainer }
 
 // RenderSiteBlock generates a Caddy site block.
 func RenderSiteBlock(domain, upstreamIP string, upstreamPort int, tls string, extra []string) string {
+	return RenderSite("", config.RoutingConfig{Domain: domain, UpstreamPort: upstreamPort, TLS: tls, ExtraDirectives: extra}, upstreamIP)
+}
+
+// RenderSite generates the site block for a route. A route with a cache or a rate limit puts them and the
+// reverse_proxy in a `route` block, which runs them in the order written (limit, then cache, then the
+// upstream) without the Caddyfile's global `order` options, which native-ops never edits. A route with
+// neither renders exactly as it always has, so turning this feature on changes no existing site.
+func RenderSite(siteName string, r config.RoutingConfig, upstreamIP string) string {
+	if r.Cache == nil && r.RateLimit == nil {
+		return renderPlainSite(r.Domain, upstreamIP, r.UpstreamPort, r.TLS, r.ExtraDirectives)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s {\n", r.Domain)
+	if r.TLS != "" {
+		fmt.Fprintf(&sb, "    tls %s\n", r.TLS)
+	}
+	for _, line := range r.ExtraDirectives {
+		fmt.Fprintf(&sb, "    %s\n", line)
+	}
+	sb.WriteString("    route {\n")
+	if rl := r.RateLimit; rl != nil {
+		zone := siteName
+		if zone == "" {
+			zone = "site"
+		}
+		sb.WriteString("        rate_limit {\n")
+		fmt.Fprintf(&sb, "            zone %s {\n", zone)
+		if len(rl.Paths) > 0 {
+			fmt.Fprintf(&sb, "                match {\n                    path %s\n                }\n", strings.Join(rl.Paths, " "))
+		}
+		fmt.Fprintf(&sb, "                key {client_ip}\n                events %d\n                window %s\n", rl.Requests, rl.Window)
+		sb.WriteString("            }\n        }\n")
+	}
+	if c := r.Cache; c != nil {
+		fmt.Fprintf(&sb, "        @native_ops_cache path %s\n", strings.Join(c.Paths, " "))
+		fmt.Fprintf(&sb, "        cache @native_ops_cache {\n            ttl %s\n        }\n", c.TTLOrDefault())
+	}
+	fmt.Fprintf(&sb, "        reverse_proxy %s:%d\n", upstreamIP, r.UpstreamPort)
+	sb.WriteString("    }\n}\n")
+	return sb.String()
+}
+
+func renderPlainSite(domain, upstreamIP string, upstreamPort int, tls string, extra []string) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("%s {\n", domain))
 	if tls != "" {
@@ -218,11 +261,14 @@ func (e *EdgeManager) PublishSite(ctx context.Context, siteName string, routing 
 	if routing.UpstreamPort < 1 || routing.UpstreamPort > 65535 {
 		return fmt.Errorf("invalid upstream port %d", routing.UpstreamPort)
 	}
+	if err := e.checkEdgeOptions(ctx, routing); err != nil {
+		return err
+	}
 	if err := e.EnsureBaseCaddyfile(ctx); err != nil {
 		return err
 	}
 
-	desired := RenderSiteBlock(routing.Domain, upstreamIP, routing.UpstreamPort, routing.TLS, routing.ExtraDirectives)
+	desired := RenderSite(siteName, routing, upstreamIP)
 	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
 	if err != nil {
 		return err
@@ -386,6 +432,9 @@ func (e *EdgeManager) PlanSiteFor(ctx context.Context, siteName string, routing 
 	if routing.UpstreamPort < 1 || routing.UpstreamPort > 65535 {
 		return plan, fmt.Errorf("invalid upstream port %d", routing.UpstreamPort)
 	}
+	if err := e.checkEdgeOptions(ctx, routing); err != nil {
+		return plan, err
+	}
 	base, foundBase, err := e.incus.PullFile(ctx, e.edgeContainer, caddyfilePath)
 	if err != nil {
 		return plan, err
@@ -416,7 +465,7 @@ func (e *EdgeManager) PlanSiteFor(ctx context.Context, siteName string, routing 
 	if err != nil {
 		return plan, err
 	}
-	desired := RenderSiteBlock(routing.Domain, choose, routing.UpstreamPort, routing.TLS, routing.ExtraDirectives)
+	desired := RenderSite(siteName, routing, choose)
 	switch {
 	case hadPrev && prev == desired:
 	case hadPrev:
@@ -425,6 +474,52 @@ func (e *EdgeManager) PlanSiteFor(ctx context.Context, siteName string, routing 
 		plan.Change, plan.Detail = "create", "there is no site file for "+routing.Domain
 	}
 	return plan, nil
+}
+
+// The Caddy modules a route's options need, by option.
+const (
+	cacheModule     = "http.handlers.cache"      // github.com/caddyserver/cache-handler
+	rateLimitModule = "http.handlers.rate_limit" // github.com/mholt/caddy-ratelimit
+)
+
+// checkEdgeOptions validates a route's cache and rate limit and, when it has either, that the edge's
+// Caddy carries the plugin for it: without it the site would fail `caddy validate` (and be rolled back)
+// with a less helpful message, and a plan would not see it coming.
+func (e *EdgeManager) checkEdgeOptions(ctx context.Context, routing config.RoutingConfig) error {
+	if err := routing.ValidateEdgeOptions(); err != nil {
+		return fmt.Errorf("route %s: %w", routing.Domain, err)
+	}
+	var need []string
+	if routing.Cache != nil {
+		need = append(need, cacheModule)
+	}
+	if routing.RateLimit != nil {
+		need = append(need, rateLimitModule)
+	}
+	if len(need) == 0 {
+		return nil
+	}
+	out, err := e.exec.Run(ctx, "incus exec "+incus.ShQuote(e.edgeContainer)+" -- caddy list-modules")
+	if err != nil {
+		return fmt.Errorf("could not list the edge's Caddy modules: %w", err)
+	}
+	have := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		have[strings.TrimSpace(line)] = true
+	}
+	for _, m := range need {
+		if !have[m] {
+			return fmt.Errorf("route %s uses %s, but the edge's Caddy has no %s module: rebuild the edge image with the plugin (native-ops images/edge includes it)", routing.Domain, optionFor(m), m)
+		}
+	}
+	return nil
+}
+
+func optionFor(module string) string {
+	if module == cacheModule {
+		return "cache"
+	}
+	return "rate_limit"
 }
 
 // RemoveSite deletes a site file and reloads Caddy. Removing a site that is not

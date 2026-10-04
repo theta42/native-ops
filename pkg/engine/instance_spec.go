@@ -30,6 +30,10 @@ type InstanceSpec struct {
 	// Domain publishes a route to Health.Port through the edge.
 	Domain          string   `json:"domain,omitempty"`
 	RouteDirectives []string `json:"route_directives,omitempty"` // "import <snippet>" only, from InstancePolicy.RouteImports
+	// Cache and RateLimit are the route's edge cache and per-client rate limit (config.RouteCache,
+	// config.RouteRateLimit); they need a domain.
+	Cache     *config.RouteCache     `json:"cache,omitempty"`
+	RateLimit *config.RouteRateLimit `json:"rate_limit,omitempty"`
 }
 
 // VolumeSpec is a data volume; its name must start with the instance's name and a dash.
@@ -134,8 +138,14 @@ func (s *InstanceSpec) Validate(name string, pol InstancePolicy) error {
 		if s.Health == nil {
 			return fmt.Errorf("a domain needs health.port (the port the route points at)")
 		}
-	} else if len(s.RouteDirectives) > 0 {
-		return fmt.Errorf("route_directives need a domain")
+	} else if len(s.RouteDirectives) > 0 || s.Cache != nil || s.RateLimit != nil {
+		return fmt.Errorf("route_directives, cache and rate_limit need a domain")
+	}
+	if err := s.Cache.Validate(); err != nil {
+		return err
+	}
+	if err := s.RateLimit.Validate(); err != nil {
+		return err
 	}
 	for _, d := range s.RouteDirectives {
 		m := importRe.FindStringSubmatch(d)
@@ -178,6 +188,8 @@ func (s *InstanceSpec) TemplateConfig() *config.TemplateConfig {
 		Profiles:          s.Profiles,
 		DefaultLimits:     s.Limits,
 		RoutingDirectives: s.RouteDirectives,
+		RoutingCache:      s.Cache,
+		RoutingRateLimit:  s.RateLimit,
 	}
 	for _, v := range s.Volumes {
 		shifted := true

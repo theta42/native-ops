@@ -195,6 +195,8 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 			Domain:          domain,
 			UpstreamPort:    port,
 			ExtraDirectives: p.Template.RoutingDirectives,
+			Cache:           p.Template.RoutingCache,
+			RateLimit:       p.Template.RoutingRateLimit,
 		}
 		ips, err := m.incus.GlobalIPv4s(ctx, p.Name)
 		if err != nil {

@@ -24,6 +24,7 @@ type edgeSim struct {
 	restarts    int
 	rejectWhen  string // `caddy validate` fails while any file contains this
 	reloadFails bool
+	modules     string // what `caddy list-modules` prints
 
 	// resolvBroken simulates whether the container can currently resolve its own hostname -- false (the
 	// default) is a resolver that already works by some other means (a fresh container's systemd-resolved
@@ -57,6 +58,8 @@ func (s *edgeSim) Run(_ context.Context, cmd string) (string, error) {
 		return "", nil
 	}
 	switch {
+	case strings.Contains(cmd, "caddy list-modules"):
+		return s.modules, nil
 	case strings.Contains(cmd, "caddy validate"):
 		if s.rejectWhen != "" {
 			for _, c := range s.files {
