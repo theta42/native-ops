@@ -213,6 +213,11 @@ type RoutingConfig struct {
 	UpstreamPort    int      `yaml:"upstream_port"` // e.g. 3000
 	TLS             string   `yaml:"tls,omitempty"` // e.g. "dns digitalocean" or "internal"
 	ExtraDirectives []string `yaml:"extra_directives,omitempty"`
+	// Cache and RateLimit are HTTP response caching and per-client request limits at the edge, for
+	// this route only (see RouteCache, RouteRateLimit). They need the edge's Caddy to carry the
+	// cache-handler and caddy-ratelimit plugins (images/edge does).
+	Cache     *RouteCache     `yaml:"cache,omitempty"`
+	RateLimit *RouteRateLimit `yaml:"rate_limit,omitempty"`
 }
 
 // PortForward is a generic raw port forward: a TCP/UDP port on the host published straight into an
@@ -360,9 +365,12 @@ type TemplateConfig struct {
 	HealthCheck    HealthCheckConfig `yaml:"healthcheck,omitempty"`
 	RoutingPattern string            `yaml:"routing_pattern,omitempty"` // e.g. "{slug}.example.com"
 	// RoutingDirectives are extra Caddy directives for the route (for example "import strip-forged-identity").
-	RoutingDirectives []string      `yaml:"routing_directives,omitempty"`
-	Forwards          []PortForward `yaml:"forwards,omitempty"`
-	Hooks             ServiceHooks  `yaml:"hooks,omitempty"`
+	RoutingDirectives []string `yaml:"routing_directives,omitempty"`
+	// RoutingCache and RoutingRateLimit are the route's edge cache and rate limit (see RoutingConfig).
+	RoutingCache     *RouteCache     `yaml:"routing_cache,omitempty"`
+	RoutingRateLimit *RouteRateLimit `yaml:"routing_rate_limit,omitempty"`
+	Forwards         []PortForward   `yaml:"forwards,omitempty"`
+	Hooks            ServiceHooks    `yaml:"hooks,omitempty"`
 }
 
 // HostSpec defines the parameters to create or resize a host VM / Droplet.

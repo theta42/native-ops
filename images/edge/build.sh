@@ -1,22 +1,29 @@
 #!/bin/bash
-# Edge image: Caddy with DigitalOcean DNS plugin for wildcard TLS.
-# Downloads pre-built Caddy binary with the DO DNS plugin from the download API.
+# Edge image: Caddy with the DigitalOcean DNS plugin (wildcard TLS), and the plugins behind a route's
+# `cache` (cache-handler) and `rate_limit` (caddy-ratelimit) options. Downloads a pre-built Caddy binary
+# with them from the download API.
 # Replaces do-ops/edge/Dockerfile.caddy with native LXC build.
 set -euo pipefail
 
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends ca-certificates curl
 
-# Download Caddy with DO DNS plugin (pre-built, no Go toolchain needed)
-curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com%2Fcaddy-dns%2Fdigitalocean" \
+# Download Caddy with the plugins (pre-built, no Go toolchain needed)
+curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com%2Fcaddy-dns%2Fdigitalocean&p=github.com%2Fcaddyserver%2Fcache-handler&p=github.com%2Fmholt%2Fcaddy-ratelimit" \
   -o /usr/local/bin/caddy
 chmod +x /usr/local/bin/caddy
 
 # Verify
 /usr/local/bin/caddy version
-/usr/local/bin/caddy list-modules 2>&1 | grep -q "dns.providers.digitalocean" \
-  && echo "digitalocean DNS plugin: OK" \
-  || (echo "digitalocean DNS plugin: MISSING" >&2; exit 1)
+modules=$(/usr/local/bin/caddy list-modules 2>&1)
+for m in dns.providers.digitalocean http.handlers.cache http.handlers.rate_limit; do
+  if grep -qx "$m" <<<"$modules"; then
+    echo "$m: OK"
+  else
+    echo "$m: MISSING" >&2
+    exit 1
+  fi
+done
 
 # Install supporting files
 mkdir -p /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy

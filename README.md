@@ -15,6 +15,7 @@
   - **Level 2 (Workload Mobility)**: Cross-host container and volume migration (`native-ops instance migrate`) across cloud providers and on-prem nodes.
 - **Pluggable DNS Architecture**: Native DigitalOcean DNS support + extensible Python/Bash script plugins (`providers/dns/*.py`) defined in user configuration repos.
 - **Git + CI is the only control path**: nobody installs or runs a control app on their own machine. A pull request plans, an admin approves the exact plan, and the merge applies it -- all from CI (GitHub Actions, Gitea Actions) talking over HTTPS to the **native-ops daemon that runs on each host**. CI never holds an SSH key.
+- **Edge caching and rate limiting per route**: a manifest's `routing.cache` and `routing.rate_limit` become Caddy configuration for that route only.
 - **Immutable Container Lifecycle**: Rebuild and replace, never live patch. Automated volume snapshotting before updates.
 - **One static Go binary**: the same binary is the daemon on the host and the client in CI (`native-ops remote ...`).
 
@@ -326,6 +327,14 @@ healthcheck:
 routing:
   domain: git.example.com
   upstream_port: 3000
+  # Optional, per route, at the edge (both off unless set):
+  cache:                 # cache responses for these paths; upstream Cache-Control is honoured
+    ttl: 5m              # for responses that do not say (default 2m)
+    paths: ["/assets/*", "/avatars/*"]   # required: "/*" caches the whole site
+  rate_limit:            # per client address; over it, 429 with Retry-After
+    requests: 120
+    window: 1m
+    paths: ["/api/*"]    # optional; default is every path
 # Raw host ports forwarded into the instance, for a protocol the edge cannot
 # carry (git-over-SSH). Converged on every deploy, so an immutable replace keeps them.
 forwards:
@@ -334,6 +343,15 @@ forwards:
     listen: 2222    # host port, or "address:port" (default 0.0.0.0)
     target: 2222    # instance port, or "address:port" (default 127.0.0.1)
 ```
+
+A route's `cache` and `rate_limit` are rendered into the site file native-ops publishes, inside a
+`route` block (limit, then cache, then the upstream), so they need no global options in the Caddyfile.
+They need the edge's Caddy to carry the [cache-handler](https://github.com/caddyserver/cache-handler) and
+[caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) plugins, which `images/edge` includes; a plan
+blocks, naming the missing module, when the edge lacks one. The client address is Caddy's `{client_ip}`:
+behind another proxy or CDN, set `trusted_proxies` in the Caddyfile's global options so each client is
+counted on its own. Cache only what is the same for everyone (static assets, public pages): a cached
+response is served to every visitor of that path. A route with neither option renders exactly as before.
 
 A volume's `shifted` defaults to true: native-ops creates it with `security.shifted=true`, so its files
 keep the instance's own IDs and it can be attached to a replacement or restored instance unchanged. An
@@ -359,7 +377,15 @@ healthcheck:
   path: /health
   port: 8787
 routing_pattern: "{slug}.example.com"
+routing_cache:           # optional, as a service's routing.cache
+  paths: ["/assets/*"]
+routing_rate_limit:      # optional, as a service's routing.rate_limit
+  requests: 300
+  window: 1m
 ```
+
+A tenant instance asked for over the daemon's API (`PUT /v1/instances/{name}`) may carry `cache` and
+`rate_limit` the same way.
 
 ---
 

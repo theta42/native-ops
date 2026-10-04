@@ -405,3 +405,28 @@ func TestPurgeNeverTakesAVolumeThatOnlySharesAPrefix(t *testing.T) {
 		t.Fatalf("only volumes named <instance>-... are purged: %v", sim.volumes)
 	}
 }
+
+func TestASpecMayCacheAndRateLimitItsRoute(t *testing.T) {
+	s := platformSpec()
+	s.Cache = &config.RouteCache{TTL: "10m", Paths: []string{"/assets/*"}}
+	s.RateLimit = &config.RouteRateLimit{Requests: 300, Window: "1m"}
+	if err := s.Validate("demo-multi", testPolicy); err != nil {
+		t.Fatalf("a valid cache and rate limit: %v", err)
+	}
+	if tc := s.TemplateConfig(); tc.RoutingCache != s.Cache || tc.RoutingRateLimit != s.RateLimit {
+		t.Fatal("the template carries the route's cache and rate limit")
+	}
+	for name, change := range map[string]func(s *InstanceSpec){
+		"a cache without a domain":    func(s *InstanceSpec) { s.Domain, s.RouteDirectives, s.RateLimit = "", nil, nil },
+		"a cache without paths":       func(s *InstanceSpec) { s.Cache = &config.RouteCache{} },
+		"a rate limit with no window": func(s *InstanceSpec) { s.RateLimit = &config.RouteRateLimit{Requests: 5} },
+		"a path that injects a block": func(s *InstanceSpec) { s.Cache = &config.RouteCache{Paths: []string{"/x {"}} },
+	} {
+		bad := platformSpec()
+		bad.Cache, bad.RateLimit = s.Cache, s.RateLimit
+		change(&bad)
+		if err := bad.Validate("demo-multi", testPolicy); err == nil {
+			t.Errorf("%s must be refused", name)
+		}
+	}
+}

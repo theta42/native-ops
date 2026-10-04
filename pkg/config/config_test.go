@@ -266,3 +266,25 @@ func TestVolumeShiftedDefaultsToTrue(t *testing.T) {
 		t.Fatalf("volumes: %+v (an omitted shifted is true, an explicit false is kept)", svc.Volumes)
 	}
 }
+
+func TestARouteReadsItsCacheAndRateLimitFromYAML(t *testing.T) {
+	var svc ServiceConfig
+	doc := "name: web\nrouting:\n  domain: www.example.com\n  upstream_port: 3000\n  cache:\n    ttl: 5m\n    paths: [\"/static/*\"]\n  rate_limit:\n    requests: 120\n    window: 1m\n    paths: [\"/api/*\"]\n"
+	if err := yaml.Unmarshal([]byte(doc), &svc); err != nil {
+		t.Fatal(err)
+	}
+	r := svc.Routing
+	if r.Cache == nil || r.Cache.TTL != "5m" || r.Cache.Paths[0] != "/static/*" || r.RateLimit == nil || r.RateLimit.Requests != 120 || r.RateLimit.Window != "1m" {
+		t.Fatalf("routing: %+v cache %+v limit %+v", r, r.Cache, r.RateLimit)
+	}
+	if err := r.ValidateEdgeOptions(); err != nil {
+		t.Fatal(err)
+	}
+	var tpl TemplateConfig
+	if err := yaml.Unmarshal([]byte("name: platform\nrouting_cache:\n  paths: [\"/assets/*\"]\nrouting_rate_limit:\n  requests: 60\n  window: 30s\n"), &tpl); err != nil {
+		t.Fatal(err)
+	}
+	if tpl.RoutingCache == nil || tpl.RoutingRateLimit == nil || tpl.RoutingCache.TTLOrDefault() != "2m" {
+		t.Fatalf("template: %+v", tpl)
+	}
+}
