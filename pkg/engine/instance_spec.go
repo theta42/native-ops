@@ -34,6 +34,9 @@ type InstanceSpec struct {
 	// config.RouteRateLimit); they need a domain.
 	Cache     *config.RouteCache     `json:"cache,omitempty"`
 	RateLimit *config.RouteRateLimit `json:"rate_limit,omitempty"`
+	// Labels describe what the instance is (see ValidateLabels; `environment` is a closed set). Absent
+	// leaves an existing instance's labels as they are; present, even empty, is the whole set it carries.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // VolumeSpec is a data volume; its name must start with the instance's name and a dash.
@@ -141,6 +144,9 @@ func (s *InstanceSpec) Validate(name string, pol InstancePolicy) error {
 	} else if len(s.RouteDirectives) > 0 || s.Cache != nil || s.RateLimit != nil {
 		return fmt.Errorf("route_directives, cache and rate_limit need a domain")
 	}
+	if err := ValidateLabels(s.Labels); err != nil {
+		return err
+	}
 	if err := s.Cache.Validate(); err != nil {
 		return err
 	}
@@ -190,6 +196,7 @@ func (s *InstanceSpec) TemplateConfig() *config.TemplateConfig {
 		RoutingDirectives: s.RouteDirectives,
 		RoutingCache:      s.Cache,
 		RoutingRateLimit:  s.RateLimit,
+		Labels:            s.Labels,
 	}
 	for _, v := range s.Volumes {
 		shifted := true

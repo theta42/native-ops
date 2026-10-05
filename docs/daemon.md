@@ -48,11 +48,12 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `PUT /v1/users/by-email/{email}` | admin | give the user with this email a role (and `disabled`), creating it to sign in over OIDC if there is none: how a directory grants access before a first sign-in and removes it after someone leaves |
 | `GET /v1/images/recipes`, `POST /v1/images/recipes/{digest}/approve`, `DELETE /v1/images/recipes/{digest}/approval` | admin | the image recipes builds were asked for, and approving or withdrawing one (with `--enable-image-build`) |
 | `PUT /v1/instances/{name}`, `POST /v1/instances/{name}/update`, `DELETE /v1/instances/{name}` | deployer | create, move to another image, or remove a tenant instance, as a job (only with `--enable-instances`) |
+| `PATCH /v1/instances/{name}/labels` | deployer | change a tenant instance's labels live (`{"set": {...}, "remove": [...]}`), as a job; no restart |
 | `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
 | `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
 | `POST /v1/images/build` | deployer | build and publish an application image from an uploaded configuration tree, as a job (only with `--enable-image-build`) |
 | `POST /v1/images/prune` | deployer (unscoped) | image retention as a job: delete images no instance runs that are orphans or old tags (`?dry_run=1` reports only; with `--enable-image-build`) |
-| `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see |
+| `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see, with their labels; `?label=environment=production` (repeatable) keeps those carrying every label given |
 | `POST /mcp` (`GET`, `DELETE`: 405) | viewer, bearer token only | the Model Context Protocol server: the deploy, job, plan and status endpoints as tools for AI agents, with the caller's token and role ([api.md](api.md#mcp)) |
 | `GET /.well-known/oauth-protected-resource` (and `/.well-known/oauth-protected-resource/mcp`), `GET /.well-known/oauth-authorization-server` | none | OAuth discovery for `/mcp` (RFC 9728, RFC 8414), with sign-in on and `--mcp-oauth` (the default) |
 | `POST /oauth/register`, `GET`/`POST /oauth/authorize`, `POST /oauth/login`, `POST /oauth/token`, `POST /oauth/revoke` | none (a sign-in, then consent) | an MCP client registers, sends its person through the daemon's sign-in and a consent page, and gets tokens that act as that person, at `/mcp` only ([api.md](api.md#connect-by-signing-in-oauth)) |
@@ -261,7 +262,8 @@ this API, without holding a key to the host. Off unless the daemon is started wi
 ```bash
 # a token that can only ever manage demo-*/cust-* instances, from one image family, on one zone
 native-ops remote token-create --name fleet-manager --role deployer \
-    --names 'demo-*,cust-*' --images 'acme-app:*' --domains '*.acme.example'
+    --names 'demo-*,cust-*' --images 'acme-app:*' --domains '*.acme.example' \
+    --labels 'environment=staging,testing'
 
 curl -X PUT "$URL/v1/instances/demo-one" -H "Authorization: Bearer $TOKEN" -d '{
   "template": "app", "image": "acme-app:latest",
@@ -289,6 +291,7 @@ What stops a fleet manager, or anyone holding its token, from doing more than th
 - **A scope.** A token created with `--names`/`--images`/`--domains` (globs) can call only these endpoints, and
   only for instances, images and domains that match; it is refused everywhere else (plan, apply, status). It
   must be a `deployer` token and needs names and images (no domains means no route may be published).
+  `--labels` adds the instances' labels to the scope (see below).
 - **A strict spec.** A request is checked against a short list of shapes before anything runs: only the
   profiles the operator allows (`--instance-profiles`, default `base,service`), only `limits.cpu` and
   `limits.memory`, data volumes named `<instance>-...` at clean absolute paths (`owner`, if given, only a
@@ -352,6 +355,36 @@ The approval is per recipe, not per build: a release pipeline building a new ref
 recipe needs nothing, while any change to a build script waits for its deploy tag. **After upgrading a
 daemon to a version with this check, deploy a tag (or approve the current recipe) once**, or the next
 build is refused.
+
+### Labels: what an instance is
+
+An instance can carry **labels**, a small map that says what it is for. They are stored on the instance
+itself, as `user.native-ops.label.<key>` next to the other bookkeeping keys, so they survive an update, a
+rollback and a resize (the whole config is carried over) and need nothing to run beyond Incus.
+
+```bash
+curl -X PUT  "$URL/v1/instances/rest-acme" -d '{ ..., "labels": {"environment": "production", "app": "platform"} }'
+curl -X PATCH "$URL/v1/instances/rest-acme/labels" -d '{"set": {"upgrade-window": "us-east-night"}, "remove": ["app"]}'
+curl "$URL/v1/instances?label=environment=production"
+```
+
+- **`environment` is a closed set:** `production`, `staging`, `testing`, `development` or `demo`. Anything else
+  is refused (a spec, a label change or a token scope that names it). The set is fixed in native-ops, not
+  configured per host, so every deployment means the same thing by it; adding a value is a reviewed change
+  to native-ops. Every other label is free-form: at most 16 per instance, a lowercase name (letters, digits,
+  dashes, at most 32 characters) and a plain value (1-63 letters, digits, dots, dashes or underscores).
+- **In a spec**, `labels` absent leaves an existing instance's labels as they are; present, even empty, is the
+  whole set it carries (`PUT` converges to it). A new instance is created with them.
+- **`PATCH .../labels`** adds, changes and removes labels live, as an audited job, with no restart or
+  replacement. Only a tenant instance (one launched from a template) can be changed here.
+- **Listing**: each instance shows its `labels`; `GET /v1/instances?label=k=v` (repeatable) keeps the ones that
+  carry every label given. An instance with no labels is allowed (every instance made before labels
+  existed), and is never matched by a label filter or a label scope.
+- **Scope.** `token-create --labels 'environment=staging,testing;app=platform'` limits a token to instances
+  carrying one of the listed values for **each** label named. Such a token only sees those instances (anything
+  else looks like it does not exist), cannot update, resize, suspend, delete or relabel one outside its scope,
+  cannot create an instance without the labels or with other values, and cannot relabel one of its own into
+  another environment. A staging token physically cannot touch production, whatever it is asked to do.
 
 ### Image retention
 

@@ -29,6 +29,7 @@ type fakeOps struct {
 	suspended []engine.SuspendRequest
 	deleted   []string
 	purged    []bool
+	labeled   []labelCall
 	err       error
 	block     chan struct{}
 	started   chan struct{}
@@ -93,6 +94,21 @@ func (f *fakeOps) Destroy(_ context.Context, name string, purge bool, logf func(
 	f.purged = append(f.purged, purge)
 	f.mu.Unlock()
 	logf("==> destroying %s", name)
+	f.wait()
+	return f.err
+}
+
+type labelCall struct {
+	Name   string
+	Set    map[string]string
+	Remove []string
+}
+
+func (f *fakeOps) SetLabels(_ context.Context, name string, set map[string]string, remove []string, logf func(string, ...any)) error {
+	f.mu.Lock()
+	f.labeled = append(f.labeled, labelCall{name, set, remove})
+	f.mu.Unlock()
+	logf("==> labelling %s", name)
 	f.wait()
 	return f.err
 }

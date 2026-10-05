@@ -59,6 +59,7 @@ type Instance struct {
 	IPv4       []string          `json:"ipv4,omitempty"`
 	Limits     map[string]string `json:"limits,omitempty"`
 	Recorded   map[string]string `json:"recorded,omitempty"`    // user.native-ops.* bookkeeping (image reference, template)
+	Labels     map[string]string `json:"labels,omitempty"`      // user.native-ops.label.*: what the instance is (environment, app, ...)
 	ConfigKeys []string          `json:"config_keys,omitempty"` // names only
 	EnvKeys    []string          `json:"env_keys,omitempty"`    // names only, never values
 	Devices    []Device          `json:"devices,omitempty"`
@@ -143,6 +144,11 @@ func ParseInstances(out string) ([]Instance, error) {
 					in.Limits = map[string]string{}
 				}
 				in.Limits[k] = v
+			case strings.HasPrefix(k, "user.native-ops.label."):
+				if in.Labels == nil {
+					in.Labels = map[string]string{}
+				}
+				in.Labels[strings.TrimPrefix(k, "user.native-ops.label.")] = v
 			case strings.HasPrefix(k, "user.native-ops."):
 				if in.Recorded == nil {
 					in.Recorded = map[string]string{}

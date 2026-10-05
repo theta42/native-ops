@@ -668,6 +668,7 @@ func handleTokenCommand(args []string) {
 	names := flags.String("names", "", "Limit the token to tenant instances with these names, as globs, comma separated, e.g. 'demo-*,rest-*' (create; needs --images, and the deployer role)")
 	images := flags.String("images", "", "The images such a token may launch, as globs, e.g. 'app-platform:*' (create)")
 	domains := flags.String("domains", "", "The domains such a token may publish a route for, as globs, e.g. '*.example.com' (create)")
+	labels := flags.String("labels", "", "Limit the token to instances carrying these labels, key=v1,v2;key2=v3, e.g. 'environment=staging,testing' (create)")
 	id := flags.String("id", "", "Token id (revoke)")
 	_ = flags.Parse(args[1:])
 
@@ -677,7 +678,11 @@ func handleTokenCommand(args []string) {
 	}
 	switch action {
 	case "create":
-		secret, t, err := store.CreateScoped(*name, server.Role(*role), server.Scope{Names: splitList(*names), Images: splitList(*images), Domains: splitList(*domains)})
+		labelScope, err := server.ParseLabelScope(*labels)
+		if err != nil {
+			log.Fatalf("token create: %v", err)
+		}
+		secret, t, err := store.CreateScoped(*name, server.Role(*role), server.Scope{Names: splitList(*names), Images: splitList(*images), Domains: splitList(*domains), Labels: labelScope})
 		if err != nil {
 			log.Fatalf("token create: %v", err)
 		}
@@ -692,7 +697,7 @@ func handleTokenCommand(args []string) {
 		for _, t := range ts {
 			scope := "-"
 			if t.Scoped() {
-				scope = "names=" + strings.Join(t.Scope.Names, ",") + " images=" + strings.Join(t.Scope.Images, ",") + " domains=" + strings.Join(t.Scope.Domains, ",")
+				scope = t.Scope.Summary()
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t.ID, t.Name, t.Role, scope, t.Created.Format("2006-01-02"))
 		}

@@ -371,6 +371,9 @@ type TemplateConfig struct {
 	RoutingRateLimit *RouteRateLimit `yaml:"routing_rate_limit,omitempty"`
 	Forwards         []PortForward   `yaml:"forwards,omitempty"`
 	Hooks            ServiceHooks    `yaml:"hooks,omitempty"`
+	// Labels are written to the instance as user.native-ops.label.<key>. nil leaves an existing instance's
+	// labels alone; non-nil (even empty) is exactly the set it carries.
+	Labels map[string]string `yaml:"labels,omitempty"`
 }
 
 // HostSpec defines the parameters to create or resize a host VM / Droplet.

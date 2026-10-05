@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/theta42/native-ops/pkg/engine"
 	"github.com/theta42/native-ops/pkg/incus"
@@ -22,6 +25,7 @@ type InstanceOps interface {
 	Resize(ctx context.Context, name string, req engine.ResizeRequest, logf func(string, ...any)) error
 	Suspend(ctx context.Context, name string, req engine.SuspendRequest, logf func(string, ...any)) error
 	Destroy(ctx context.Context, name string, purge bool, logf func(string, ...any)) error
+	SetLabels(ctx context.Context, name string, set map[string]string, remove []string, logf func(string, ...any)) error
 }
 
 const maxInstanceBody = 64 << 10
@@ -60,6 +64,74 @@ func checkScope(scope *Scope, name, image, domain string) string {
 		return "this token may not publish the domain " + domain
 	}
 	return ""
+}
+
+// parseLabelFilter reads ?label=k=v (repeatable): an instance must carry every one.
+func parseLabelFilter(raw []string) (map[string]string, error) {
+	var out map[string]string
+	for _, f := range raw {
+		k, v, ok := strings.Cut(f, "=")
+		if !ok || !engine.ValidLabelKey(k) || v == "" {
+			return nil, fmt.Errorf("label must look like environment=production, not %q", f)
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+func hasLabels(have, want map[string]string) bool {
+	for k, v := range want {
+		if have[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// checkLabelScope reports why a token with a label scope may not make this change to the instance called
+// name ("" is fine). It matters only for a token whose scope names labels. The instance's labels *now* must
+// be in scope (so it cannot touch another environment's instance), and so must the labels the change would
+// leave it with: desired, when the caller supplies a whole set (hasDesired), which a new instance must.
+// code is the HTTP status to answer with when msg is not empty.
+func (s *Server) checkLabelScope(ctx context.Context, scope *Scope, name string, desired map[string]string, hasDesired bool) (code int, msg string) {
+	if scope == nil || len(scope.Labels) == 0 {
+		return 0, ""
+	}
+	snap, err := s.snapshot(ctx)
+	if err != nil {
+		log.Printf("instance labels scope %s: %v", name, err)
+		return http.StatusBadGateway, "could not read the host's state to check the token's labels"
+	}
+	exists := false
+	for _, i := range snap.Instances {
+		if i.Name != name {
+			continue
+		}
+		exists = true
+		if !scope.AllowsLabels(i.Labels) {
+			// The same answer as for an instance that is not the caller's to see.
+			return http.StatusForbidden, "this token may not manage an instance called " + name
+		}
+	}
+	if hasDesired && !scope.AllowsLabels(desired) {
+		return http.StatusForbidden, "this token may only manage instances labelled " + scopeLabels(scope) + ", and the change would leave this one outside that"
+	}
+	if !exists && !hasDesired {
+		return http.StatusForbidden, "a token limited to labels (" + scopeLabels(scope) + ") must give the labels of an instance it creates"
+	}
+	return 0, ""
+}
+
+func scopeLabels(scope *Scope) string {
+	parts := []string{}
+	for k, v := range scope.Labels {
+		parts = append(parts, k+"="+strings.Join(v, "|"))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " ")
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -136,6 +208,11 @@ func (s *Server) handleInstancePut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
 		return
 	}
+	if code, msg := s.checkLabelScope(r.Context(), scope, name, spec.Labels, spec.Labels != nil); msg != "" {
+		auditDetail(r, "instance put %s refused: outside the token's labels", name)
+		writeError(w, code, "out_of_scope", msg)
+		return
+	}
 	tpl, exists, err := s.opts.Instances.Template(r.Context(), name)
 	if err != nil {
 		log.Printf("instance put %s: %v", name, err)
@@ -174,6 +251,11 @@ func (s *Server) handleInstanceUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "out_of_scope", msg)
 		return
 	}
+	if code, msg := s.checkLabelScope(r.Context(), scope, name, nil, false); msg != "" {
+		auditDetail(r, "instance update %s refused: outside the token's labels", name)
+		writeError(w, code, "out_of_scope", msg)
+		return
+	}
 	if err := req.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
 		return
@@ -201,6 +283,11 @@ func (s *Server) handleInstanceResize(w http.ResponseWriter, r *http.Request) {
 	if msg := checkScope(scope, name, "", ""); msg != "" {
 		auditDetail(r, "instance resize %s refused: outside the token's scope", name)
 		writeError(w, http.StatusForbidden, "out_of_scope", msg)
+		return
+	}
+	if code, msg := s.checkLabelScope(r.Context(), scope, name, nil, false); msg != "" {
+		auditDetail(r, "instance resize %s refused: outside the token's labels", name)
+		writeError(w, code, "out_of_scope", msg)
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -234,6 +321,11 @@ func (s *Server) handleInstanceSuspend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "out_of_scope", msg)
 		return
 	}
+	if code, msg := s.checkLabelScope(r.Context(), scope, name, nil, false); msg != "" {
+		auditDetail(r, "instance suspend %s refused: outside the token's labels", name)
+		writeError(w, code, "out_of_scope", msg)
+		return
+	}
 	if err := req.Validate(s.opts.InstancePolicy); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
 		return
@@ -257,6 +349,11 @@ func (s *Server) handleInstanceDelete(w http.ResponseWriter, r *http.Request) {
 	if msg := checkScope(scope, name, "", ""); msg != "" {
 		auditDetail(r, "instance delete %s refused: outside the token's scope", name)
 		writeError(w, http.StatusForbidden, "out_of_scope", msg)
+		return
+	}
+	if code, msg := s.checkLabelScope(r.Context(), scope, name, nil, false); msg != "" {
+		auditDetail(r, "instance delete %s refused: outside the token's labels", name)
+		writeError(w, code, "out_of_scope", msg)
 		return
 	}
 	purge := r.URL.Query().Get("purge_volumes") == "true"
@@ -288,16 +385,17 @@ func (s *Server) requireManaged(w http.ResponseWriter, r *http.Request, name, op
 
 // tenantView is a tenant instance as the API shows it.
 type tenantView struct {
-	Name     string   `json:"name"`
-	Status   string   `json:"status"`
-	Template string   `json:"template"`
-	Image    string   `json:"image,omitempty"`
-	IPv4     []string `json:"ipv4,omitempty"`
-	Created  string   `json:"created_at,omitempty"`
+	Name     string            `json:"name"`
+	Status   string            `json:"status"`
+	Template string            `json:"template"`
+	Image    string            `json:"image,omitempty"`
+	IPv4     []string          `json:"ipv4,omitempty"`
+	Created  string            `json:"created_at,omitempty"`
+	Labels   map[string]string `json:"labels,omitempty"`
 }
 
 func viewOfInstance(i status.Instance) tenantView {
-	return tenantView{Name: i.Name, Status: i.Status, Template: i.Recorded["template"], Image: i.Recorded["image"], IPv4: i.IPv4, Created: i.CreatedAt}
+	return tenantView{Name: i.Name, Status: i.Status, Template: i.Recorded["template"], Image: i.Recorded["image"], IPv4: i.IPv4, Created: i.CreatedAt, Labels: i.Labels}
 }
 
 // handleInstanceList is GET /v1/instances: the tenant instances the caller may see.
@@ -309,9 +407,17 @@ func (s *Server) handleInstanceList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, scope := s.actorScope(r)
+	want, err := parseLabelFilter(r.URL.Query()["label"])
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
 	out := []tenantView{}
 	for _, i := range snap.Instances {
-		if i.Recorded["template"] == "" || (scope != nil && !scope.AllowsName(i.Name)) {
+		if i.Recorded["template"] == "" || (scope != nil && (!scope.AllowsName(i.Name) || !scope.AllowsLabels(i.Labels))) {
+			continue
+		}
+		if !hasLabels(i.Labels, want) {
 			continue
 		}
 		out = append(out, viewOfInstance(i))
@@ -330,11 +436,93 @@ func (s *Server) handleInstanceGet(w http.ResponseWriter, r *http.Request) {
 	}
 	_, scope := s.actorScope(r)
 	for _, i := range snap.Instances {
-		if i.Name == name && i.Recorded["template"] != "" && (scope == nil || scope.AllowsName(name)) {
+		if i.Name == name && i.Recorded["template"] != "" && (scope == nil || (scope.AllowsName(name) && scope.AllowsLabels(i.Labels))) {
 			writeJSON(w, http.StatusOK, viewOfInstance(i))
 			return
 		}
 	}
 	// The same answer whether it does not exist or is not the caller's to see.
 	writeError(w, http.StatusNotFound, "not_found", "no such instance")
+}
+
+// handleInstanceLabels is PATCH /v1/instances/{name}/labels {"set": {...}, "remove": [...]}: change a tenant
+// instance's labels live, with no restart. A token limited to labels may only leave the instance inside its
+// own scope, so it cannot relabel an instance into (or out of) another environment.
+func (s *Server) handleInstanceLabels(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !incus.ValidName(name) {
+		writeError(w, http.StatusBadRequest, "bad_request", "not a valid instance name")
+		return
+	}
+	var req struct {
+		Set    map[string]string `json:"set"`
+		Remove []string          `json:"remove"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if len(req.Set) == 0 && len(req.Remove) == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "give labels to set or remove")
+		return
+	}
+	for _, k := range req.Remove {
+		if !engine.ValidLabelKey(k) {
+			writeError(w, http.StatusBadRequest, "invalid_spec", fmt.Sprintf("label name %q is not allowed", k))
+			return
+		}
+	}
+	if err := engine.ValidateLabels(req.Set); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
+		return
+	}
+	_, scope := s.actorScope(r)
+	if msg := checkScope(scope, name, "", ""); msg != "" {
+		auditDetail(r, "instance labels %s refused: outside the token's scope", name)
+		writeError(w, http.StatusForbidden, "out_of_scope", msg)
+		return
+	}
+	if scope != nil && len(scope.Labels) > 0 {
+		// What the instance would carry afterwards: what it has now, with the change applied.
+		snap, err := s.snapshot(r.Context())
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "host_unavailable", "could not read the host's state")
+			return
+		}
+		after := map[string]string{}
+		for _, i := range snap.Instances {
+			if i.Name == name {
+				for k, v := range i.Labels {
+					after[k] = v
+				}
+			}
+		}
+		for _, k := range req.Remove {
+			delete(after, k)
+		}
+		for k, v := range req.Set {
+			after[k] = v
+		}
+		if code, msg := s.checkLabelScope(r.Context(), scope, name, after, true); msg != "" {
+			auditDetail(r, "instance labels %s refused: outside the token's labels", name)
+			writeError(w, code, "out_of_scope", msg)
+			return
+		}
+	}
+	tpl, exists, err := s.opts.Instances.Template(r.Context(), name)
+	switch {
+	case err != nil:
+		log.Printf("instance labels %s: %v", name, err)
+		writeError(w, http.StatusBadGateway, "host_unavailable", "could not read the host's state")
+		return
+	case !exists:
+		writeError(w, http.StatusNotFound, "not_found", "no such instance")
+		return
+	case tpl == "":
+		writeError(w, http.StatusForbidden, "not_managed", "that is not a tenant instance: it was not launched from a template, so it cannot be managed here")
+		return
+	}
+	auditDetail(r, "instance labels %s set=%s remove=%s", name, engine.FormatLabels(req.Set), strings.Join(req.Remove, ","))
+	s.startInstanceJob(w, r, "labels", name, func(ctx context.Context, logf func(string, ...any)) error {
+		return s.opts.Instances.SetLabels(ctx, name, req.Set, req.Remove, logf)
+	})
 }

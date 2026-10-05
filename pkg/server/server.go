@@ -437,6 +437,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("POST /v1/instances/{name}/resize", s.authScoped(RoleDeployer, s.handleInstanceResize))
 		mux.Handle("POST /v1/instances/{name}/suspend", s.authScoped(RoleDeployer, s.handleInstanceSuspend))
 		mux.Handle("DELETE /v1/instances/{name}", s.authScoped(RoleDeployer, s.handleInstanceDelete))
+		mux.Handle("PATCH /v1/instances/{name}/labels", s.authScoped(RoleDeployer, s.handleInstanceLabels))
 	}
 	if s.opts.Jobs != nil {
 		mux.Handle("GET /v1/jobs", s.authScoped(RoleViewer, s.handleJobs))

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/theta42/native-ops/pkg/engine"
+	"github.com/theta42/native-ops/pkg/server"
 )
 
 // `native-ops remote ...` is the client side of the daemon, for CI: it packs the checked-out
@@ -50,7 +51,7 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
                                   upgrade the daemon to a pinned release and wait until it runs it (admin)
   image-prune [--dry-run]         delete images no instance runs that retention does not keep: orphans
                                   left by rebuilds, and old tags beyond --image-keep per app (deployer; no upload)
-  token-create --name n --role r [--names g --images g --domains g]   (admin; no upload)
+  token-create --name n --role r [--names g --images g --domains g --labels k=v1,v2]   (admin; no upload)
 
 Common flags: --url (NATIVE_OPS_URL), --token-env (default NATIVE_OPS_TOKEN), --config-dir (.),
               --sha (commit, recorded in the audit log; default GITHUB_SHA), --timeout (default 30m)`
@@ -86,6 +87,7 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	names := flags.String("names", "", "token-create: instance name globs, comma separated (a scoped token)")
 	images := flags.String("images", "", "token-create: image globs, comma separated")
 	domains := flags.String("domains", "", "token-create: domain globs, comma separated")
+	labelScope := flags.String("labels", "", "token-create: limit to instances with these labels, key=v1,v2;key2=v3")
 	upVersion := flags.String("version", "", "daemon-upgrade: the release tag, e.g. v1.56.0")
 	upSHA := flags.String("sha256", "", "daemon-upgrade: the SHA-256 of native-ops_<version>_linux_<arch>.tar.gz, from the release's checksums.txt")
 	dryRun := flags.Bool("dry-run", false, "image-prune: only report what would be deleted")
@@ -244,8 +246,16 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		os.Exit(c.wait(ctx, flags.Arg(0)))
 	case "token-create":
 		body := map[string]any{"name": *name, "role": *role}
-		if *names != "" || *images != "" || *domains != "" {
-			body["scope"] = map[string]any{"names": splitList(*names), "images": splitList(*images), "domains": splitList(*domains)}
+		if *names != "" || *images != "" || *domains != "" || *labelScope != "" {
+			scope := map[string]any{"names": splitList(*names), "images": splitList(*images), "domains": splitList(*domains)}
+			if *labelScope != "" {
+				parsed, err := server.ParseLabelScope(*labelScope)
+				if err != nil {
+					fatalf("%v", err)
+				}
+				scope["labels"] = parsed
+			}
+			body["scope"] = scope
 		}
 		var out struct {
 			Secret string         `json:"secret"`
