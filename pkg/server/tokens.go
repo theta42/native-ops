@@ -12,10 +12,14 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/theta42/native-ops/pkg/engine"
 )
 
 // Role orders what a token may do: viewer reads; planner may also upload a configuration to be
@@ -58,10 +62,14 @@ type Scope struct {
 	Names   []string `json:"names,omitempty"`
 	Images  []string `json:"images,omitempty"`
 	Domains []string `json:"domains,omitempty"` // empty: no route may be published
+	// Labels limit the token to instances carrying one of the listed values for each label named, e.g.
+	// {"environment": ["staging","testing"]}: it cannot see, create or change an instance with another
+	// value, or with none, so a non-production token cannot reach production whatever it is asked to do.
+	Labels map[string][]string `json:"labels,omitempty"`
 }
 
 // Any reports whether the scope limits anything.
-func (s Scope) Any() bool { return len(s.Names)+len(s.Images)+len(s.Domains) > 0 }
+func (s Scope) Any() bool { return len(s.Names)+len(s.Images)+len(s.Domains)+len(s.Labels) > 0 }
 
 var patternRe = regexp.MustCompile(`^[A-Za-z0-9*?._:/@-]{1,100}$`)
 
@@ -83,7 +91,49 @@ func (s Scope) Validate() error {
 			}
 		}
 	}
+	for k, values := range s.Labels {
+		if !engine.ValidLabelKey(k) {
+			return fmt.Errorf("label name %q is not allowed", k)
+		}
+		if len(values) == 0 {
+			return fmt.Errorf("label %s needs at least one allowed value", k)
+		}
+		for _, v := range values {
+			if !patternRe.MatchString(v) {
+				return fmt.Errorf("label value %q is not allowed", v)
+			}
+			if _, err := path.Match(v, ""); err != nil {
+				return fmt.Errorf("label value %q is not valid: %v", v, err)
+			}
+			// A plain environment value must be a real one, so a typo cannot quietly scope a token to nothing.
+			if k == engine.EnvironmentLabel && !strings.ContainsAny(v, "*?[") && !slices.Contains(engine.Environments, v) {
+				return fmt.Errorf("environment %q is not one of %s", v, strings.Join(engine.Environments, ", "))
+			}
+		}
+	}
 	return nil
+}
+
+// ParseLabelScope reads a label scope as written on a command line: key=v1,v2;key2=v3.
+func ParseLabelScope(text string) (map[string][]string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, nil
+	}
+	out := map[string][]string{}
+	for _, part := range strings.Split(text, ";") {
+		k, vs, ok := strings.Cut(strings.TrimSpace(part), "=")
+		k = strings.TrimSpace(k)
+		if !ok || k == "" || strings.TrimSpace(vs) == "" {
+			return nil, fmt.Errorf("a label scope looks like environment=staging,testing;app=platform, not %q", part)
+		}
+		for _, v := range strings.Split(vs, ",") {
+			if v = strings.TrimSpace(v); v != "" {
+				out[k] = append(out[k], v)
+			}
+		}
+	}
+	return out, nil
 }
 
 func matchAny(patterns []string, v string) bool {
@@ -98,6 +148,32 @@ func matchAny(patterns []string, v string) bool {
 func (s Scope) AllowsName(n string) bool   { return matchAny(s.Names, n) }
 func (s Scope) AllowsImage(i string) bool  { return matchAny(s.Images, i) }
 func (s Scope) AllowsDomain(d string) bool { return matchAny(s.Domains, d) }
+
+// AllowsLabels reports whether an instance with these labels is inside the label scope: every label the
+// scope names must be present with an allowed value. An unlabelled instance is never inside a label scope.
+func (s Scope) AllowsLabels(labels map[string]string) bool {
+	for k, allowed := range s.Labels {
+		v, ok := labels[k]
+		if !ok || !matchAny(allowed, v) {
+			return false
+		}
+	}
+	return true
+}
+
+// ScopeSummary is a scope as one line, for listings.
+func (s Scope) Summary() string {
+	out := "names=" + strings.Join(s.Names, ",") + " images=" + strings.Join(s.Images, ",") + " domains=" + strings.Join(s.Domains, ",")
+	keys := make([]string, 0, len(s.Labels))
+	for k := range s.Labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out += " " + k + "=" + strings.Join(s.Labels[k], ",")
+	}
+	return out
+}
 
 // Token is one API credential. Only the SHA-256 of the secret is ever stored;
 // the secret itself is shown once, at creation.

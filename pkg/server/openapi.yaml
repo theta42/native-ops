@@ -701,11 +701,15 @@ paths:
       operationId: listInstances
       tags: [instances]
       summary: The tenant instances the token may see
+      description: Each instance shows its labels. `label=key=value` (repeatable) keeps only the instances that carry every label given.
       x-native-ops-role: viewer
       x-native-ops-scoped: true
       x-native-ops-enabled-by: --enable-instances
+      parameters:
+        - { name: label, in: query, required: false, schema: { type: array, items: { type: string, examples: [environment=production] } }, style: form, explode: true }
       responses:
         "200": { description: "The instances.", content: { application/json: {} } }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
   /v1/instances/{name}:
     get:
@@ -797,6 +801,32 @@ paths:
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Busy" }
+  /v1/instances/{name}/labels:
+    patch:
+      operationId: patchInstanceLabels
+      tags: [instances]
+      summary: Change a tenant instance's labels, live
+      description: |
+        Sets and removes labels without restarting or replacing the instance. `environment` is one of production, staging, testing, development, demo. A token limited to labels may only leave the instance inside its own scope, so it cannot relabel an instance into or out of another environment.
+      x-native-ops-role: deployer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                set: { type: object, additionalProperties: { type: string } }
+                remove: { type: array, items: { type: string } }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { description: "Outside the token's scope, or not a tenant instance." }
+        "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Busy" }
   /v1/instances/{name}/suspend:
     post:
@@ -1185,11 +1215,15 @@ components:
       enum: [viewer, planner, deployer, admin]
     Scope:
       type: object
-      description: Limits a token to tenant instances (names, images and domains, as globs).
+      description: Limits a token to tenant instances (names, images and domains, as globs; and optionally labels).
       properties:
         names: { type: array, items: { type: string } }
         images: { type: array, items: { type: string } }
         domains: { type: array, items: { type: string } }
+        labels:
+          type: object
+          description: "Label name to the values it may have, e.g. {environment: [staging, testing]}. The token cannot see, create or change an instance that carries another value or none."
+          additionalProperties: { type: array, items: { type: string } }
     TagRequest:
       type: object
       required: [tag]
@@ -1310,6 +1344,10 @@ components:
               owner: { type: string }
         service: { type: string }
         env: { type: object, additionalProperties: { type: string } }
+        labels:
+          type: object
+          description: "What the instance is: at most 16, a lowercase name and a plain value each. environment is one of production, staging, testing, development, demo. Absent leaves an existing instance's labels alone; present, even empty, is the whole set."
+          additionalProperties: { type: string }
         health: { $ref: "#/components/schemas/HealthSpec" }
         domain: { type: string }
         route_directives: { type: array, items: { type: string } }

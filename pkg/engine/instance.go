@@ -96,6 +96,11 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 			return "", fmt.Errorf("instance %s already exists and was not launched from template %q; refusing to adopt it (use `instance update` to change an existing instance)", p.Name, p.Template.Name)
 		}
 		m.log("    %s already exists from this template; resuming\n", p.Name)
+		if p.Template.Labels != nil {
+			if err := m.reconcileLabels(ctx, p.Name, st.Config, p.Template.Labels); err != nil {
+				return "", err
+			}
+		}
 	} else {
 		cfg := make(map[string]string, len(limits)+2)
 		for k, v := range limits {
@@ -103,6 +108,9 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		}
 		cfg[incus.TemplateKey] = p.Template.Name
 		cfg[incus.ImageKey] = p.Template.Image
+		for k, v := range p.Template.Labels {
+			cfg[incus.LabelKey(k)] = v
+		}
 		if err := m.incus.LaunchContainer(ctx, imageRef, p.Name, profiles, cfg); err != nil {
 			return "", fmt.Errorf("launch container %s: %w", p.Name, err)
 		}

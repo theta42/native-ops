@@ -188,3 +188,23 @@ func TestCollectQuotesEverythingItInterpolates(t *testing.T) {
 		}
 	}
 }
+
+func TestParseInstancesSeparatesLabelsFromRecordedBookkeeping(t *testing.T) {
+	ins, err := ParseInstances(`[{"name":"rest-x","status":"Running","type":"container","profiles":["base"],
+	  "config":{"user.native-ops.template":"platform","user.native-ops.image":"opsavor-platform:latest",
+	            "user.native-ops.label.environment":"production","user.native-ops.label.upgrade-window":"us-east-night"},
+	  "devices":{},"snapshots":[],"state":null}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := ins[0]
+	if in.Labels["environment"] != "production" || in.Labels["upgrade-window"] != "us-east-night" || len(in.Labels) != 2 {
+		t.Fatalf("labels: %v", in.Labels)
+	}
+	if in.Recorded["template"] != "platform" || in.Recorded["image"] != "opsavor-platform:latest" || len(in.Recorded) != 2 {
+		t.Fatalf("labels must not appear in the recorded bookkeeping: %v", in.Recorded)
+	}
+	if bare, _ := ParseInstances(`[{"name":"gitea","status":"Running","type":"container","profiles":[],"config":{},"devices":{},"snapshots":[],"state":null}]`); bare[0].Labels != nil {
+		t.Fatal("an unlabelled instance has no labels")
+	}
+}
