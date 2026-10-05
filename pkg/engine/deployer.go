@@ -293,6 +293,9 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		cfg[k] = v
 	}
 	cfg[incus.ImageKey] = deployRef
+	for k, v := range svc.Labels {
+		cfg[incus.LabelKey(k)] = v
+	}
 	d.log("    Launching container %s from image %s...\n", svc.Name, deployRef)
 	if err := d.incus.LaunchContainer(ctx, deployRef, svc.Name, d.profilesOf(svc), cfg); err != nil {
 		return fmt.Errorf("launch container: %w", err)
@@ -501,6 +504,13 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 			return err
 		}
 		changed = true
+		// The replacement carried the labels over; make them what the manifest declares (live, no restart).
+		if len(labelsDrift(st.Config, svc.Labels)) > 0 {
+			d.log("    Applying changed labels to %s\n", svc.Name)
+			if err := reconcileLabels(ctx, d.incus, svc.Name, st.Config, svc.Labels); err != nil {
+				return err
+			}
+		}
 		// The replacement carries the live env over; now apply what the manifest declares.
 		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), declaredEnv); err != nil {
 			return err
@@ -510,6 +520,14 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 			}
 		}
 	} else {
+		// Labels apply live, no restart.
+		if drift := labelsDrift(st.Config, svc.Labels); len(drift) > 0 {
+			d.log("    Applying changed labels to %s: %s\n", svc.Name, strings.Join(drift, ", "))
+			if err := reconcileLabels(ctx, d.incus, svc.Name, st.Config, svc.Labels); err != nil {
+				return err
+			}
+			changed = true
+		}
 		// Limits apply live, no restart.
 		drift := limitsDrift(st, svc.Limits)
 		if len(drift) > 0 {

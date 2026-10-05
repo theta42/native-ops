@@ -358,7 +358,7 @@ build is refused.
 
 ### Labels: what an instance is
 
-An instance can carry **labels**, a small map that says what it is for. They are stored on the instance
+An instance, and a static service in `fleet.yml`, can carry **labels**, a small map that says what it is for. They are stored on the instance
 itself, as `user.native-ops.label.<key>` next to the other bookkeeping keys, so they survive an update, a
 rollback and a resize (the whole config is carried over) and need nothing to run beyond Incus.
 
@@ -375,11 +375,16 @@ curl "$URL/v1/instances?label=environment=production"
   dashes, at most 32 characters) and a plain value (1-63 letters, digits, dots, dashes or underscores).
 - **In a spec**, `labels` absent leaves an existing instance's labels as they are; present, even empty, is the
   whole set it carries (`PUT` converges to it). A new instance is created with them.
+- **Services** declare `labels:` in `service.yml`: the declared set is exact, a change is a `set-labels` item in
+  the plan applied live (with or without an image replacement, and with no restart), and a manifest with no
+  `labels:` leaves the instance's labels alone. A bad label (an unknown `environment`, a malformed name) is
+  refused when the manifest is loaded, so a plan never contains one.
 - **`PATCH .../labels`** adds, changes and removes labels live, as an audited job, with no restart or
   replacement. Only a tenant instance (one launched from a template) can be changed here.
 - **Listing**: each instance shows its `labels`; `GET /v1/instances?label=k=v` (repeatable) keeps the ones that
   carry every label given. An instance with no labels is allowed (every instance made before labels
-  existed), and is never matched by a label filter or a label scope.
+  existed), and is never matched by a label filter or a label scope; `host_status` warns of the ones with no
+  `environment` label.
 - **Scope.** `token-create --labels 'environment=staging,testing;app=platform'` limits a token to instances
   carrying one of the listed values for **each** label named. Such a token only sees those instances (anything
   else looks like it does not exist), cannot update, resize, suspend, delete or relabel one outside its scope,

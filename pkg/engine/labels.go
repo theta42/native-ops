@@ -3,70 +3,70 @@ package engine
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/theta42/native-ops/pkg/incus"
+	"github.com/theta42/native-ops/pkg/labels"
 )
 
-// Environments is the closed set of values the `environment` label may take. It is fixed in native-ops, not
-// configured per host, so every deployment means the same thing by it and a token scoped to
-// `environment=production` cannot be defeated by a spelling. Adding a value is a reviewed change here.
-var Environments = []string{"production", "staging", "testing", "development", "demo"}
+// Environments, EnvironmentLabel, MaxLabels, ValidLabelKey and ValidateLabels are the label vocabulary of
+// pkg/labels, under the names the engine and the API already use.
+var Environments = labels.Environments
 
-// EnvironmentLabel is the label that names what an instance is for.
-const EnvironmentLabel = "environment"
-
-// MaxLabels is the most labels one instance may carry.
-const MaxLabels = 16
-
-var (
-	labelKeyRe   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
-	labelValueRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+const (
+	EnvironmentLabel = labels.Environment
+	MaxLabels        = labels.Max
 )
 
-// ValidLabelKey reports whether key is a usable label name.
-func ValidLabelKey(key string) bool { return labelKeyRe.MatchString(key) }
+func ValidLabelKey(key string) bool { return labels.ValidKey(key) }
 
-// ValidateLabels reports why labels cannot be accepted: at most MaxLabels, a plain key and a plain value
-// each, and `environment` one of Environments. Any other label is free-form.
-func ValidateLabels(labels map[string]string) error {
-	if len(labels) > MaxLabels {
-		return fmt.Errorf("at most %d labels", MaxLabels)
-	}
-	for k, v := range labels {
-		if !labelKeyRe.MatchString(k) {
-			return fmt.Errorf("label name %q is not allowed (a lowercase letter, then lowercase letters, digits or dashes, at most 32 characters)", k)
-		}
-		if !labelValueRe.MatchString(v) {
-			return fmt.Errorf("the value of label %s is not allowed (1-63 letters, digits, dots, dashes or underscores)", k)
-		}
-		if k == EnvironmentLabel && !contains(Environments, v) {
-			return fmt.Errorf("environment %q is not one of %s", v, strings.Join(Environments, ", "))
-		}
-	}
-	return nil
-}
+func ValidateLabels(l map[string]string) error { return labels.Validate(l) }
 
 // reconcileLabels makes an instance carry exactly the labels in want: it sets the ones that are new or
 // changed and removes the ones that are not wanted. cfg is the instance's current config.
 func (m *InstanceManager) reconcileLabels(ctx context.Context, name string, cfg map[string]string, want map[string]string) error {
+	return reconcileLabels(ctx, m.incus, name, cfg, want)
+}
+
+// reconcileLabels is reconcileLabels for any caller holding an incus client (the service deployer too).
+func reconcileLabels(ctx context.Context, ic *incus.Client, name string, cfg map[string]string, want map[string]string) error {
 	have := incus.LabelsOf(cfg)
 	for _, k := range sortedKeys(want) {
 		if v, ok := have[k]; !ok || v != want[k] {
-			if err := m.incus.SetInstanceConfig(ctx, name, incus.LabelKey(k), want[k]); err != nil {
+			if err := ic.SetInstanceConfig(ctx, name, incus.LabelKey(k), want[k]); err != nil {
 				return err
 			}
 		}
 	}
 	for _, k := range sortedKeys(have) {
 		if _, ok := want[k]; !ok {
-			if err := m.incus.UnsetInstanceConfig(ctx, name, incus.LabelKey(k)); err != nil {
+			if err := ic.UnsetInstanceConfig(ctx, name, incus.LabelKey(k)); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// labelsDrift lists how an instance's labels differ from the declared set, as "k: old -> new" parts, in a
+// stable order. A manifest that declares no `labels:` (nil) declares nothing, so it never drifts.
+func labelsDrift(cfg map[string]string, want map[string]string) []string {
+	if want == nil {
+		return nil
+	}
+	have := incus.LabelsOf(cfg)
+	var parts []string
+	for _, k := range sortedKeys(want) {
+		if v, ok := have[k]; !ok || v != want[k] {
+			parts = append(parts, fmt.Sprintf("%s: %s -> %s", k, orNone(have[k]), want[k]))
+		}
+	}
+	for _, k := range sortedKeys(have) {
+		if _, ok := want[k]; !ok {
+			parts = append(parts, fmt.Sprintf("%s: %s -> (removed)", k, have[k]))
+		}
+	}
+	return parts
 }
 
 // SetLabels changes an instance's labels live, with no restart: set adds or changes, remove deletes. The

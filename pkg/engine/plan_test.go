@@ -100,6 +100,21 @@ func deployedGitea(t *testing.T) (*hostSim, *Deployer, *config.ServiceConfig) {
 	return sim, d, svc
 }
 
+// deployedLabelledGitea is gitea deployed with labels in its manifest.
+func deployedLabelledGitea(t *testing.T) (*hostSim, *Deployer, *config.ServiceConfig) {
+	t.Helper()
+	sim := newHostSim(t)
+	sim.aliases["gitea:latest"] = fpA
+	d := newTestDeployer(sim)
+	svc := giteaSvc()
+	svc.Labels = map[string]string{"environment": "production", "app": "gitea"}
+	if err := d.DeployService(context.Background(), svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	sim.reset()
+	return sim, d, svc
+}
+
 func deployedDB(t *testing.T) (*hostSim, *Deployer, *config.ServiceConfig) {
 	t.Helper()
 	sim := newHostSim(t)
@@ -140,6 +155,8 @@ func observed(kind string, sim *hostSim, existedBefore bool) bool {
 		return has("incus config device add")
 	case ChangeSetLimits:
 		return has("incus config set", "limits.")
+	case ChangeSetLabels:
+		return has("incus config set", incus.LabelPrefix) || has("incus config unset", incus.LabelPrefix)
 	case ChangeSetEnv:
 		return has("incus file push", "/etc/default/")
 	case ChangeRestart:
@@ -169,6 +186,23 @@ func TestPlanPredictsWhatApplyDoes(t *testing.T) {
 			return sim, newTestDeployer(sim), giteaSvc()
 		}, nil, false, []string{ChangeCreateInstance, ChangeCreateVolume, ChangeAttachVolume, ChangeSetEnv, ChangePublishRoute, ChangeRunHook, ChangeRunHook, ChangeRunHook}, ActionCreate},
 		{"already converged", deployedGitea, nil, true, nil, ActionNone},
+		{"labels already match the manifest", deployedLabelledGitea, nil, true, nil, ActionNone},
+		{"labels were added to a service that had none", deployedGitea, func(sim *hostSim, svc *config.ServiceConfig) {
+			svc.Labels = map[string]string{"environment": "production"}
+		}, true, []string{ChangeSetLabels}, ActionUpdate},
+		{"the environment changed", deployedLabelledGitea, func(sim *hostSim, svc *config.ServiceConfig) {
+			svc.Labels["environment"] = "staging"
+		}, true, []string{ChangeSetLabels}, ActionUpdate},
+		{"a label was removed from the manifest", deployedLabelledGitea, func(sim *hostSim, svc *config.ServiceConfig) {
+			delete(svc.Labels, "app")
+		}, true, []string{ChangeSetLabels}, ActionUpdate},
+		{"a manifest with no labels leaves the live ones alone", deployedLabelledGitea, func(sim *hostSim, svc *config.ServiceConfig) {
+			svc.Labels = nil
+		}, true, nil, ActionNone},
+		{"the image moved and a label changed", deployedLabelledGitea, func(sim *hostSim, svc *config.ServiceConfig) {
+			sim.aliases["gitea:latest"] = fpB
+			svc.Labels["environment"] = "staging"
+		}, true, []string{ChangeReplaceImage, ChangeRunHook, ChangeRunHook, ChangeRunHook, ChangeUpdateRoute, ChangeSetLabels}, ActionUpdate},
 		{"a limit changed", deployedGitea, func(sim *hostSim, svc *config.ServiceConfig) { svc.Limits["limits.cpu"] = "4" }, true,
 			[]string{ChangeSetLimits}, ActionUpdate},
 		{"an env value changed and a key was added", deployedGitea, func(sim *hostSim, svc *config.ServiceConfig) {
@@ -216,7 +250,7 @@ func TestPlanPredictsWhatApplyDoes(t *testing.T) {
 				predicted[k] = true
 			}
 			for _, k := range []string{ChangeCreateInstance, ChangeReplaceImage, ChangeAdoptImage, ChangeCreateVolume, ChangeAttachVolume,
-				ChangeSetLimits, ChangeSetEnv, ChangeRestart, ChangePublishRoute, ChangeRunHook} {
+				ChangeSetLimits, ChangeSetLabels, ChangeSetEnv, ChangeRestart, ChangePublishRoute, ChangeRunHook} {
 				// A replacement carries volumes and env over, restarts, and repoints the route as part of
 				// the safe update path; they are not separate changes there.
 				if predicted[ChangeReplaceImage] && (k == ChangeAttachVolume || k == ChangeSetEnv || k == ChangeRestart) {
@@ -670,4 +704,43 @@ func TestApplyPlanRefusesABlockedPlanAndStopsAtTheFirstFailure(t *testing.T) {
 		t.Fatal("services after the failure must be left alone")
 	}
 	_ = svc
+}
+
+func TestAServiceIsLaunchedWithItsLabelsAndTheyAreTheOnlyOnesTouched(t *testing.T) {
+	sim := newHostSim(t)
+	sim.aliases["gitea:latest"] = fpA
+	d := newTestDeployer(sim)
+	svc := giteaSvc()
+	svc.Labels = map[string]string{"environment": "demo", "app": "gitea"}
+	p := plan(t, sim, svc)
+	if !strings.Contains(detailOf(p, ChangeCreateInstance), "labelled app=gitea environment=demo") {
+		t.Fatalf("the create plan must say what the service will be labelled: %q", detailOf(p, ChangeCreateInstance))
+	}
+	if err := d.DeployService(context.Background(), svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	launch := ""
+	for _, c := range sim.cmds {
+		if strings.HasPrefix(c, "incus launch") {
+			launch = c
+		}
+	}
+	for _, want := range []string{"--config 'user.native-ops.label.environment=demo'", "--config 'user.native-ops.label.app=gitea'"} {
+		if !strings.Contains(launch, want) {
+			t.Fatalf("the launch must carry %s: %s", want, launch)
+		}
+	}
+	// a hand-set key that is not a label, and the other bookkeeping, are never touched
+	sim.ctrs["gitea"].config["user.owner"] = "ops"
+	svc.Labels = map[string]string{"environment": "staging"}
+	sim.reset()
+	if err := d.DeployService(context.Background(), svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if got := sim.ctrs["gitea"].config; got["user.owner"] != "ops" || got[incus.ImageKey] == "" || got[incus.LabelKey("environment")] != "staging" || got[incus.LabelKey("app")] != "" {
+		t.Fatalf("only labels may change, and the declared set is exact: %v", got)
+	}
+	if sim.count("incus launch") != 0 || sim.count("systemctl restart") != 0 {
+		t.Fatalf("a label change must not restart or replace the service: %v", sim.mutations())
+	}
 }

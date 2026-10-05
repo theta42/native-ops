@@ -71,7 +71,7 @@ var (
 	// then -- only when it differs -- a chown to the one asked for.
 	simStatRe    = regexp.MustCompile(`^stat -c %U '([^']*)'$`)
 	simChownRe   = regexp.MustCompile(`^chown '([^']*)' '([^']*)'$`)
-	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|device add) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
+	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|unset|device add) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
 )
 
 func (s *hostSim) get(name string) (*simCtr, bool) { c, ok := s.ctrs[name]; return c, ok }
@@ -198,6 +198,12 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		}
 		k, v, _ := strings.Cut(arg(1), "=")
 		c.config[k] = v
+	case strings.HasPrefix(cmd, "incus config unset "):
+		c, ok := s.get(arg(0))
+		if !ok {
+			return "", errors.New("Error: Instance not found")
+		}
+		delete(c.config, arg(1))
 	case strings.HasPrefix(cmd, "incus delete ") || strings.HasPrefix(cmd, "incus stop "):
 		name := arg(0)
 		if strings.HasPrefix(cmd, "incus delete ") {

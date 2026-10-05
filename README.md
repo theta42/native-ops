@@ -321,6 +321,13 @@ volumes:
 limits:
   limits.cpu: 2
   limits.memory: 2GB
+# What the service is for. `environment` is one of production, staging, testing, development, demo
+# (anything else is refused when the manifest is loaded); other labels are free-form. Declared, the set is
+# exact; a change is a `set-labels` plan item applied live (no restart); absent, the instance's labels are
+# left alone. Scoped tokens, `?label=` filters and a fleet's rollouts all key off these.
+labels:
+  environment: production
+  app: gitea
 healthcheck:
   path: /
   port: 3000

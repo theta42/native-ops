@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/theta42/native-ops/pkg/labels"
 )
 
 // FleetConfig defines global fleet configuration.
@@ -335,6 +337,10 @@ type ServiceConfig struct {
 	Routing     *RoutingConfig    `yaml:"routing,omitempty"`
 	Forwards    []PortForward     `yaml:"forwards,omitempty"`
 	Hooks       ServiceHooks      `yaml:"hooks,omitempty"`
+	// Labels say what the service is (environment, app, ...): see pkg/labels. Declared, they are exactly the set
+	// the instance carries, and a change is applied live (no restart). Absent (nil), the instance's labels are
+	// left alone.
+	Labels map[string]string `yaml:"labels,omitempty"`
 }
 
 // Unit is the systemd unit (and /etc/default/<name>) this service runs: Service when set, else the
@@ -434,6 +440,9 @@ func LoadServiceConfig(path string) (*ServiceConfig, error) {
 	}
 	if svc.Service != "" && !serviceUnitRe.MatchString(svc.Service) {
 		return nil, fmt.Errorf("service config %s: service %q is not a valid unit name", path, svc.Service)
+	}
+	if err := labels.Validate(svc.Labels); err != nil {
+		return nil, fmt.Errorf("service config %s: %w", path, err)
 	}
 
 	return &svc, nil
