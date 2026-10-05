@@ -16,7 +16,11 @@ import (
 // so the daemon builds from a tree only when an admin has approved its recipe: the digest of
 // everything under scripts/ and images/ (engine.RecipeDigest). Approval is per recipe, not per build:
 // a release pipeline building a new ref with an unchanged recipe needs nothing, while any change to a
-// build script waits for an admin, like an apply waits for its plan to be approved.
+// build script waits for approval, like an apply waits for its plan to be approved.
+//
+// Approval is part of the git workflow: deploying a protected deploy tag approves the recipe in that
+// tag's commit (Server.approveRecipeFromTag), exactly as it approves the plan. An admin can also approve
+// a digest by hand, for hosts that do not deploy from git.
 //
 //	GET    /v1/images/recipes                     admin: the recipes seen, approved or waiting
 //	POST   /v1/images/recipes/{digest}/approve    admin: allow builds from this recipe
@@ -144,6 +148,25 @@ func (s *RecipeStore) Approve(digest, by string) (RecipeRecord, error) {
 	}
 	r.ApprovedBy, r.ApprovedAt = by, &now
 	return *r, s.save()
+}
+
+// ApproveFromGit approves a recipe on the strength of a protected git tag (see Server.approveRecipeFromTag).
+// A recipe that is already approved keeps its first approver, so a later deploy of the same recipe
+// does not rewrite who approved it. It reports whether this call approved it.
+func (s *RecipeStore) ApproveFromGit(digest, by string) (RecipeRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := s.recs[digest]; r != nil && r.ApprovedAt != nil {
+		return *r, false, nil
+	}
+	now := s.now()
+	r := s.recs[digest]
+	if r == nil {
+		r = &RecipeRecord{Digest: digest, FirstSeen: now, LastSeen: now}
+		s.recs[digest] = r
+	}
+	r.ApprovedBy, r.ApprovedAt = by, &now
+	return *r, true, s.save()
 }
 
 // Revoke takes an approval back.

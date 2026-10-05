@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/theta42/native-ops/pkg/engine"
 )
 
 // DeploySource is where POST /v1/deploy reads a tagged commit from: the configuration repository on its
@@ -100,6 +102,9 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 			return err
 		}
 
+		// The protected tag is also the approval of the image recipe in this commit.
+		s.approveRecipeFromTag(root, tag, sha, logf)
+
 		// fleet.yml's daemon pin is the version the commit was written for: move to it first, so the
 		// plan and the apply run on that binary.
 		if upgraded, err := s.followPin(ctx, root, tag, actor, resumed, logf); err != nil || upgraded {
@@ -137,6 +142,31 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 		return nil
 	})
 	return job, nil
+}
+
+// approveRecipeFromTag approves the image recipe (scripts/ and images/) of a deploy tag's commit. The
+// daemon resolved the tag, checked that a protection rule covers it and downloaded the commit itself, so
+// the people the repository lets push the tag are the ones approving the recipe: the whole release,
+// including a change to how an image is built, is approved in git and applied by CI, with nobody calling
+// the daemon by hand. (Unlike a deploy, which launches containers, a build runs the recipe on the host as
+// the daemon's user, so protect the deploy tag pattern for the people you would approve a recipe.)
+//
+// It never fails the deploy: a commit with no recipe has nothing to approve, and a store that cannot be
+// written is logged (the build is refused until the recipe is approved some other way).
+func (s *Server) approveRecipeFromTag(root, tag, sha string, logf func(string, ...any)) {
+	if s.opts.Recipes == nil {
+		return
+	}
+	digest, err := engine.RecipeDigest(root)
+	if err != nil {
+		logf("image recipe in %s not approved: %v", tag, err)
+		return
+	}
+	if _, fresh, err := s.opts.Recipes.ApproveFromGit(digest, "tag "+tag+" ("+sha[:12]+")"); err != nil {
+		logf("image recipe %s could not be recorded as approved: %v", digest[:12], err)
+	} else if fresh {
+		logf("image recipe %s approved by the tag", digest[:12])
+	}
 }
 
 // How a deploy that succeeded ended (Job.Result).

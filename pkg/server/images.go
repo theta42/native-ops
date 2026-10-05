@@ -59,7 +59,8 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 			"code":   "recipe_not_approved",
 			"digest": digest,
 			"error": "this image recipe (scripts/ and images/ in the upload) has not been approved, and a build runs it on the host. " +
-				"An admin can approve it with POST /v1/images/recipes/" + digest + "/approve (or `native-ops remote recipe-approve " + digest + "`); then run the build again. " +
+				"Merge the change and deploy a protected deploy tag at that commit: the tag approves its recipe; then run the build again. " +
+				"(An admin can also approve it by hand: POST /v1/images/recipes/" + digest + "/approve or `native-ops remote recipe-approve " + digest + "`.) " +
 				"Builds of other refs from the same recipe need no new approval.",
 		})
 		return

@@ -299,3 +299,122 @@ func TestReleaseBefore(t *testing.T) {
 		}
 	}
 }
+
+// A deploy tree: the configuration plus the scripts an image build runs.
+func deployRecipeTree(t *testing.T, script string) []byte {
+	t.Helper()
+	return tgz(t,
+		entry{name: "conf/fleet.yml", body: "name: from-the-tag\n"},
+		entry{name: "conf/services/web/service.yml", body: "image: x\n"},
+		entry{name: "conf/scripts/build-image.sh", body: "#!/bin/sh\n" + script + "\n"},
+		entry{name: "conf/images/app/build.sh", body: "echo build\n"})
+}
+
+// recipeDigestOf is the digest the daemon should compute for a tree: the same extraction and the same
+// engine.RecipeDigest a build upload would be hashed with.
+func recipeDigestOf(t *testing.T, tree []byte) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := ExtractTarGz(bytes.NewReader(tree), dir); err != nil {
+		t.Fatal(err)
+	}
+	d, err := engine.RecipeDigest(filepath.Join(dir, "conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func newRecipeDeployRig(t *testing.T, src *fakeSource) (*applyRig, *RecipeStore) {
+	t.Helper()
+	store, err := OpenRecipeStore(filepath.Join(t.TempDir(), "recipes.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newApplyRigWith(t, func(o *Options) { o.Deploy, o.DeployTags, o.Recipes = src, "deploy-*", store }), store
+}
+
+func TestADeployTagApprovesTheRecipeInItsCommit(t *testing.T) {
+	tree := deployRecipeTree(t, "echo v1")
+	src := &fakeSource{protected: true, tree: tree}
+	rig, store := newRecipeDeployRig(t, src)
+	want := recipeDigestOf(t, tree)
+
+	if ok, _ := store.Seen(want, "ci", "app", ""); ok {
+		t.Fatal("the recipe must not be approved before the tag is deployed")
+	}
+	res, body := rig.post(t, "/v1/deploy", rig.deployerToken, "application/json", []byte(`{"tag":"deploy-1"}`))
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("%d %s", res.StatusCode, body)
+	}
+	j := rig.waitJob(t, jobID(t, body), JobSucceeded)
+	if !strings.Contains(j.Log, "image recipe "+want[:12]+" approved by the tag") {
+		t.Fatalf("the job log must say the tag approved the recipe:\n%s", j.Log)
+	}
+	var rec *RecipeRecord
+	for _, r := range store.List() {
+		if r.Digest == want {
+			r := r
+			rec = &r
+		}
+	}
+	if rec == nil || rec.ApprovedAt == nil || rec.ApprovedBy != "tag deploy-1 ("+deployCommit[:12]+")" {
+		t.Fatalf("recipe record: %+v", rec)
+	}
+	// A build of that recipe is now accepted without anyone calling the daemon.
+	if ok, _ := store.Seen(want, "ci", "app", ""); !ok {
+		t.Fatal("a build of the deployed commit's recipe must be approved")
+	}
+}
+
+func TestADeployTagApprovesOnlyThatCommitsRecipe(t *testing.T) {
+	src := &fakeSource{protected: true, tree: deployRecipeTree(t, "echo v1")}
+	rig, store := newRecipeDeployRig(t, src)
+	other := recipeDigestOf(t, deployRecipeTree(t, "echo something else"))
+	res, body := rig.post(t, "/v1/deploy", rig.deployerToken, "application/json", []byte(`{"tag":"deploy-1"}`))
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("%d %s", res.StatusCode, body)
+	}
+	rig.waitJob(t, jobID(t, body), JobSucceeded)
+	if ok, _ := store.Seen(other, "ci", "app", ""); ok {
+		t.Fatal("a different recipe must still need its own approval")
+	}
+}
+
+func TestADeployKeepsTheFirstApproverOfARecipe(t *testing.T) {
+	tree := deployRecipeTree(t, "echo v1")
+	src := &fakeSource{protected: true, tree: tree}
+	rig, store := newRecipeDeployRig(t, src)
+	want := recipeDigestOf(t, tree)
+	if _, err := store.Approve(want, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	res, body := rig.post(t, "/v1/deploy", rig.deployerToken, "application/json", []byte(`{"tag":"deploy-1"}`))
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("%d %s", res.StatusCode, body)
+	}
+	j := rig.waitJob(t, jobID(t, body), JobSucceeded)
+	if strings.Contains(j.Log, "approved by the tag") {
+		t.Fatalf("an already approved recipe must not be announced again:\n%s", j.Log)
+	}
+	for _, r := range store.List() {
+		if r.Digest == want && r.ApprovedBy != "alice" {
+			t.Fatalf("the first approver must be kept: %+v", r)
+		}
+	}
+}
+
+func TestAnUnprotectedTagApprovesNoRecipe(t *testing.T) {
+	tree := deployRecipeTree(t, "echo v1")
+	src := &fakeSource{protected: false, tree: tree}
+	rig, store := newRecipeDeployRig(t, src)
+	want := recipeDigestOf(t, tree)
+	res, body := rig.post(t, "/v1/deploy", rig.deployerToken, "application/json", []byte(`{"tag":"deploy-1"}`))
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("%d %s", res.StatusCode, body)
+	}
+	rig.waitJob(t, jobID(t, body), JobFailed)
+	if ok, _ := store.Seen(want, "ci", "app", ""); ok {
+		t.Fatal("a tag no protection rule covers must not approve a recipe")
+	}
+}

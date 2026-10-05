@@ -317,9 +317,31 @@ itself must be matched by setting `--image-prefix` (or `NATIVE_OPS_IMAGE_PREFIX`
 `/etc/native-ops/serve.env`) to what it produces.
 
 That script runs **on the host, as the daemon's user**, so whoever writes it can run anything there.
-The daemon therefore builds only from a recipe an admin has approved: the digest of every file under
+The daemon therefore builds only from an approved recipe: the digest of every file under
 `scripts/` and `images/` in the upload. An unapproved recipe is refused with
-`403 recipe_not_approved` and the digest; an admin approves it once, on the UI's Recipes page or:
+`403 recipe_not_approved` and the digest.
+
+**Approval is part of the git workflow.** Deploying a protected deploy tag approves the recipe in that
+tag's commit, the same way it approves that commit's plan: the daemon resolves the tag, checks the
+protection rule and downloads the commit itself, so the people the repository lets push the tag are the
+people approving the recipe. A change to a build script is therefore a pull request, a merge, and a deploy
+tag; nothing calls the daemon by hand:
+
+```
+merge the change  ->  push deploy-YYYY.MM.DD  ->  the daemon approves its recipe  ->  builds are accepted
+```
+
+The deploy job's log says `image recipe <digest> approved by the tag`, and the Recipes page and
+`GET /v1/images/recipes` show who approved it (`tag deploy-... (<commit>)`). A deploy whose plan has
+nothing to change still approves the recipe. A tag no protection rule covers approves nothing, and a
+digest that is already approved keeps its first approver.
+
+A build runs the recipe **on the host, as the daemon's user**, outside any container, unlike a deploy,
+which launches containers. Protect the deploy tag pattern for the people you would trust to approve a
+build script.
+
+For a host that does not deploy from git, an admin can still approve a digest by hand, on the UI's
+Recipes page or:
 
 ```bash
 native-ops image recipe-digest --config-dir .                # the digest of a checkout
@@ -327,9 +349,9 @@ native-ops remote recipe-approve --config-dir .              # admin token: appr
 ```
 
 The approval is per recipe, not per build: a release pipeline building a new ref from an unchanged
-recipe needs nothing, while any change to a build script waits for an admin -- the same rule an apply
-follows for its plan. **After upgrading a daemon to a version with this check, approve the current
-recipe once**, or the next build is refused.
+recipe needs nothing, while any change to a build script waits for its deploy tag. **After upgrading a
+daemon to a version with this check, deploy a tag (or approve the current recipe) once**, or the next
+build is refused.
 
 ### Image retention
 
