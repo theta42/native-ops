@@ -208,3 +208,27 @@ func TestParseInstancesSeparatesLabelsFromRecordedBookkeeping(t *testing.T) {
 		t.Fatal("an unlabelled instance has no labels")
 	}
 }
+
+func TestAnalyzeWarnsOfInstancesWithNoEnvironmentLabel(t *testing.T) {
+	s := &Snapshot{Instances: []Instance{
+		{Name: "crew", Status: "Running", Labels: map[string]string{"environment": "production"}},
+		{Name: "gitea", Status: "Running"},
+		{Name: "plane", Status: "Running", Labels: map[string]string{"app": "plane"}},
+	}}
+	var got string
+	for _, w := range Analyze(s, time.Now()) {
+		if strings.Contains(w, "no environment label") {
+			got = w
+		}
+	}
+	if !strings.Contains(got, "2 instance(s)") || !strings.Contains(got, "gitea, plane") || strings.Contains(got, "crew") {
+		t.Fatalf("an unlabelled instance, and one with other labels but no environment, must be listed; a labelled one must not: %q", got)
+	}
+	s.Instances[1].Labels = map[string]string{"environment": "production"}
+	s.Instances[2].Labels = map[string]string{"environment": "demo"}
+	for _, w := range Analyze(s, time.Now()) {
+		if strings.Contains(w, "no environment label") {
+			t.Fatalf("every instance is labelled: %q", w)
+		}
+	}
+}

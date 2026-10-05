@@ -111,7 +111,7 @@ review + branch protection gates production."
 - [ ] A PR CI workflow exists and is a required status check.
 - [ ] Release tag pattern protected; only authorized users can tag.
 - [ ] Production deploys run only on protected tags; staging only on reviewed `main`.
-- [ ] Instances carry a lane; rolls target one lane.
+- [ ] Instances carry a lane: an `environment` label (`labels:` in `service.yml`, or `labels` on a tenant instance), and a roll is done with a token scoped to the environments it may touch (`token-create --labels environment=staging,testing`).
 - [ ] No powerful secrets at the organization level; secrets are repo-scoped.
 - [ ] CI credentials are least-privilege; exposed ones rotated.
 - [ ] The runner is scoped to trusted repositories.

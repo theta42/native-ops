@@ -24,6 +24,7 @@ const (
 	ChangeCreateVolume   = "create-volume"
 	ChangeAttachVolume   = "attach-volume"
 	ChangeSetLimits      = "set-limits"
+	ChangeSetLabels      = "set-labels"
 	ChangeSetEnv         = "set-env"
 	ChangeRestart        = "restart"
 	ChangePublishRoute   = "publish-route"
@@ -177,6 +178,9 @@ func (d *Deployer) planFresh(ctx context.Context, p *ServicePlan, svc *config.Se
 	if len(svc.Limits) > 0 {
 		detail += " and " + joinKV(svc.Limits)
 	}
+	if len(svc.Labels) > 0 {
+		detail += ", labelled " + FormatLabels(svc.Labels)
+	}
 	p.add(ChangeCreateInstance, "%s", detail)
 	for _, vol := range svc.Volumes {
 		ok, err := d.incus.VolumeExists(ctx, vol.Pool, vol.Name)
@@ -226,6 +230,12 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 		for _, h := range hooksOf(svc) {
 			p.add(ChangeRunHook, "%s", h)
 		}
+	}
+
+	// Labels are applied live whether or not the image is replaced (a replacement carries the old ones over,
+	// and apply then reconciles them to the manifest).
+	if drift := labelsDrift(st.Config, svc.Labels); len(drift) > 0 {
+		p.add(ChangeSetLabels, "%s", strings.Join(drift, ", "))
 	}
 
 	declared := serviceEnv(svc, configDir)

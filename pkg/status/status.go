@@ -282,6 +282,21 @@ func Analyze(s *Snapshot, now time.Time) []string {
 			}
 		}
 	}
+	// An instance with no environment label is never matched by a label filter or a label-scoped token, and a
+	// fleet rollout leaves it alone: worth saying while most hosts still have unlabelled instances.
+	var bare []string
+	for _, in := range s.Instances {
+		if in.Labels["environment"] == "" {
+			bare = append(bare, in.Name)
+		}
+	}
+	if len(bare) > 0 {
+		list := strings.Join(bare, ", ")
+		if len(bare) > 8 {
+			list = strings.Join(bare[:8], ", ") + fmt.Sprintf(" and %d more", len(bare)-8)
+		}
+		w = append(w, fmt.Sprintf("%d instance(s) have no environment label (a rollout and a label-scoped token never touch them): %s", len(bare), list))
+	}
 	for _, v := range s.Volumes {
 		if v.Shifted != "true" && len(v.UsedBy) > 0 {
 			w = append(w, fmt.Sprintf("volume %s does not have security.shifted=true", v.Name))

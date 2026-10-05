@@ -288,3 +288,30 @@ func TestARouteReadsItsCacheAndRateLimitFromYAML(t *testing.T) {
 		t.Fatalf("template: %+v", tpl)
 	}
 }
+
+func TestAServiceManifestCarriesItsLabelsAndRefusesABadOne(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "service.yml")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	svc, err := LoadServiceConfig(write("name: crew\nimage: crew:latest\nlabels:\n  environment: production\n  app: crew\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc.Labels["environment"] != "production" || svc.Labels["app"] != "crew" {
+		t.Fatalf("%v", svc.Labels)
+	}
+	none, err := LoadServiceConfig(write("name: crew\nimage: crew:latest\n"))
+	if err != nil || none.Labels != nil {
+		t.Fatalf("no labels: declared nothing (nil), %v %v", none.Labels, err)
+	}
+	for _, bad := range []string{"environment: prod", "Environment: production", "app: a b"} {
+		if _, err := LoadServiceConfig(write("name: crew\nimage: crew:latest\nlabels:\n  " + bad + "\n")); err == nil {
+			t.Errorf("labels %q must be refused when the manifest is loaded", bad)
+		}
+	}
+}
