@@ -525,6 +525,43 @@ needs:
   cannot read or delete other backups.
 - **OIDC client secret:** only usable with the redirect URL registered at the identity provider.
 
+
+## Service secrets (`env_from`)
+
+A service's own secrets (an API token, a cloud service-account key) reach its `/etc/default/<service>` the
+same way, so they are never in git and nobody puts them on the host:
+
+```yaml
+# services/crew/service.yml
+env:
+  GITEA_URL: "https://git.example.com"
+env_from:
+  GOOGLE_SERVICE_ACCOUNT_KEY: SERVICE_CREW_GOOGLE_KEY   # ENV_KEY: secret name
+```
+
+```yaml
+# the workflow that syncs secrets maps the git server's secret onto the store's name
+- env:
+    NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_ADMIN_TOKEN }}
+    SERVICE_CREW_GOOGLE_KEY: ${{ secrets.CREW_GOOGLE_SERVICE_ACCOUNT_KEY }}
+  run: native-ops remote secret-sync SERVICE_CREW_GOOGLE_KEY
+```
+
+- **Only `SERVICE_*` names.** A manifest can name only secrets that start with `SERVICE_`, and the daemon
+  reads them from its store alone (never its own environment), so no manifest can route the daemon's
+  credentials (`DO_API_TOKEN`, the backup keys, the OIDC secret) into a container.
+- **The plan names the source, never the value:** `add GOOGLE_SERVICE_ACCOUNT_KEY (from secret
+  SERVICE_CREW_GOOGLE_KEY)`. The value is bound into the plan's keyed hash, so rotating a secret changes
+  the plan and needs a fresh approval, and an approval of one value cannot apply another.
+- **A secret that is not set blocks the service's plan** (and apply stops before touching the service)
+  instead of writing an empty value or leaving the key out.
+- A key is set by `env` or `env_from`, not both. `env_from` wins over the same key in an `env_file`.
+- Values must fit one line of an environment file: encode a multi-line value (a JSON key, a PEM) as
+  base64 and decode it in the service.
+- Without a daemon (`native-ops apply` on the host), `env_from` reads the process environment.
+- If one workflow syncs with `--prune`, it must name every secret, the daemon's and the services': a
+  prune removes whatever it is not given.
+
 ## UI sign-in: local users and OIDC
 
 By default the UI takes a pasted API token (kept for the browser tab). Two sign-in methods can be turned

@@ -127,12 +127,19 @@ func (d *Deployer) bindOf(svc *config.ServiceConfig, configDir string) string {
 		Manifest *config.ServiceConfig
 		Env      map[string]string
 		Hooks    map[string]string
-	}{svc, serviceEnv(svc, configDir), map[string]string{
+	}{svc, d.bindEnv(svc, configDir), map[string]string{
 		"pre_deploy":     hookBody(configDir, svc, svc.Hooks.PreDeploy),
 		"container_init": hookBody(configDir, svc, svc.Hooks.ContainerInit),
 		"post_deploy":    hookBody(configDir, svc, svc.Hooks.PostDeploy),
 	}})
 	return d.bind(b)
+}
+
+// bindEnv is the environment bindOf digests: with resolved env_from values, so a changed secret changes
+// the plan's hash and needs a fresh approval.
+func (d *Deployer) bindEnv(svc *config.ServiceConfig, configDir string) map[string]string {
+	env, _ := d.declaredEnv(svc, configDir)
+	return env
 }
 
 func hookBody(configDir string, svc *config.ServiceConfig, hook string) string {
@@ -144,6 +151,12 @@ func hookBody(configDir string, svc *config.ServiceConfig, hook string) string {
 
 // PlanOption changes how PlanFleet plans.
 type PlanOption func(*Deployer)
+
+// WithSecrets makes the plan resolve env_from through lookup (the daemon's secret store) instead of the
+// process environment. A secret that is not there blocks the service's plan.
+func WithSecrets(lookup SecretLookup) PlanOption {
+	return func(d *Deployer) { d.SetSecrets(lookup) }
+}
 
 // WithBindKey makes the plan's Hash cover the parts of a manifest the plan does not print
 // (environment values, hook bodies), keyed with key so the hash reveals nothing about them.
@@ -194,8 +207,19 @@ func (d *Deployer) planFresh(ctx context.Context, p *ServicePlan, svc *config.Se
 			p.add(ChangeAttachVolume, "the existing volume %s at %s (its data is kept)", vol.Name, vol.Path)
 		}
 	}
-	if declared := serviceEnv(svc, configDir); len(declared) > 0 {
-		p.add(ChangeSetEnv, "write /etc/default/%s with %d keys: %s", svc.Unit(), len(declared), strings.Join(sortedKeys(declared), ", "))
+	declared, err := d.declaredEnv(svc, configDir)
+	if err != nil {
+		p.block("%v", err)
+	}
+	if len(declared) > 0 || len(svc.EnvFrom) > 0 {
+		keys := sortedKeys(declared)
+		for k := range svc.EnvFrom {
+			if _, ok := declared[k]; !ok {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		p.add(ChangeSetEnv, "write /etc/default/%s with %d keys: %s", svc.Unit(), len(keys), strings.Join(envKeyLabels(svc, keys), ", "))
 	}
 	if err := d.planRoute(ctx, p, svc, nil, routeFresh); err != nil {
 		return err
@@ -238,7 +262,10 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 		p.add(ChangeSetLabels, "%s", strings.Join(drift, ", "))
 	}
 
-	declared := serviceEnv(svc, configDir)
+	declared, envErr := d.declaredEnv(svc, configDir)
+	if envErr != nil {
+		p.block("%v", envErr)
+	}
 	if !replace {
 		if drift := limitsDrift(st, svc.Limits); len(drift) > 0 {
 			var parts []string
@@ -267,7 +294,7 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 		}
 	}
 
-	if len(declared) > 0 {
+	if len(declared) > 0 && envErr == nil {
 		es, err := readEnvState(ctx, d.incus, svc.Name, svc.Unit(), declared)
 		if err != nil {
 			return err
@@ -278,10 +305,10 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 				parts = append(parts, "the file does not exist yet")
 			}
 			if len(es.Added) > 0 {
-				parts = append(parts, "add "+strings.Join(es.Added, ", "))
+				parts = append(parts, "add "+strings.Join(envKeyLabels(svc, es.Added), ", "))
 			}
 			if len(es.Changed) > 0 {
-				parts = append(parts, "change "+strings.Join(es.Changed, ", "))
+				parts = append(parts, "change "+strings.Join(envKeyLabels(svc, es.Changed), ", "))
 			}
 			if es.Kept > 0 {
 				parts = append(parts, fmt.Sprintf("%d keys the manifest does not declare are kept", es.Kept))
