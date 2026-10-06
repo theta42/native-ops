@@ -333,3 +333,63 @@ func TestImagePruneIsAJobForAnUnscopedDeployer(t *testing.T) {
 		}
 	}
 }
+
+func TestImageRetentionRunsByItself(t *testing.T) {
+	rig := newImageRig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rig.srv2.RunImageRetention(ctx, 30*time.Millisecond)
+	for i := 0; i < 2; i++ {
+		select {
+		case dry := <-rig.prunes:
+			if dry {
+				t.Fatal("the scheduled retention must delete, not only report")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("scheduled retention did not run (round %d)", i+1)
+		}
+	}
+	cancel()
+	// Each round is a recorded job a person can read, started by the daemon.
+	n := 0
+	for _, j := range rig.srv2.opts.Jobs.List() {
+		if j.Kind != "image:prune" {
+			continue
+		}
+		n++
+		if j.Actor != scheduledActor {
+			t.Fatalf("job actor: %q", j.Actor)
+		}
+	}
+	if n < 2 {
+		t.Fatalf("each round is a recorded job, found %d", n)
+	}
+}
+
+func TestImageRetentionWaitsOutABusyHostAndCanBeTurnedOff(t *testing.T) {
+	rig := newImageRig(t)
+	rig.srv2.applyMu.Lock() // a change is running
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rig.srv2.RunImageRetention(ctx, 20*time.Millisecond)
+	select {
+	case <-rig.prunes:
+		t.Fatal("retention must not run over another change")
+	case <-time.After(200 * time.Millisecond):
+	}
+	rig.srv2.applyMu.Unlock()
+	select {
+	case <-rig.prunes:
+	case <-time.After(3 * time.Second):
+		t.Fatal("retention did not run once the host was free")
+	}
+	cancel()
+
+	off := newImageRig(t)
+	go off.srv2.RunImageRetention(context.Background(), 0)
+	select {
+	case <-off.prunes:
+		t.Fatal("an interval of 0 turns it off")
+	case <-time.After(150 * time.Millisecond):
+	}
+}

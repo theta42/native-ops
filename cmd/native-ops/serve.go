@@ -123,6 +123,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded fleet.yml's dns_records in the allowed zones (--dns-domains or NATIVE_OPS_DNS_ZONES) through the built-in provider (DO_API_TOKEN from the secret store, else the environment). Script plugins are not run from an upload")
 	imageKeep := flags.Int("image-keep", envInt("NATIVE_OPS_IMAGE_KEEP", 5), "Image retention: tagged images kept per app (<prefix><app>:<ref>; :latest and any image an instance runs are always kept); 0 keeps every tag. Env: NATIVE_OPS_IMAGE_KEEP")
 	imageOrphanAge := flags.Duration("image-orphan-age", 24*time.Hour, "Image retention: how old an image with no alias that no instance runs must be before POST /v1/images/prune deletes it (an image a build displaces goes at once); 0 keeps them")
+	imagePruneEvery := flags.Duration("image-prune-interval", envDuration("NATIVE_OPS_IMAGE_PRUNE_INTERVAL", 12*time.Hour), "Image retention: how often the daemon applies it by itself, as a recorded job (the same rule as POST /v1/images/prune: nothing an instance runs is deleted), because a build leaves the image it displaced while an instance still runs it and nothing else would ever delete it; 0 turns it off. Needs --enable-image-build. Env: NATIVE_OPS_IMAGE_PRUNE_INTERVAL")
 	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "app-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
 	gitURL := flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server (Gitea) holding the configuration repository, e.g. https://git.example.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
 	deployRepo := flags.String("deploy-repo", envOr("NATIVE_OPS_DEPLOY_REPO", ""), "The configuration repository on --git-url, as owner/name: a protected deploy tag there deploys its commit. Env: NATIVE_OPS_DEPLOY_REPO")
@@ -202,6 +203,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 			}
 		}()
 	}
+	go srv.RunImageRetention(ctx, *imagePruneEvery)
 	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v, self-upgrade: %v)", Version, *addr, *stateDir, *enableApply, managedBinDir(binDir) != "")
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
@@ -439,6 +441,15 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 
 // envOr returns an environment value, or a default when it is empty.
 // envInt is envOr for a number; a value that is not one falls back to def.
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return def
+}
+
 func envInt(key string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(key)); err == nil {
 		return v
