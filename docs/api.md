@@ -5,7 +5,8 @@ previewing and running deploys, seeing what is live, and following jobs. For run
 itself (flags, tokens, the state directory, upgrades) see [daemon.md](daemon.md).
 
 - **Reference:** every endpoint, parameter and answer is in the OpenAPI 3.1 document the daemon serves
-  at `GET /openapi.json` (and `/openapi.yaml`), with no token. Load it into any OpenAPI viewer or client
+  at `GET /openapi.json` (and `/openapi.yaml`), with no token, and drawn as a readable page at `GET /docs`
+  (also no token, nothing loaded from elsewhere). Load it into any OpenAPI viewer or client
   generator. Its source is [`pkg/server/openapi.yaml`](../pkg/server/openapi.yaml); a test fails the
   build when it and the daemon's routes disagree.
 - **Agents:** the same operations are MCP tools at `POST /mcp`; an agent connects by having its person

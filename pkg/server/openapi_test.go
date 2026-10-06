@@ -33,7 +33,7 @@ func TestTheOpenAPIDocumentMatchesTheRoutes(t *testing.T) {
 		if method == "options" { // CORS preflight for the OAuth endpoints, not an operation
 			continue
 		}
-		if path == "/{$}" || path == "/index.html" || strings.HasPrefix(path, "/static") {
+		if path == "/{$}" || path == "/index.html" || path == "/docs" || strings.HasPrefix(path, "/static") {
 			continue
 		}
 		served[method+" "+path] = true
@@ -95,5 +95,34 @@ func TestTheOpenAPIDocumentIsServedWithoutATokenAndNamesTheVersion(t *testing.T)
 	}
 	if f.calls.Load() != 0 {
 		t.Fatal("serving the document must not read the host")
+	}
+}
+
+// /docs draws the OpenAPI document for people. It is as public as the document, runs under the UI's strict CSP,
+// and loads nothing from anywhere else.
+func TestTheAPIReferenceIsServedWithoutATokenAndLoadsNothingRemote(t *testing.T) {
+	f := setup(t, time.Minute, nil)
+	res, body := f.do(t, "GET", "/docs", "")
+	if res.StatusCode != http.StatusOK || !strings.Contains(res.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("/docs: %d %s", res.StatusCode, res.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(res.Header.Get("Content-Security-Policy"), "script-src 'self'") {
+		t.Fatalf("csp: %q", res.Header.Get("Content-Security-Policy"))
+	}
+	if !strings.Contains(body, "/static/js/docs.js") {
+		t.Fatalf("the page does not load its script: %.300s", body)
+	}
+	for _, bad := range []string{"http://", "https://", " style=", "<script>"} {
+		if strings.Contains(strings.ReplaceAll(body, "<script>", ""), bad) && bad != "<script>" {
+			t.Fatalf("the page must not contain %q (CSP, nothing remote)", bad)
+		}
+	}
+	for _, asset := range []string{"/static/js/docs.js", "/static/css/docs.css"} {
+		if res, _ := f.do(t, "GET", asset, ""); res.StatusCode != http.StatusOK {
+			t.Fatalf("%s: %d", asset, res.StatusCode)
+		}
+	}
+	if f.calls.Load() != 0 {
+		t.Fatal("serving the reference must not read the host")
 	}
 }

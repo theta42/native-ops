@@ -318,7 +318,8 @@ func (s *Server) snapshot(ctx context.Context) (*status.Snapshot, error) {
 // other file is served at its path under ui/ (/static/..., /static-modules/...).
 // It is built from what is actually embedded, so only those files are ever served.
 var uiFiles = func() map[string]string {
-	m := map[string]string{"/": "ui/index.html"}
+	// "/docs" is the API reference: public, like the openapi.json it draws.
+	m := map[string]string{"/": "ui/index.html", "/docs": "ui/docs.html"}
 	err := fs.WalkDir(uiFS, "ui", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -498,6 +499,7 @@ func (s *Server) Handler() http.Handler {
 	ui := s.uiHandler()
 	mux.Handle("GET /{$}", ui)
 	mux.Handle("GET /index.html", ui)
+	mux.Handle("GET /docs", ui)
 	mux.Handle("GET /static/", ui)
 	mux.Handle("GET /static-modules/", ui)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

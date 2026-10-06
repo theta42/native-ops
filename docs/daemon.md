@@ -59,6 +59,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /oauth/register`, `GET`/`POST /oauth/authorize`, `POST /oauth/login`, `POST /oauth/token`, `POST /oauth/revoke` | none (a sign-in, then consent) | an MCP client registers, sends its person through the daemon's sign-in and a consent page, and gets tokens that act as that person, at `/mcp` only ([api.md](api.md#connect-by-signing-in-oauth)) |
 | `GET /v1/oauth/grants`, `DELETE /v1/oauth/grants/{id}` | admin | which MCP clients people signed in, and revoking one (also on the UI's Tokens page) |
 | `GET /openapi.json`, `GET /openapi.yaml` | none | the OpenAPI 3.1 description of every endpoint here (the same on every daemon; no host data) |
+| `GET /docs` | none | that description drawn as a readable reference page (loads nothing from elsewhere) |
 | `GET /` | none | the UI (Overview, Instances, Volumes, Network). It holds no data; it signs in (or takes a token) and calls `/v1/status` |
 
 `native-ops status [--json]` prints the same snapshot from the CLI. It reports **key names only**
