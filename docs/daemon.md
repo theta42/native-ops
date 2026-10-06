@@ -424,6 +424,7 @@ Tokens are managed over the API by an admin, so nobody needs a shell on the host
 export NATIVE_OPS_TOKEN=$BOOTSTRAP_TOKEN    # or any admin token
 native-ops remote token-create --name ci-plan --role planner          # prints the secret, once
 native-ops remote token-create --name ci-release --role deployer --names 'app-*' --images 'acme-app:*'
+native-ops remote token-create --name ci-secrets --role deployer --secrets 'SERVICE_APP_*'   # may only sync those secrets
 curl -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens"     # list
 curl -X DELETE -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens/<id>"
 ```
@@ -539,13 +540,28 @@ env_from:
   GOOGLE_SERVICE_ACCOUNT_KEY: SERVICE_CREW_GOOGLE_KEY   # ENV_KEY: secret name
 ```
 
+CI syncs them with a **secrets token**, not an admin token: one that may only set the `SERVICE_*` names its
+scope matches.
+
+```bash
+native-ops remote token-create --name ci-crew-secrets --role deployer --secrets 'SERVICE_CREW_*'   # admin, once
+```
+
 ```yaml
 # the workflow that syncs secrets maps the git server's secret onto the store's name
 - env:
-    NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_ADMIN_TOKEN }}
+    NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_SECRETS_TOKEN }}
     SERVICE_CREW_GOOGLE_KEY: ${{ secrets.CREW_GOOGLE_SERVICE_ACCOUNT_KEY }}
-  run: native-ops remote secret-sync SERVICE_CREW_GOOGLE_KEY
+  run: native-ops remote secret-sync --prune SERVICE_CREW_GOOGLE_KEY
 ```
+
+- A secrets token can call `PUT /v1/secrets` and nothing else: it cannot read a value, list the daemon's
+  own credentials, delete, plan, apply, touch an instance, create tokens, call `whoami` or use MCP. Its
+  answer lists only the names it may set, and its `--prune` removes only names within its scope. A plain
+  deployer cannot sync at all; an admin can still sync anything.
+- So a git server that shows a repository's secrets to every branch hands out, at worst, the power to change
+  that service's secrets, and a changed secret reaches the service only through a plan whose hash binds
+  the value.
 
 - **Only `SERVICE_*` names.** A manifest can name only secrets that start with `SERVICE_`, and the daemon
   reads them from its store alone (never its own environment), so no manifest can route the daemon's

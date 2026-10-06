@@ -203,15 +203,34 @@ func bearer(r *http.Request) string {
 // auth requires a token of at least the given role. A token limited to a scope of tenant instances is
 // refused here: it may only call the instance endpoints (authScoped).
 func (s *Server) auth(min Role, next http.HandlerFunc) http.Handler {
-	return s.authWith(min, false, next)
+	return s.authWith(min, false, false, next)
 }
 
 // authScoped is auth for the endpoints a scoped token may call. The handler enforces the scope.
 func (s *Server) authScoped(min Role, next http.HandlerFunc) http.Handler {
-	return s.authWith(min, true, next)
+	return s.authWith(min, true, false, next)
 }
 
-func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) http.Handler {
+// authSecretSync is auth for PUT /v1/secrets, the one endpoint a secrets token may call: an admin, or a
+// deployer token whose scope is Secrets (the handler checks each name against it). A plain deployer is
+// refused, as is a token scoped to instances.
+func (s *Server) authSecretSync(next http.HandlerFunc) http.Handler {
+	return s.authWith(RoleDeployer, true, true, func(w http.ResponseWriter, r *http.Request) {
+		h, _ := r.Context().Value(actorKey{}).(*actorHolder)
+		if h == nil || !(h.scope.SecretsOnly() || (h.scope == nil && h.role.Allows(RoleAdmin))) {
+			writeError(w, http.StatusForbidden, "forbidden", "syncing secrets needs an admin, or a token scoped to service secrets")
+			return
+		}
+		next(w, r)
+	})
+}
+
+// A secrets token (Scope.Secrets) may call only authSecretSync endpoints, whatever its role.
+func secretsOnlyRefused(scope *Scope, allowSecrets bool) bool {
+	return scope.SecretsOnly() && !allowSecrets
+}
+
+func (s *Server) authWith(min Role, allowScoped, allowSecrets bool, next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// A request an MCP tool makes carries the caller /mcp already authenticated (see mcpDo): only
 		// code in this process can put it there.
@@ -222,6 +241,8 @@ func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) htt
 			switch {
 			case !c.role.Allows(min):
 				writeError(w, http.StatusForbidden, "forbidden", "this caller's role cannot do that")
+			case secretsOnlyRefused(c.scope, allowSecrets):
+				writeError(w, http.StatusForbidden, "forbidden", "this token may only sync service secrets")
 			case c.scope != nil && !allowScoped:
 				writeError(w, http.StatusForbidden, "forbidden", "this token is limited to managing its own instances")
 			default:
@@ -258,6 +279,10 @@ func (s *Server) authWith(min Role, allowScoped bool, next http.HandlerFunc) htt
 		}
 		if !t.Role.Allows(min) {
 			writeError(w, http.StatusForbidden, "forbidden", "this token's role cannot do that")
+			return
+		}
+		if t.Scoped() && secretsOnlyRefused(t.Scope, allowSecrets) {
+			writeError(w, http.StatusForbidden, "forbidden", "this token may only sync service secrets")
 			return
 		}
 		if t.Scoped() && !allowScoped {
@@ -409,7 +434,7 @@ func (s *Server) Handler() http.Handler {
 	}))
 	if s.opts.Secrets != nil {
 		mux.Handle("GET /v1/secrets", s.auth(RoleAdmin, s.handleSecretList))
-		mux.Handle("PUT /v1/secrets", s.auth(RoleAdmin, s.handleSecretSync))
+		mux.Handle("PUT /v1/secrets", s.authSecretSync(s.handleSecretSync))
 		mux.Handle("DELETE /v1/secrets/{name}", s.auth(RoleAdmin, s.handleSecretDelete))
 	}
 	mux.Handle("GET /v1/tokens", s.auth(RoleAdmin, s.handleTokenList))
