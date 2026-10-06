@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"log"
 	"net/http"
+	"time"
 
 	"github.com/theta42/native-ops/pkg/engine"
 )
@@ -125,4 +127,50 @@ func (s *Server) handleImagePrune(w http.ResponseWriter, r *http.Request) {
 	})
 	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
 	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "dry_run": dry})
+}
+
+// RunImageRetention applies image retention on its own, every `every`, until ctx ends (0 turns it off). Nothing
+// else would: a build deletes the image it displaces only if no instance runs it at that moment, which is the
+// usual case (build now, deploy later), so that image becomes an orphan only when the deploy replaces the
+// instance, and the retention rule runs only when something calls it. Left to a person or a pipeline to
+// remember, the host fills up; it is the daemon's own housekeeping. It is the same rule as POST
+// /v1/images/prune (an image an instance runs is never deleted) and is a recorded job like any other change.
+// It does not wait for a busy host: another change running means skipping this round, and the next one runs.
+func (s *Server) RunImageRetention(ctx context.Context, every time.Duration) {
+	if s.opts.ImagePrune == nil || s.opts.Jobs == nil || every <= 0 {
+		return
+	}
+	first := every
+	if first > 5*time.Minute {
+		first = 5 * time.Minute // soon after a start, so a daemon restarted often still gets there
+	}
+	t := time.NewTimer(first)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		s.pruneImagesNow()
+		t.Reset(every)
+	}
+}
+
+const scheduledActor = "native-ops (scheduled)"
+
+// pruneImagesNow runs one retention job unless the host is busy.
+func (s *Server) pruneImagesNow() {
+	if !s.applyMu.TryLock() {
+		return
+	}
+	job, err := s.opts.Jobs.CreateKind("image:prune", scheduledActor, "", "", "")
+	if err != nil {
+		s.applyMu.Unlock()
+		log.Printf("scheduled image retention: could not record the job: %v", err)
+		return
+	}
+	s.startJob(job.ID, scheduledActor, "image prune (scheduled)", "image prune", nil, func(ctx context.Context, logf func(string, ...any)) error {
+		return s.opts.ImagePrune(ctx, false, logf)
+	})
 }

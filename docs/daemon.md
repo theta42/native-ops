@@ -400,7 +400,12 @@ check, deleting only images that no instance runs (`volatile.base_image`):
 
 - **After every build**, the image the build displaced is deleted if it now has no alias and no
   instance runs it, and that app's tagged images beyond the newest `--image-keep` (default 5) go too.
-  `:latest` is always kept.
+  `:latest` is always kept. Usually the displaced image *is* still run by an instance (build now, deploy
+  later), so it is skipped here and only becomes an orphan when the deploy replaces the instance.
+- **On its own, every `--image-prune-interval`** (default 12h, first run five minutes after a start; `0`
+  turns it off), the daemon applies the rule below as a recorded `image:prune` job started by
+  `native-ops (scheduled)`. This is what clears the images a deploy has just freed. It skips a round when
+  another change is running. Needs `--enable-image-build`.
 - **`POST /v1/images/prune`** (deployer; not a scoped token, since it acts on every app) does the same
   for every app, and also deletes images with no alias older than `--image-orphan-age` (default 24h),
   such as those left before this existed. `?dry_run=1` only reports. From CI:
@@ -676,6 +681,7 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--enable-image-build` | | off | `POST /v1/images/build` and the recipe endpoints |
 | `--image-prefix` | `NATIVE_OPS_IMAGE_PREFIX` | `app-` | what the recipe names images before `<app>:<ref>` |
 | `--image-keep` | `NATIVE_OPS_IMAGE_KEEP` | `5` | tagged images kept per app by image retention (0: every tag) |
+| `--image-prune-interval` | `NATIVE_OPS_IMAGE_PRUNE_INTERVAL` | `12h` | how often the daemon applies image retention by itself (0: never) |
 | `--image-orphan-age` | | `24h` | how old an unaliased image no instance runs must be before a prune deletes it |
 | `--enable-edge-apply` | | off | `POST /v1/edge/apply` |
 | `--git-url` | `NATIVE_OPS_GIT_URL` | none | the git server (Gitea) holding the configuration repository; with `--deploy-repo` and `--enable-apply`, `POST /v1/deploy` |
