@@ -184,6 +184,53 @@ func (e *EdgeManager) EnsureBaseCaddyfile(ctx context.Context) error {
 	return e.incus.PushFile(ctx, e.edgeContainer, caddyfilePath, BaseCaddyfile(e.Email), "0644")
 }
 
+// CaddyfileDrift is what SyncCaddyfile would do with content, worked out without doing it: the content is
+// checked the same way (not empty, imports the sites directory), and the edge's Caddyfile is read and
+// compared. found is false when the edge has none; added and removed count the lines that differ.
+func (e *EdgeManager) CaddyfileDrift(ctx context.Context, content string) (differs, found bool, added, removed int, err error) {
+	if err := checkCaddyfile(content); err != nil {
+		return false, false, 0, 0, err
+	}
+	cur, found, err := e.incus.PullFile(ctx, e.edgeContainer, caddyfilePath)
+	if err != nil {
+		return false, false, 0, 0, err
+	}
+	if found && cur == content {
+		return false, true, 0, 0, nil
+	}
+	added, removed = lineDiff(cur, content)
+	return true, found, added, removed, nil
+}
+
+func checkCaddyfile(content string) error {
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("refusing to apply an empty Caddyfile")
+	}
+	if !strings.Contains(content, "import "+sitesDir) {
+		return fmt.Errorf("the Caddyfile does not import %s/*.caddy, so published sites would never be served; add that import line", sitesDir)
+	}
+	return nil
+}
+
+// lineDiff counts the lines only in b (added) and only in a (removed), as multisets.
+func lineDiff(a, b string) (added, removed int) {
+	count := map[string]int{}
+	for _, l := range strings.Split(a, "\n") {
+		count[l]++
+	}
+	for _, l := range strings.Split(b, "\n") {
+		if count[l] > 0 {
+			count[l]--
+		} else {
+			added++
+		}
+	}
+	for _, n := range count {
+		removed += n
+	}
+	return added, removed
+}
+
 // SyncCaddyfile makes the edge's main Caddyfile exactly content: it creates one
 // when the edge has none, replaces one that differs, and does nothing when the
 // file already matches. It is how the edge's routes and TLS are applied from the
@@ -194,11 +241,8 @@ func (e *EdgeManager) EnsureBaseCaddyfile(ctx context.Context) error {
 // validation or at reload -- the previous Caddyfile is put back, so a bad file
 // can never take the edge down. changed reports whether the edge was touched.
 func (e *EdgeManager) SyncCaddyfile(ctx context.Context, content string) (changed bool, err error) {
-	if strings.TrimSpace(content) == "" {
-		return false, fmt.Errorf("refusing to apply an empty Caddyfile")
-	}
-	if !strings.Contains(content, "import "+sitesDir) {
-		return false, fmt.Errorf("the Caddyfile does not import %s/*.caddy, so published sites would never be served; add that import line", sitesDir)
+	if err := checkCaddyfile(content); err != nil {
+		return false, err
 	}
 	prev, hadPrev, err := e.incus.PullFile(ctx, e.edgeContainer, caddyfilePath)
 	if err != nil {

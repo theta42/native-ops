@@ -120,7 +120,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
 	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
 	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as the uploaded fleet.yml's backup section says, only to the destination pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT/_BUCKET). The keys and pins come from the secret store (synced from the git server), else the environment")
-	enableDNSSync := flags.Bool("enable-dns-sync", false, "Serve POST /v1/dns/sync: create or update the uploaded fleet.yml's dns_records in the allowed zones (--dns-domains or NATIVE_OPS_DNS_ZONES) through the built-in provider (DO_API_TOKEN from the secret store, else the environment). Script plugins are not run from an upload")
+	enableDNSSync := flags.Bool("enable-dns-sync", false, "Retired: fleet.yml's dns_records are part of the plan and change with a deploy tag. Accepted so an old unit still starts")
 	imageKeep := flags.Int("image-keep", envInt("NATIVE_OPS_IMAGE_KEEP", 5), "Image retention: tagged images kept per app (<prefix><app>:<ref>; :latest and any image an instance runs are always kept); 0 keeps every tag. Env: NATIVE_OPS_IMAGE_KEEP")
 	imageOrphanAge := flags.Duration("image-orphan-age", 24*time.Hour, "Image retention: how old an image with no alias that no instance runs must be before POST /v1/images/prune deletes it (an image a build displaces goes at once); 0 keeps them")
 	imagePruneEvery := flags.Duration("image-prune-interval", envDuration("NATIVE_OPS_IMAGE_PRUNE_INTERVAL", 12*time.Hour), "Image retention: how often the daemon applies it by itself, as a recorded job (the same rule as POST /v1/images/prune: nothing an instance runs is deleted), because a build leaves the image it displaced while an instance still runs it and nothing else would ever delete it; 0 turns it off. Needs --enable-image-build. Env: NATIVE_OPS_IMAGE_PRUNE_INTERVAL")
@@ -128,7 +128,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	gitURL := flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server (Gitea) holding the configuration repository, e.g. https://git.example.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
 	deployRepo := flags.String("deploy-repo", envOr("NATIVE_OPS_DEPLOY_REPO", ""), "The configuration repository on --git-url, as owner/name: a protected deploy tag there deploys its commit. Env: NATIVE_OPS_DEPLOY_REPO")
 	deployTags := flags.String("deploy-tags", envOr("NATIVE_OPS_DEPLOY_TAGS", "deploy-*"), "Glob of the tags that deploy; the repository must protect them. Env: NATIVE_OPS_DEPLOY_TAGS")
-	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Serve POST /v1/edge/apply: apply the config repo's edge/Caddyfile to the edge container (validated, with rollback). Changes the host, so it runs as a job")
+	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Retired: edge/Caddyfile is part of the plan and changes with a deploy tag. Accepted so an old unit still starts")
 	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
 	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
 	// unprivileged user on the host could read.
@@ -144,10 +144,15 @@ func handleServeCommand(ctx context.Context, args []string) {
 	publicURL := flags.String("public-url", os.Getenv("NATIVE_OPS_PUBLIC_URL"), "The daemon's public origin (e.g. https://native-ops.example.com), named in the OAuth metadata; default: the origin of --oidc-redirect-url, else each request's. Env: NATIVE_OPS_PUBLIC_URL")
 	edgeContainer := flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
 	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from for the status page, e.g. digitalocean (DO_API_TOKEN from the secret store, else the environment). Env: NATIVE_OPS_DNS_PROVIDER")
-	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for, and that a DNS sync may change, e.g. 'example.com,example.net'. Env: NATIVE_OPS_DNS_DOMAINS")
+	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for on the status page, e.g. 'example.com,example.net'. When set (or the synced secret NATIVE_OPS_DNS_ZONES is), a plan whose dns_records name another zone is blocked. Env: NATIVE_OPS_DNS_DOMAINS")
 	stateDir := stateDirFlag(flags)
 	_ = flags.Parse(args)
 
+	for name, on := range map[string]bool{"--enable-dns-sync": *enableDNSSync, "--enable-edge-apply": *enableEdgeApply} {
+		if on {
+			log.Printf("%s is retired and does nothing: DNS records and the edge Caddyfile are part of the plan, applied by a deploy tag", name)
+		}
+	}
 	switch *dnsProviderFlag {
 	case "", "digitalocean", "do":
 	default:
@@ -166,12 +171,10 @@ func handleServeCommand(ctx context.Context, args []string) {
 		EnableImageBuild: *enableImageBuild,
 		ImagePrefix:      *imagePrefix,
 		ImageRetention:   engine.ImageRetention{Prefix: *imagePrefix, KeepTags: *imageKeep, OrphanAge: *imageOrphanAge},
-		EnableEdgeApply:  *enableEdgeApply,
 		GitURL:           *gitURL,
 		DeployRepo:       *deployRepo,
 		DeployTags:       *deployTags,
 		EnableBackup:     *enableBackup,
-		EnableDNSSync:    *enableDNSSync,
 		EnableAuth:       *enableAuth,
 		MCPOAuth:         *mcpOAuth,
 		PublicURL:        *publicURL,
@@ -236,14 +239,12 @@ type daemonConfig struct {
 	EnableImageBuild     bool
 	ImagePrefix          string
 	ImageRetention       engine.ImageRetention
-	EnableEdgeApply      bool
 	// GitURL, DeployRepo and DeployTags, with EnableApply, enable POST /v1/deploy (see pkg/gitsource);
 	// the git server's token is the secret NATIVE_OPS_GIT_TOKEN.
-	GitURL        string
-	DeployRepo    string
-	DeployTags    string
-	EnableBackup  bool
-	EnableDNSSync bool
+	GitURL       string
+	DeployRepo   string
+	DeployTags   string
+	EnableBackup bool
 	// DNSProviderName ("digitalocean") lists DNS records for the status page with the provider's token
 	// read through the secret store at each listing; DNS, when set, is used instead (tests).
 	DNSProviderName string
@@ -319,10 +320,10 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) {
 			return status.CollectFull(ctx, cfg.Exec, status.Options{Pool: cfg.Pool, EdgeContainer: cfg.EdgeContainer, DNS: cfg.DNS, DNSDomains: cfg.DNSDomains})
 		},
-		Plan:    planSource(cfg.Exec, key, secrets.Get),
+		Plan:    planSource(cfg.Exec, key, secrets.Get, lookup, cfg.DNSDomains),
 		Secrets: secrets,
 	}
-	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply || cfg.EnableBackup || cfg.EnableDNSSync || cfg.SelfUpgradeDir != "" {
+	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableBackup || cfg.SelfUpgradeDir != "" {
 		jobs, err := server.OpenJobs(filepath.Join(cfg.StateDir, "jobs"))
 		if err != nil {
 			audit.Close()
@@ -330,7 +331,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		opts.Jobs = jobs
 		if cfg.EnableApply {
-			opts.Apply = applySource(cfg.Exec, secrets.Get)
+			opts.Apply = applySource(cfg.Exec, secrets.Get, lookup, cfg.DNSDomains)
 		}
 		if cfg.EnableInstances {
 			opts.Instances, opts.InstancePolicy = engine.NewInstances(cfg.Exec), cfg.InstancePolicy
@@ -358,13 +359,6 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		if cfg.EnableBackup {
 			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup), restoreSource(cfg.Exec, cfg.Pool, lookup)
 		}
-		// The DNS source is wired when either the standalone endpoint is asked for (--enable-dns-sync)
-		// or deploys are on: a deploy applies its commit's fleet.yml dns_records, so a record change
-		// lands with the deploy tag. Records are scoped to NATIVE_OPS_DNS_ZONES (synced from the git
-		// server's secrets), so a deploy tag cannot write an arbitrary zone.
-		if cfg.EnableDNSSync || cfg.EnableApply {
-			opts.DNSSync = dnsSyncSource(lookup, cfg.DNSDomains)
-		}
 		if cfg.GitURL != "" || cfg.DeployRepo != "" {
 			if !cfg.EnableApply {
 				audit.Close()
@@ -377,9 +371,6 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 				return nil, nil, err
 			}
 			opts.Deploy, opts.DeployTags = src, cfg.DeployTags
-		}
-		if cfg.EnableEdgeApply {
-			opts.EdgeApply = edgeApplySource(cfg.Exec, cfg.EdgeContainer)
 		}
 	}
 	if cfg.EnableAuth || cfg.OIDC.Issuer != "" {
@@ -487,25 +478,51 @@ func splitList(s string) []string {
 	return out
 }
 
-// planSource is what POST /v1/plan plans with. engine.PlanFleet wraps exec in remote.ReadOnly, so
-// an uploaded tree can be planned against this host but never applied to it. The key makes the
-// plan's hash cover the environment values and hook bodies the plan itself does not print. A service's
-// env_from reads secrets (the store only: never the daemon's own environment).
-func planSource(exec remote.Executor, key []byte, secrets engine.SecretLookup) server.PlanFunc {
+// planSource is what POST /v1/plan (and a deploy) plans with. engine.PlanFleet wraps exec in
+// remote.ReadOnly, so an uploaded tree can be planned against this host but never applied to it. The key
+// makes the plan's hash cover the environment values and hook bodies the plan itself does not print. A
+// service's env_from reads secrets (the store only: never the daemon's own environment). fleet.yml's
+// dns_records are planned against the provider (read only), with the token from lookup.
+func planSource(exec remote.Executor, key []byte, secrets engine.SecretLookup, lookup func(string) string, flagZones []string) server.PlanFunc {
 	return func(ctx context.Context, dir, service string) (*engine.FleetPlan, error) {
-		return engine.PlanFleet(ctx, exec, dir, service, engine.WithBindKey(key), engine.WithSecrets(secrets))
+		return engine.PlanFleet(ctx, exec, dir, service, engine.WithBindKey(key), engine.WithSecrets(secrets),
+			engine.WithDNS(dnsProviderFor(lookup), dnsZoneLimit(lookup, flagZones)))
 	}
 }
 
-// applySource is what POST /v1/apply applies with, once the server has checked the plan's hash.
-// Progress goes to the job's own log, not the process log.
-func applySource(exec remote.Executor, secrets engine.SecretLookup) server.ApplyFunc {
+// applySource is what POST /v1/apply (and a deploy) applies with, once the server has checked the plan's
+// hash. Progress goes to the job's own log, not the process log.
+func applySource(exec remote.Executor, secrets engine.SecretLookup, lookup func(string) string, flagZones []string) server.ApplyFunc {
 	return func(ctx context.Context, dir string, plan *engine.FleetPlan, logf func(format string, a ...any)) error {
 		d := engine.NewDeployer(exec)
 		d.SetLogger(logf)
 		d.SetSecrets(secrets)
+		d.SetDNS(dnsProviderFor(lookup), dnsZoneLimit(lookup, flagZones))
 		return d.ApplyPlan(ctx, dir, plan)
 	}
+}
+
+// dnsProviderFor gives the daemon's DNS provider for a fleet: only a built-in one, never a script plugin
+// (that would run a commit's code on the host as the daemon). The API token comes from the secret store.
+func dnsProviderFor(lookup func(string) string) engine.DNSFunc {
+	return func(fleet *config.FleetConfig) (provider.DNSProvider, error) {
+		switch fleet.DNSProvider {
+		case "digitalocean", "do":
+		default:
+			return nil, fmt.Errorf("dns_provider %q: the daemon plans DNS only through a built-in provider (digitalocean)", fleet.DNSProvider)
+		}
+		token := lookup("DO_API_TOKEN")
+		if token == "" {
+			return nil, errors.New("DO_API_TOKEN is not in the daemon's secret store: sync it from the git server's secrets")
+		}
+		return digitalocean.New(token)
+	}
+}
+
+// dnsZoneLimit is the optional hard limit on the zones dns_records may name: --dns-domains plus the synced
+// secret NATIVE_OPS_DNS_ZONES. Empty means the records' own zones are the intent of the change.
+func dnsZoneLimit(lookup func(string) string, flagZones []string) []string {
+	return append(append([]string{}, flagZones...), splitList(lookup("NATIVE_OPS_DNS_ZONES"))...)
 }
 
 // imageBuildSource is what POST /v1/images/build builds with.
@@ -531,15 +548,6 @@ func imagePruneSource(exec remote.Executor, keep engine.ImageRetention) server.I
 	return func(ctx context.Context, dryRun bool, logf func(string, ...any)) error {
 		_, err := engine.PruneImages(ctx, exec, keep, dryRun, logf)
 		return err
-	}
-}
-
-// edgeApplySource is what POST /v1/edge/apply applies with: the uploaded tree's
-// edge/Caddyfile to the edge container, validated and reloaded with rollback.
-func edgeApplySource(exec remote.Executor, edgeContainer string) server.EdgeApplyFunc {
-	return func(ctx context.Context, dir string, logf func(string, ...any)) error {
-		logf("applying edge config from %s", dir)
-		return engine.ApplyEdgeConfig(ctx, exec, dir, edgeContainer)
 	}
 }
 
@@ -599,52 +607,6 @@ func restoreSource(exec remote.Executor, pool string, lookup func(string) string
 			logf("restored %s from %s in place", req.Volume, req.From)
 		}
 		return nil
-	}
-}
-
-// dnsSyncSource is what POST /v1/dns/sync runs: the uploaded fleet.yml's dns_records, through a built-in
-// provider. A script plugin is never run from an upload: that would let any deployer token run code
-// on the host without the plan approval an apply needs.
-func dnsSyncSource(lookup func(string) string, flagZones []string) server.DNSSyncFunc {
-	return func(ctx context.Context, dir string, logf func(string, ...any)) error {
-		fleet, err := config.LoadFleetConfig(dir)
-		if err != nil {
-			return err
-		}
-		if len(fleet.DNSRecords) == 0 {
-			logf("fleet.yml declares no dns_records; nothing to sync")
-			return nil
-		}
-		switch fleet.DNSProvider {
-		case "digitalocean", "do":
-		default:
-			return fmt.Errorf("dns_provider %q: the daemon syncs DNS only through a built-in provider (digitalocean); run `native-ops dns sync` for a script plugin", fleet.DNSProvider)
-		}
-		// The zones a change touches are the zones its own dns_records name: the intent is in the
-		// manifest (a protected deploy tag, or an upload), not in a separate allowlist. An operator
-		// who wants a hard limit can still set --dns-domains / NATIVE_OPS_DNS_ZONES; when given, a
-		// record outside it is refused (the provider's token reaches every zone in the account).
-		allowed := append(append([]string{}, flagZones...), splitList(lookup("NATIVE_OPS_DNS_ZONES"))...)
-		byZone, err := fleet.DNSRecordsByZone()
-		if err != nil {
-			return err
-		}
-		if len(allowed) > 0 {
-			for zone := range byZone {
-				if !containsFold(allowed, zone) {
-					return fmt.Errorf("dns_records name the zone %s, outside the zones this daemon was limited to (%v)", zone, allowed)
-				}
-			}
-		}
-		token := lookup("DO_API_TOKEN")
-		if token == "" {
-			return errors.New("DO_API_TOKEN is not set on this daemon: sync it from the git server's secrets (native-ops remote secret-sync)")
-		}
-		prov, err := digitalocean.New(token)
-		if err != nil {
-			return fmt.Errorf("DigitalOcean provider: %w", err)
-		}
-		return syncDeclaredRecords(ctx, fleet, prov, logf)
 	}
 }
 
@@ -861,13 +823,4 @@ func (l lazyDO) DeleteRecord(ctx context.Context, domain, id string) error {
 		return err
 	}
 	return c.DeleteRecord(ctx, domain, id)
-}
-
-func containsFold(list []string, s string) bool {
-	for _, x := range list {
-		if strings.EqualFold(strings.TrimSuffix(x, "."), strings.TrimSuffix(s, ".")) {
-			return true
-		}
-	}
-	return false
 }

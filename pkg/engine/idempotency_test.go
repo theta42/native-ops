@@ -71,7 +71,7 @@ var (
 	// then -- only when it differs -- a chown to the one asked for.
 	simStatRe    = regexp.MustCompile(`^stat -c %U '([^']*)'$`)
 	simChownRe   = regexp.MustCompile(`^chown '([^']*)' '([^']*)'$`)
-	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|unset|device add) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
+	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|unset|device add|device override|device remove) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
 )
 
 func (s *hostSim) get(name string) (*simCtr, bool) { c, ok := s.ctrs[name]; return c, ok }
@@ -97,6 +97,8 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		return string(b), nil
 	case cmd == "incus image list --format json":
 		return "[]", nil
+	case cmd == "incus network get 'incusbr0' ipv4.address":
+		return "10.0.100.1/24", nil
 	case simListRe.MatchString(cmd):
 		name := simListRe.FindStringSubmatch(cmd)[1]
 		c, ok := s.get(name)
@@ -191,6 +193,15 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 			d[k] = v
 		}
 		c.devices[m[2]] = d
+	case strings.HasPrefix(cmd, "incus config device remove "):
+		c, ok := s.get(arg(0))
+		if !ok {
+			return "", errors.New("Error: Instance not found")
+		}
+		if _, ok := c.devices[arg(1)]; !ok {
+			return "", errors.New("Error: Device not found")
+		}
+		delete(c.devices, arg(1))
 	case strings.HasPrefix(cmd, "incus config set "):
 		c, ok := s.get(arg(0))
 		if !ok {

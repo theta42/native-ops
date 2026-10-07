@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/server"
 	"github.com/theta42/native-ops/pkg/status"
 )
@@ -96,21 +97,6 @@ func TestREADMECarriesTheUsage(t *testing.T) {
 	}
 }
 
-func TestDNSSyncWithNoRecordsNeedsNoProvider(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte("name: f\ndns_provider: digitalocean\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("DO_API_TOKEN", "")
-	var logged []string
-	if err := dnsSyncSource(func(string) string { return "" }, nil)(context.Background(), dir, func(f string, a ...any) { logged = append(logged, f) }); err != nil {
-		t.Fatalf("nothing to sync must succeed without provider credentials: %v", err)
-	}
-	if len(logged) != 1 {
-		t.Fatalf("it must say there was nothing to sync: %v", logged)
-	}
-}
-
 func writeFleet(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -144,23 +130,25 @@ func TestDaemonBackupsGoOnlyToThePinnedDestination(t *testing.T) {
 	}
 }
 
-func TestDaemonDNSSyncTouchesOnlyAllowedZonesAndNeedsAToken(t *testing.T) {
-	dir := writeFleet(t, "name: f\ndns_provider: digitalocean\ndns_records:\n  - zone: victim.example\n    type: A\n    name: www\n    value: 203.0.113.66\n")
-	logf := func(string, ...any) {}
-	// A limit, when given, is enforced: a record outside it is refused.
-	err := dnsSyncSource(lookupOf(map[string]string{"DO_API_TOKEN": "t"}), []string{"example.com"})(context.Background(), dir, logf)
-	if err == nil || !strings.Contains(err.Error(), "outside the zones this daemon was limited to") {
-		t.Fatalf("a zone outside the daemon's limit must be refused: %v", err)
+// The daemon plans and applies DNS only through a built-in provider (a commit's script plugin would run
+// its code on the host), with the token from the secret store; the zone limit is optional.
+func TestTheDaemonsDNSProviderIsBuiltInAndNeedsAToken(t *testing.T) {
+	fleet := &config.FleetConfig{DNSProvider: "./providers/dns.sh"}
+	if _, err := dnsProviderFor(lookupOf(map[string]string{"DO_API_TOKEN": "t"}))(fleet); err == nil || !strings.Contains(err.Error(), "built-in provider") {
+		t.Fatalf("a script plugin must be refused: %v", err)
 	}
-	// Without a limit, the zone is the one the change itself declares -- the intent, not a list to
-	// pre-declare. So it passes the zone check and fails only for the missing token.
-	if err := dnsSyncSource(lookupOf(map[string]string{}), nil)(context.Background(), dir, logf); err == nil || !strings.Contains(err.Error(), "DO_API_TOKEN is not set") {
-		t.Fatalf("without a limit the declared zone is the intent; only the token should be missing: %v", err)
+	fleet.DNSProvider = "digitalocean"
+	if _, err := dnsProviderFor(lookupOf(nil))(fleet); err == nil || !strings.Contains(err.Error(), "DO_API_TOKEN") {
+		t.Fatalf("a missing token must say what to sync: %v", err)
 	}
-	// A limit from the synced secret is enforced the same way, and a zone inside it proceeds.
-	err = dnsSyncSource(lookupOf(map[string]string{"NATIVE_OPS_DNS_ZONES": "example.com, victim.example"}), nil)(context.Background(), dir, logf)
-	if err == nil || !strings.Contains(err.Error(), "DO_API_TOKEN is not set") {
-		t.Fatalf("an allowed zone without a token must say what to sync: %v", err)
+	if _, err := dnsProviderFor(lookupOf(map[string]string{"DO_API_TOKEN": "t"}))(fleet); err != nil {
+		t.Fatalf("a synced token must work: %v", err)
+	}
+	if got := dnsZoneLimit(lookupOf(nil), nil); len(got) != 0 {
+		t.Fatalf("no limit unless one is set: %v", got)
+	}
+	if got := dnsZoneLimit(lookupOf(map[string]string{"NATIVE_OPS_DNS_ZONES": "example.com, example.net"}), []string{"example.org"}); strings.Join(got, ",") != "example.org,example.com,example.net" {
+		t.Fatalf("the limit is the flag plus the synced secret: %v", got)
 	}
 }
 

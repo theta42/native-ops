@@ -33,6 +33,7 @@ case "$*" in
   "storage volume show default web-data") echo "Error: Storage volume not found" >&2; exit 1 ;;
   "file pull edge/etc/caddy/Caddyfile -") echo 'import /etc/caddy/sites/*.caddy' ;;
   "file pull edge/etc/caddy/sites/web.caddy -") echo "Error: Path not found" >&2; exit 1 ;;
+  "network get incusbr0 ipv4.address") echo '10.0.100.1/24' ;;
   *) echo "fake incus: unexpected: $*" >&2; exit 1 ;;
 esac
 `

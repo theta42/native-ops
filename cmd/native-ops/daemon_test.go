@@ -67,6 +67,7 @@ case "$*" in
   "config device add"*|"config set"*) ;;
   "file push"*) cat > /dev/null ;;
   "exec edge -- "*) ;;
+  "network get incusbr0 ipv4.address") echo '10.0.100.1/24' ;;
   *) echo "fake incus: unexpected: $*" >&2; exit 1 ;;
 esac
 `

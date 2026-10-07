@@ -275,7 +275,7 @@ func (f PortForward) DeviceProps() (map[string]string, error) {
 		return nil, fmt.Errorf("forward %s target: %w", f.describe(), err)
 	}
 	if name == "" {
-		name = fmt.Sprintf("%s-%s", protocol, hostPort)
+		name = f.DeviceName()
 	}
 	if !deviceNameRe.MatchString(name) {
 		return nil, fmt.Errorf("forward has no usable name (%q)", name)
@@ -288,6 +288,22 @@ func (f PortForward) DeviceProps() (map[string]string, error) {
 		"listen":  protocol + ":" + hostAddr + ":" + hostPort,
 		"connect": protocol + ":" + instAddr + ":" + instPort,
 	}, nil
+}
+
+// DeviceName is the Incus device the forward is published as: its name, or "<protocol>-<host port>".
+func (f PortForward) DeviceName() string {
+	if s := strings.TrimSpace(f.Name); s != "" {
+		return s
+	}
+	protocol := strings.ToLower(strings.TrimSpace(f.Protocol))
+	if protocol == "" {
+		protocol = "tcp"
+	}
+	_, port, err := splitPort(f.Listen, "0.0.0.0")
+	if err != nil {
+		return ""
+	}
+	return protocol + "-" + port
 }
 
 func (f PortForward) describe() string {

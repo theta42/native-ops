@@ -63,7 +63,7 @@ func TestThePlanEndpointPlansAnUploadedConfAgainstTheHost(t *testing.T) {
 	srv, err := server.New(server.Options{
 		Tokens: tokens, Version: "test",
 		Status: func(ctx context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil },
-		Plan:   planSource(remote.NewLocalExecutor(), []byte("0123456789abcdef0123456789abcdef"), func(string) (string, bool) { return "", false }),
+		Plan:   planSource(remote.NewLocalExecutor(), []byte("0123456789abcdef0123456789abcdef"), func(string) (string, bool) { return "", false }, func(string) string { return "" }, nil),
 	})
 	if err != nil {
 		t.Fatal(err)

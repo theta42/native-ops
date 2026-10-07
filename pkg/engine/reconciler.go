@@ -428,7 +428,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 
 		// The edge's own config (edge/Caddyfile) last, so the routes it adds -- the daemon's included, on a
-		// first bootstrap -- point at services that now exist. Normally this is POST /v1/edge/apply.
+		// first bootstrap -- point at services that now exist. Normally a deploy tag's plan applies it.
 		if _, err := os.Stat(filepath.Join(r.configDir, "edge", "Caddyfile")); err == nil {
 			log.Printf("==> [GitOps] Applying edge/Caddyfile to the edge container\n")
 			if err := ApplyEdgeConfig(ctx, activeExec, r.configDir, "edge"); err != nil {
