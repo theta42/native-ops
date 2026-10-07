@@ -34,10 +34,9 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/plans/{hash}/approve`, `DELETE /v1/plans/{hash}/approval` | admin | approve one apply of exactly this plan, or take the approval back |
 | `POST /v1/apply` | deployer | apply an **approved** plan, as a job (only with `--enable-apply`) |
 | `GET /v1/jobs?kind=&status=&limit=`, `GET /v1/jobs/{id}?wait=` | viewer | jobs and their outcome, filtered by kind (or a family, `instance:`) and status; `wait` (up to 60 seconds) answers when a running job ends. The log is shown to deployers and admins only. A scoped token sees only jobs it started and jobs about instances its scope allows |
-| `POST /v1/edge/apply` | deployer | apply the uploaded tree's `edge/Caddyfile` to the edge container (validated, rolled back if Caddy rejects it), as a job (only with `--enable-edge-apply`) |
 | `POST /v1/backups?volume=&prune=1` | deployer | back up one volume, or every volume `fleet.yml` allows, then optionally apply retention, as a job (only with `--enable-backup`) |
 | `POST /v1/backups/restore?volume=&from=&as=&force=1` | admin | restore a volume in place (keeping a copy of the current one) or as a new volume, as a job (only with `--enable-backup`) |
-| `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (with `--enable-dns-sync`; a deploy applies the commit's records without it) |
+| `POST /v1/edge/apply`, `POST /v1/dns/sync` | | retired: `410 Gone`. The edge's Caddyfile and `dns_records` are part of the plan ([The network is in the plan](#the-network-is-in-the-plan)) |
 | `POST /v1/deploy` | deployer | deploy the commit a protected deploy tag points at, read from the git server (`{"tag": ...}`), as a job (with `--enable-apply`, `--git-url` and `--deploy-repo`) |
 | `POST /v1/deploy/plan` | planner | what deploying a tag would change, read from the git server and planned against the host now, without a job and without changing anything (`{"tag": ...}`; with the same flags as deploys) |
 | `GET /v1/deploys?limit=` | viewer | what the host runs (`current`: the newest deploy that left it matching its tag), the deploy in progress, and the history, each with its tag, commit, result and plan counts |
@@ -238,18 +237,39 @@ ends with, and what to do when one fails.
    the deploy);
 2. **downloads that commit's tree from the git server**: the caller sends only the tag name, so a CI job
    (or a leaked deployer token) cannot make the daemon apply anything but a tagged commit;
-3. plans it, refusing a blocked plan, and records the plan as approved by the tag and used by the job;
-4. applies the commit's declarative DNS records (`fleet.yml` `dns_records`) through the built-in
-   provider, in the zones those records name — the intent of the change. A fleet that declares none is a
-   no-op; a failure stops the deploy before the services are touched, so a record change lands with the
-   tag and never needs a second command;
-5. applies the services. A plan with nothing to change still applies the DNS records, then ends.
+3. plans it -- the services **and the network they share** (DNS records, the edge's Caddyfile; see
+   [The network is in the plan](#the-network-is-in-the-plan)) -- refusing a blocked plan, and records the
+   plan as approved by the tag and used by the job;
+4. applies exactly that plan: the network first, then the services. A plan with nothing to change ends
+   the job without touching anything.
 
-The DNS source is wired whenever deploys are on (`--enable-apply`), so a deploy tag converges
-`dns_records` even without `--enable-dns-sync`; that flag only adds the standalone `POST /v1/dns/sync`.
-Only the built-in provider is used from a deploy (never a script plugin from the commit). A daemon may
-still be *limited* to certain zones with `--dns-domains`/`NATIVE_OPS_DNS_ZONES`; when that is set, a
-record outside it is refused. Without a limit, the zones are exactly the ones the commit declares.
+### The network is in the plan
+
+Everything a deploy changes is in the plan it logs, is bound into the plan's hash, and is applied only as
+planned. Once applied, the same commit plans to nothing. That includes the network:
+
+| What | Declared in | Planned as | Applied |
+|---|---|---|---|
+| DNS records | `fleet.yml` `dns_records` (each names its zone) | `dns-create` / `dns-update`, diffed against the provider (read only) | through the built-in provider; the zone is read again first, and if it moved since the plan the apply refuses ("plan again") |
+| The edge's main Caddyfile | `edge/Caddyfile` | `edge-caddyfile`, with the lines added and removed; its content is in the hash | validated, reloaded, and rolled back if Caddy rejects it |
+| Host ports | a service's `forwards:` | `publish-port` / `remove-port` on that service | an Incus proxy device per forward |
+| The instance bridge | `fleet.yml` `network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan |
+
+Rules that keep it safe to run again and again:
+
+- **DNS only creates or updates.** A record the manifest does not mention (mail, verification) is never
+  deleted. The zones are the ones the records name; a daemon can be held to a hard list with
+  `--dns-domains` or the synced secret `NATIVE_OPS_DNS_ZONES`, and then a record outside it blocks the
+  plan. The token is `DO_API_TOKEN` in the secret store; without it, a fleet that declares records has a
+  blocked plan that says so. Only a built-in provider is used (a commit's script plugin would run its
+  code on the host). A record that `reconcile` also writes for `domain:` (`A @`, `A *`) blocks the plan:
+  declare it in one place.
+- **Ports native-ops published are tracked** on the instance (`user.native-ops.forwards`), so a forward
+  deleted from the manifest is removed, and a proxy device somebody else added is left alone. An instance
+  whose ports predate the tracking plans one `publish-port` change that only records them.
+- **No side doors.** There is no endpoint that changes DNS or the edge outside a plan; the old
+  `POST /v1/edge/apply` and `POST /v1/dns/sync` answer `410 Gone`. A change is a commit and a deploy
+  tag. A plan made for one service (`?service=`) leaves the network out.
 
 If the commit's `fleet.yml` pins another daemon version (`daemon:`), the job upgrades the daemon to it
 first and the deploy resumes on the new binary (see [Upgrading the daemon](#upgrading-the-daemon-from-ci)).
@@ -457,30 +477,23 @@ The daemon loads it as an in-memory `admin` token named `bootstrap`; it is never
 Rotate it by changing the secret and restarting. On the host itself, `native-ops token create|list|revoke
 --state-dir /var/lib/native-ops` works on the same file, and a running daemon notices the change.
 
-## Backups, retention and DNS from CI
+## Backups and retention from CI
 
 The recurring work is a daemon job that a **scheduled pipeline** starts; the pipeline's schedule is
-the schedule, so the daemon needs none of its own.
+the schedule, so the daemon needs none of its own. (DNS is not maintenance: it is part of the plan.)
 
 ```bash
 native-ops remote backup --prune                 # every volume fleet.yml's backup section allows
 native-ops remote backup --volume gitea-data     # one volume
-native-ops remote dns-sync                        # fleet.yml's dns_records (create or update only)
 native-ops remote restore --volume gitea-data --as gitea-drill    # admin: a restore drill
 ```
 
 `fleet.yml` in the upload says what to do; the credentials stay with the daemon, in its secret store
 (see the next section): the object store's keys (`BACKUP_S3_ACCESS_KEY`/`BACKUP_S3_SECRET_KEY`, or the
-names `fleet.yml` gives) and the DNS provider's (`DO_API_TOKEN`). The upload cannot redirect them:
-
-- a backup goes only to the destination pinned on the daemon (`NATIVE_OPS_BACKUP_ENDPOINT` and
-  `NATIVE_OPS_BACKUP_BUCKET`); an upload naming another one is refused, or a deployer token could send
-  the host's volumes to storage of its own;
-- a DNS sync touches only the zones the daemon was given (`--dns-domains`, or `NATIVE_OPS_DNS_ZONES`):
-  the provider's token reaches every zone in the account;
-- DNS is synced only with a built-in provider: a script plugin from an upload would let a deployer token
-  run code on the host without an approved plan (run `native-ops dns sync` on the host for a plugin). An in-place restore stops the
-containers that mount the volume (`force=1`), copies the current volume aside to
+names `fleet.yml` gives). The upload cannot redirect them: a backup goes only to the destination pinned
+on the daemon (`NATIVE_OPS_BACKUP_ENDPOINT` and `NATIVE_OPS_BACKUP_BUCKET`); an upload naming another one
+is refused, or a deployer token could send the host's volumes to storage of its own. An in-place restore
+stops the containers that mount the volume (`force=1`), copies the current volume aside to
 `<volume>-pre-restore-<time>` first, and always starts the containers again.
 
 ## The daemon's own credentials (synced from the git server)
@@ -747,15 +760,15 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--image-keep` | `NATIVE_OPS_IMAGE_KEEP` | `5` | tagged images kept per app by image retention (0: every tag) |
 | `--image-prune-interval` | `NATIVE_OPS_IMAGE_PRUNE_INTERVAL` | `12h` | how often the daemon applies image retention by itself (0: never) |
 | `--image-orphan-age` | | `24h` | how old an unaliased image no instance runs must be before a prune deletes it |
-| `--enable-edge-apply` | | off | `POST /v1/edge/apply` |
+| `--enable-edge-apply` | | off | retired, does nothing (the edge's Caddyfile is in the plan); still accepted so an old unit starts |
 | `--git-url` | `NATIVE_OPS_GIT_URL` | none | the git server (Gitea) holding the configuration repository; with `--deploy-repo` and `--enable-apply`, `POST /v1/deploy` |
 | `--deploy-repo` | `NATIVE_OPS_DEPLOY_REPO` | none | the configuration repository there, as `owner/name` |
 | `--deploy-tags` | `NATIVE_OPS_DEPLOY_TAGS` | `deploy-*` | the tags that deploy; the repository must protect them |
 | `--enable-backup` | | off | `POST /v1/backups` and `/v1/backups/restore` |
-| `--enable-dns-sync` | | off | the standalone `POST /v1/dns/sync`; a deploy (`--enable-apply`) applies the commit's `dns_records` whether or not this is on |
+| `--enable-dns-sync` | | off | retired, does nothing (`dns_records` are in the plan); still accepted so an old unit starts |
 | `--edge-container` | `NATIVE_OPS_EDGE_CONTAINER` | `edge` | the container whose routes and certificates the status shows |
 | `--dns-provider` | `NATIVE_OPS_DNS_PROVIDER` | none | `digitalocean`: DNS records on the status page |
-| `--dns-domains` | `NATIVE_OPS_DNS_DOMAINS` | none | zones shown on the status page; set, an optional limit on the zones a DNS sync may change (otherwise the records' own zones are used) |
+| `--dns-domains` | `NATIVE_OPS_DNS_DOMAINS` | none | zones shown on the status page; set, a hard limit on the zones `dns_records` may name (a record outside it blocks the plan) |
 | `--enable-auth` | `NATIVE_OPS_ENABLE_AUTH=1` | off | local sign-in for the UI |
 | `--oidc-issuer` | `NATIVE_OPS_OIDC_ISSUER` | none | turns on OIDC sign-in |
 | `--oidc-client-id` | `NATIVE_OPS_OIDC_CLIENT_ID` | | |

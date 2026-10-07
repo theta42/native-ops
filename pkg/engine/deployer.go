@@ -27,6 +27,10 @@ type Deployer struct {
 	healthGate func(ctx context.Context, ip string, hc config.HealthCheckConfig) error
 
 	logf func(format string, a ...any)
+	// dns reads and writes fleet.yml's dns_records (see WithDNS); dnsZoneLimit, when set, is the only
+	// zones they may name.
+	dns          DNSFunc
+	dnsZoneLimit []string
 	// bind, when set, is mixed into a plan's hash: a digest of everything the manifest says that the
 	// plan does not print (environment values, hook bodies, health checks), so that the hash of a
 	// plan covers what apply would really do. See WithBindKey.

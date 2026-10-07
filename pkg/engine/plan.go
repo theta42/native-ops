@@ -221,6 +221,14 @@ func (d *Deployer) planFresh(ctx context.Context, p *ServicePlan, svc *config.Se
 		sort.Strings(keys)
 		p.add(ChangeSetEnv, "write /etc/default/%s with %d keys: %s", svc.Unit(), len(keys), strings.Join(envKeyLabels(svc, keys), ", "))
 	}
+	for _, fwd := range svc.Forwards {
+		props, err := fwd.DeviceProps()
+		if err != nil {
+			p.block("%s: %v", svc.Name, err)
+			continue
+		}
+		p.add(ChangePublishPort, "%s: %s -> %s", fwd.DeviceName(), props["listen"], props["connect"])
+	}
 	if err := d.planRoute(ctx, p, svc, nil, routeFresh); err != nil {
 		return err
 	}
@@ -261,6 +269,10 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 	if drift := labelsDrift(st.Config, svc.Labels); len(drift) > 0 {
 		p.add(ChangeSetLabels, "%s", strings.Join(drift, ", "))
 	}
+
+	// Host ports are converged whether or not the image is replaced (a replacement carries its devices
+	// over, and apply then reconciles them to the manifest).
+	planForwards(p, st, svc.Forwards)
 
 	declared, envErr := d.declaredEnv(svc, configDir)
 	if envErr != nil {
@@ -418,9 +430,11 @@ func joinKV(m map[string]string) string {
 	return strings.Join(parts, " ")
 }
 
-// FleetPlan is the plan for every service that would be applied.
+// FleetPlan is the plan for every service that would be applied, and for the network they share (DNS,
+// the edge's Caddyfile). A plan for a single service has no network part.
 type FleetPlan struct {
 	Services []*ServicePlan `json:"services"`
+	Network  *NetworkPlan   `json:"network,omitempty"`
 }
 
 // Counts returns how many services fall in each action.
@@ -435,11 +449,13 @@ func (f *FleetPlan) Counts() map[string]int {
 // Pending reports whether apply would change anything.
 func (f *FleetPlan) Pending() bool {
 	c := f.Counts()
-	return c[ActionCreate]+c[ActionUpdate] > 0
+	return c[ActionCreate]+c[ActionUpdate] > 0 || (f.Network != nil && len(f.Network.Changes) > 0)
 }
 
-// Blocked reports whether apply would fail on any service.
-func (f *FleetPlan) Blocked() bool { return f.Counts()[ActionBlocked] > 0 }
+// Blocked reports whether apply would fail on any service, or on the network.
+func (f *FleetPlan) Blocked() bool {
+	return f.Counts()[ActionBlocked] > 0 || (f.Network != nil && len(f.Network.Blockers) > 0)
+}
 
 // Render is the human-readable form.
 func (f *FleetPlan) Render() string {
@@ -459,8 +475,37 @@ func (f *FleetPlan) Render() string {
 			fmt.Fprintf(&sb, "    note: %s\n", n)
 		}
 	}
+	if n := f.Network; n != nil && (len(n.Changes)+len(n.Blockers)+len(n.Notes) > 0) {
+		switch {
+		case len(n.Blockers) > 0:
+			sb.WriteString("! network (blocked)\n")
+		case len(n.Changes) > 0:
+			sb.WriteString("~ network (update)\n")
+		default:
+			sb.WriteString("  network (none)\n")
+		}
+		for _, c := range n.Changes {
+			fmt.Fprintf(&sb, "    %-22s %s\n", c.Kind, c.Detail)
+		}
+		for _, b := range n.Blockers {
+			fmt.Fprintf(&sb, "    BLOCKED: %s\n", b)
+		}
+		for _, note := range n.Notes {
+			fmt.Fprintf(&sb, "    note: %s\n", note)
+		}
+	}
 	c := f.Counts()
-	fmt.Fprintf(&sb, "\nPlan: %d to create, %d to update, %d unchanged, %d blocked.\n", c[ActionCreate], c[ActionUpdate], c[ActionNone], c[ActionBlocked])
+	fmt.Fprintf(&sb, "\nPlan: %d to create, %d to update, %d unchanged, %d blocked", c[ActionCreate], c[ActionUpdate], c[ActionNone], c[ActionBlocked])
+	if n := f.Network; n != nil && len(n.Blockers) > 0 {
+		sb.WriteString("; the network is blocked")
+	} else if n != nil && len(n.Changes) > 0 {
+		if len(n.Changes) == 1 {
+			sb.WriteString("; 1 network change")
+		} else {
+			fmt.Fprintf(&sb, "; %d network changes", len(n.Changes))
+		}
+	}
+	sb.WriteString(".\n")
 	return sb.String()
 }
 
@@ -474,6 +519,7 @@ func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service str
 	if _, err := config.LoadFleetConfig(configDir); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
 	}
+	fleet, _ := config.LoadFleetConfig(configDir)
 	services, err := config.LoadServices(configDir, service)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
@@ -489,6 +535,12 @@ func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service str
 			return nil, fmt.Errorf("plan service %s: %w", svc.Name, err)
 		}
 		fp.Services = append(fp.Services, p)
+	}
+	// The network is the whole fleet's: a plan narrowed to one service leaves it out.
+	if service == "" {
+		if fp.Network, err = d.PlanNetwork(ctx, fleet, configDir, services); err != nil {
+			return nil, fmt.Errorf("plan the network: %w", err)
+		}
 	}
 	return fp, nil
 }
@@ -519,18 +571,31 @@ func (f *FleetPlan) Hash() string {
 	for i, sp := range svcs {
 		rows[i] = hashed{sp, sp.bind}
 	}
-	b, _ := json.Marshal(rows)
+	var b []byte
+	if f.Network == nil {
+		b, _ = json.Marshal(rows) // the same hash a plan had before it had a network part
+	} else {
+		b, _ = json.Marshal(struct {
+			Services    []hashed
+			Network     *NetworkPlan
+			NetworkBind string
+		}{rows, f.Network, f.Network.bind})
+	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
-// ApplyPlan applies what a plan says would change, and nothing else: each service whose action is
-// create or update is deployed, in plan order, and it stops at the first failure (services after
+// ApplyPlan applies what a plan says would change, and nothing else: the network part first (DNS records,
+// the edge's Caddyfile), then each service whose action is create or update is deployed, in plan order, and it stops at the first failure (services after
 // it are left alone; running the same apply again is safe and continues). A blocked plan is
 // refused before anything is touched. configDir must be the tree the plan was made from.
 func (d *Deployer) ApplyPlan(ctx context.Context, configDir string, plan *FleetPlan) error {
 	if plan.Blocked() {
 		return errors.New("the plan is blocked; nothing was applied")
+	}
+	// The network first: DNS and the edge's Caddyfile are what the services' routes are reached by.
+	if err := d.applyNetwork(ctx, configDir, plan.Network); err != nil {
+		return fmt.Errorf("apply the network: %w", err)
 	}
 	for _, sp := range plan.Services {
 		if sp.Action != ActionCreate && sp.Action != ActionUpdate {

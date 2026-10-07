@@ -19,7 +19,6 @@ type maintRig struct {
 	mu       sync.Mutex
 	backups  []BackupRequest
 	restores []RestoreRequest
-	syncs    int
 }
 
 func newMaintRig(t *testing.T) *maintRig {
@@ -46,12 +45,6 @@ func newMaintRig(t *testing.T) *maintRig {
 			rig.mu.Lock()
 			defer rig.mu.Unlock()
 			rig.restores = append(rig.restores, req)
-			return nil
-		},
-		DNSSync: func(context.Context, string, func(string, ...any)) error {
-			rig.mu.Lock()
-			defer rig.mu.Unlock()
-			rig.syncs++
 			return nil
 		},
 		Status: func(context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil }})
@@ -112,8 +105,6 @@ func TestMaintenanceEndpointsAreGatedByRole(t *testing.T) {
 		{"/v1/backups", rig.viewer, 403},
 		{"/v1/backups", rig.planner, 403},
 		{"/v1/backups", rig.scoped, 403},
-		{"/v1/dns/sync", rig.viewer, 403},
-		{"/v1/dns/sync", rig.scoped, 403},
 		// A restore replaces data: a deployer is not enough.
 		{"/v1/backups/restore?volume=gitea-data", rig.deployer, 403},
 	} {
@@ -123,7 +114,7 @@ func TestMaintenanceEndpointsAreGatedByRole(t *testing.T) {
 	}
 }
 
-func TestRestoreAndDNSSyncRunAsJobs(t *testing.T) {
+func TestRestoreRunsAsAJob(t *testing.T) {
 	rig := newMaintRig(t)
 	res, body := rig.post(t, "/v1/backups/restore?volume=gitea-data&as=gitea-drill", rig.secret, "application/gzip", goodTree(t))
 	if res.StatusCode != 202 {
@@ -132,15 +123,10 @@ func TestRestoreAndDNSSyncRunAsJobs(t *testing.T) {
 	if j := rig.wait(t, body); j.Kind != "restore" || j.Status != JobSucceeded {
 		t.Fatalf("restore job: %+v", j)
 	}
-	res, body = rig.post(t, "/v1/dns/sync", rig.deployer, "application/gzip", goodTree(t))
-	if res.StatusCode != 202 {
-		t.Fatalf("dns: %d %s", res.StatusCode, body)
-	}
-	rig.wait(t, body)
 	rig.mu.Lock()
 	defer rig.mu.Unlock()
-	if len(rig.restores) != 1 || rig.restores[0] != (RestoreRequest{Volume: "gitea-data", From: "latest", As: "gitea-drill"}) || rig.syncs != 1 {
-		t.Fatalf("restores %+v syncs %d", rig.restores, rig.syncs)
+	if len(rig.restores) != 1 || rig.restores[0] != (RestoreRequest{Volume: "gitea-data", From: "latest", As: "gitea-drill"}) {
+		t.Fatalf("restores %+v", rig.restores)
 	}
 }
 

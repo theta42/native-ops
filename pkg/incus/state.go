@@ -164,6 +164,18 @@ func (c *Client) SetDevice(ctx context.Context, container, device string, props 
 	return nil
 }
 
+// RemoveDevice removes a local device from an instance. A device that is not there is not an error.
+func (c *Client) RemoveDevice(ctx context.Context, container, device string) error {
+	if !ValidName(container) {
+		return fmt.Errorf("invalid instance name %q", container)
+	}
+	cmd := fmt.Sprintf("incus config device remove %s %s", ShQuote(container), ShQuote(device))
+	if _, err := c.exec.Run(ctx, cmd); err != nil && !strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return fmt.Errorf("remove device %s from %s: %w", device, container, err)
+	}
+	return nil
+}
+
 // GlobalIPv4s returns every global IPv4 address of a container, sorted. It
 // makes one query and has no side effects (unlike GetContainerIP).
 func (c *Client) GlobalIPv4s(ctx context.Context, name string) ([]string, error) {

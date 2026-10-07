@@ -6,17 +6,18 @@ import (
 	"regexp"
 )
 
-// Maintenance jobs: the recurring work a fleet needs besides deploying -- backups, retention, DNS --
+// Maintenance jobs: the recurring work a fleet needs besides deploying -- backups and retention --
 // driven from CI like everything else. A scheduled pipeline uploads the configuration tree it checked
-// out (fleet.yml holds the backup and DNS settings), and the daemon runs the work as a job. The daemon
-// holds the credentials (the object store's and the DNS provider's keys, in its environment); CI holds
+// out (fleet.yml holds the backup settings), and the daemon runs the work as a job. The daemon holds the
+// credentials (the object store's keys, in its environment); CI holds
 // only a token. There is no scheduler in the daemon: the pipeline's schedule is the schedule.
 //
 //	POST /v1/backups?volume=<name>&prune=1          deployer: back up one volume, or every allowlisted
 //	                                                  volume without volume=; prune=1 then applies retention
 //	POST /v1/backups/restore?volume=<name>&from=<key|latest>&as=<new name>&force=1
 //	                                                  admin: restore a volume (in place, or as a new volume)
-//	POST /v1/dns/sync                                deployer: create or update fleet.yml's dns_records
+//
+// DNS records are not maintenance: they are part of the plan, and change with a deploy tag.
 
 // BackupRequest says what POST /v1/backups should back up.
 type BackupRequest struct {
@@ -32,11 +33,10 @@ type RestoreRequest struct {
 	Force  bool   // stop the containers that mount the volume to restore it in place
 }
 
-// BackupFunc backs up as fleet.yml in configDir says. RestoreFunc restores. DNSSyncFunc syncs records.
+// BackupFunc backs up as fleet.yml in configDir says. RestoreFunc restores.
 type (
 	BackupFunc  func(ctx context.Context, configDir string, req BackupRequest, logf func(string, ...any)) error
 	RestoreFunc func(ctx context.Context, configDir string, req RestoreRequest, logf func(string, ...any)) error
-	DNSSyncFunc func(ctx context.Context, configDir string, logf func(string, ...any)) error
 )
 
 var (
@@ -90,11 +90,11 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDNSSync is POST /v1/dns/sync.
-func (s *Server) handleDNSSync(w http.ResponseWriter, r *http.Request) {
-	s.runTreeJob(w, r, "dns:sync", "", "dns sync", func(ctx context.Context, root string, logf func(string, ...any)) error {
-		return s.opts.DNSSync(ctx, root, logf)
-	})
+// goneToDeployTag answers a retired endpoint whose work is now part of the plan: 410, naming the way.
+func goneToDeployTag(what string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusGone, "gone", what+" is part of the plan now: commit it to the configuration repository and push a deploy tag")
+	}
 }
 
 // runTreeJob receives an uploaded configuration tree, takes the host lock, and runs work on the tree as

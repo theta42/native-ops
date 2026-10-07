@@ -75,15 +75,10 @@ type Options struct {
 	// pattern, for the UI.
 	Deploy     DeploySource
 	DeployTags string
-	// EdgeApply, with Jobs, enables POST /v1/edge/apply: it applies the uploaded tree's
-	// edge/Caddyfile to the edge container (validated, with rollback). It changes the host but
-	// never reconciles service containers, so unlike Apply it is safe to run on every merge.
-	EdgeApply EdgeApplyFunc
-	// Backup, Restore and DNSSync, with Jobs, enable the maintenance endpoints (see maintenance.go):
-	// POST /v1/backups, POST /v1/backups/restore and POST /v1/dns/sync.
+	// Backup and Restore, with Jobs, enable the maintenance endpoints (see maintenance.go):
+	// POST /v1/backups and POST /v1/backups/restore.
 	Backup  BackupFunc
 	Restore RestoreFunc
-	DNSSync DNSSyncFunc
 	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
 	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
 	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.
@@ -128,8 +123,8 @@ func New(opts Options) (*Server, error) {
 	if opts.OIDC != nil && opts.Users == nil {
 		return nil, errors.New("OIDC sign-in needs a user store to record who signed in")
 	}
-	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.ImagePrune != nil || opts.EdgeApply != nil ||
-		opts.Backup != nil || opts.Restore != nil || opts.DNSSync != nil || opts.Upgrade != nil
+	changes := opts.Apply != nil || opts.Instances != nil || opts.ImageBuild != nil || opts.ImagePrune != nil ||
+		opts.Backup != nil || opts.Restore != nil || opts.Upgrade != nil
 	if opts.Deploy != nil && opts.Apply == nil {
 		return nil, errors.New("deploys need apply: a deploy applies the tagged commit")
 	}
@@ -486,9 +481,6 @@ func (s *Server) Handler() http.Handler {
 	if s.opts.ImagePrune != nil {
 		mux.Handle("POST /v1/images/prune", s.auth(RoleDeployer, s.handleImagePrune))
 	}
-	if s.opts.EdgeApply != nil {
-		mux.Handle("POST /v1/edge/apply", s.auth(RoleDeployer, s.handleEdgeApply))
-	}
 	if s.opts.Upgrade != nil {
 		mux.Handle("POST /v1/daemon/upgrade", s.auth(RoleAdmin, s.handleDaemonUpgrade))
 	}
@@ -498,9 +490,10 @@ func (s *Server) Handler() http.Handler {
 	if s.opts.Restore != nil {
 		mux.Handle("POST /v1/backups/restore", s.auth(RoleAdmin, s.handleRestore))
 	}
-	if s.opts.DNSSync != nil {
-		mux.Handle("POST /v1/dns/sync", s.auth(RoleDeployer, s.handleDNSSync))
-	}
+	// The edge's Caddyfile and fleet.yml's dns_records used to have endpoints of their own. They are part
+	// of the plan now, so they change only through a deploy tag; a caller still using one is told so.
+	mux.HandleFunc("POST /v1/edge/apply", goneToDeployTag("edge/Caddyfile"))
+	mux.HandleFunc("POST /v1/dns/sync", goneToDeployTag("fleet.yml's dns_records"))
 	if s.opts.OAuth != nil {
 		mux.HandleFunc("GET /.well-known/oauth-protected-resource", oauthPublic(s.handleProtectedResource))
 		mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", oauthPublic(s.handleProtectedResource))

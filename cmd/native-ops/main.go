@@ -109,7 +109,7 @@ The daemon (runs on each host; CI drives it over HTTPS):
   serve            Run the authenticated API + UI daemon (needs a state dir; see README)
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
-  remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
+  remote           Drive a daemon from CI: plan, apply, deploy, backup, restore, wait,
                    token-create, recipe-approve, secret-sync, daemon-upgrade, deploy,
                    image-prune
                    (NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
@@ -203,7 +203,7 @@ func handleHostCommand(ctx context.Context, args []string) {
 		daemonVersion := flags.String("daemon-version", "", "Install this native-ops release as the host's daemon from cloud-init (e.g. v1.54.0); needs --daemon-sha256 and a bootstrap token")
 		daemonSHA := flags.String("daemon-sha256", "", "SHA-256 of the release's linux tarball (from its checksums.txt)")
 		daemonArch := flags.String("daemon-arch", "amd64", "Architecture of the daemon release: amd64 or arm64")
-		daemonFlags := flags.String("daemon-flags", "", "Extra `native-ops serve` flags for the daemon, e.g. '--enable-apply --enable-edge-apply'")
+		daemonFlags := flags.String("daemon-flags", "", "Extra `native-ops serve` flags for the daemon, e.g. '--enable-apply --enable-instances'")
 		_ = flags.Parse(args[1:])
 
 		if *name == "" {

@@ -124,23 +124,11 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 		s.opts.Plans.Record(PlanSeen{Hash: hash, Actor: actor, Sha: sha, Service: "", Exit: fp.ExitStatus(), Counts: fp.Counts(), Text: fp.Render()})
 		s.opts.Jobs.update(job.ID, func(j *Job) { j.PlanHash = hash })
 		logf("plan %s:\n%s", hash[:12], fp.Render())
-		switch {
-		case fp.Blocked():
+		// The plan covers the services and the network they share (fleet.yml's dns_records, the edge's
+		// Caddyfile), so what the log shows is everything the deploy does.
+		if fp.Blocked() {
 			return errors.New("the plan is blocked: apply would fail, so nothing was changed")
 		}
-
-		// The commit's declarative DNS records are part of what the deploy applies, so a record
-		// change lands with the deploy tag and never needs a second command. A fleet that declares
-		// none is a no-op; a failure stops the deploy before the services are touched. The zones are
-		// the ones the commit's own dns_records name (the intent of the change); a daemon limited
-		// with --dns-domains refuses a record outside that.
-		if s.opts.DNSSync != nil {
-			logf("syncing fleet.yml dns_records")
-			if err := s.opts.DNSSync(ctx, root, logf); err != nil {
-				return fmt.Errorf("dns sync: %w", err)
-			}
-		}
-
 		if !fp.Pending() {
 			logf("nothing to change: the host already matches %s", tag)
 			result(ResultNoChanges)

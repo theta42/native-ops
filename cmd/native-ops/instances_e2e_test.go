@@ -77,6 +77,7 @@ case "$1" in
     esac ;;
   stop) : ;;
   delete) rm -f "$D/inst/$2" ;;
+  "network get incusbr0 ipv4.address") echo '10.0.100.1/24' ;;
   *) echo "fake incus: unexpected: $*" >&2; exit 1 ;;
 esac
 `

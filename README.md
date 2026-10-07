@@ -30,7 +30,7 @@ flowchart TD
     end
 
     subgraph CI ["CI runner (GitHub / Gitea Actions)"]
-        CLI["native-ops remote\nplan / apply / edge-apply / backup / dns-sync"]
+        CLI["native-ops remote\nplan / deploy / backup"]
     end
 
     subgraph L0 ["Level 0: Cloud & Hypervisor Providers"]
@@ -104,7 +104,7 @@ The daemon (runs on each host; CI drives it over HTTPS):
   serve            Run the authenticated API + UI daemon (needs a state dir; see README)
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
-  remote           Drive a daemon from CI: plan, apply, edge-apply, backup, restore, dns-sync, wait,
+  remote           Drive a daemon from CI: plan, apply, deploy, backup, restore, wait,
                    token-create, recipe-approve, secret-sync, daemon-upgrade, deploy,
                    image-prune
                    (NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
@@ -295,9 +295,9 @@ hosts:
 daemon:
   version: v1.54.0
   sha256: <sha256 of native-ops_v1.54.0_linux_amd64.tar.gz, from checksums.txt>
-  flags: "--addr 10.0.100.1:8686 --enable-apply --enable-edge-apply"
+  flags: "--addr 10.0.100.1:8686 --enable-apply"
 
-# Records kept in sync by `native-ops dns sync` (create or update, never delete),
+# Records the plan diffs against the provider and a deploy tag applies (create or update, never delete),
 # beyond the computed apex + wildcard A. Each names its own zone.
 dns_records:
   - zone: example.com
@@ -500,8 +500,12 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
   every other token over the API: `native-ops remote token-create --name ci-plan --role planner`.
 - **Changes are gated.** An apply runs only a plan an admin approved; an image build runs only a
   recipe (`scripts/` + `images/`) an admin approved; a scoped token can touch only its own instances.
-- **Maintenance is CI-scheduled.** Backups, retention and DNS sync are daemon jobs a scheduled
-  pipeline starts (`native-ops remote backup --prune`, `dns-sync`).
+- **Maintenance is CI-scheduled.** Backups and retention are daemon jobs a scheduled pipeline starts
+  (`native-ops remote backup --prune`).
+- **The network is in the plan.** `fleet.yml`'s `dns_records`, the repo's `edge/Caddyfile` and each
+  service's `forwards:` are diffed against the provider and the host, shown in the plan, bound into its
+  hash and applied by the deploy tag; once applied, a plan shows nothing to do. There is no separate
+  endpoint for any of them.
 - **The daemon upgrades itself on a deploy.** Bump `daemon: {version, sha256}` in `fleet.yml` and push a
   deploy tag: the daemon installs the checksum-pinned release, restarts on it and resumes the deploy, with
   the previous binary kept and put back by the unit if the new one cannot stay up. No CI job holds an

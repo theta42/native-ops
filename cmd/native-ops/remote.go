@@ -38,10 +38,8 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   deploy-plan --tag <tag>         print what deploying the tag would change, changing nothing (planner;
                                   no upload); exits 1 if the plan is blocked, 2 if the tag would not deploy
   deploys     [--json]            what the host runs now and the recent deploys (no upload)
-  edge-apply                      apply edge/Caddyfile to the edge container
   backup      [--volume v] [--prune]
   restore     --volume v [--from key|latest] [--as name] [--force]   (admin)
-  dns-sync                        create or update fleet.yml's dns_records
   wait        <job-id>            wait for a job (no upload)
   recipe-approve [<digest>]       approve an image recipe; without a digest, the one of --config-dir (admin)
   secret-sync [--prune] NAME...   push these environment variables to the daemon's secret store, e.g.
@@ -144,8 +142,8 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		os.Exit(c.deployPlan(ctx, *tag))
 	case "deploys":
 		c.deploys(ctx, *asJSON)
-	case "edge-apply":
-		c.uploadAndWait(ctx, "/v1/edge/apply", *configDir, q)
+	case "edge-apply", "dns-sync":
+		fatalf("%s is retired: edge/Caddyfile and fleet.yml's dns_records are part of the plan; commit the change and push a deploy tag", action)
 	case "backup":
 		if *volume != "" {
 			q.Set("volume", *volume)
@@ -167,8 +165,6 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 			q.Set("force", "1")
 		}
 		c.uploadAndWait(ctx, "/v1/backups/restore", *configDir, q)
-	case "dns-sync":
-		c.uploadAndWait(ctx, "/v1/dns/sync", *configDir, q)
 	case "recipe-approve":
 		digest := flags.Arg(0)
 		if digest == "" {
