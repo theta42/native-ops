@@ -65,7 +65,8 @@ DNS provider); CI holds only scoped API tokens. See [docs/daemon.md](docs/daemon
 pipelines in [docs/ci-examples](docs/ci-examples).
 
 **Deploys, from CI or an AI agent.** Pushing a protected deploy tag is the approval; the daemon reads
-that commit from the git server and applies it as a job. The API previews a tag (`POST /v1/deploy/plan`),
+that commit from the git server and applies it as a job — including the commit's declarative DNS records
+(`fleet.yml` `dns_records`), scoped to the zones the daemon may change. The API previews a tag (`POST /v1/deploy/plan`),
 says what is live (`GET /v1/deploys`) and waits on jobs; the same operations are MCP tools at `/mcp`, so
 an agent (`claude mcp add --transport http native-ops https://<daemon>/mcp`) connects by having its
 person sign in, and can preview and run deploys with that person's role and no more. Every endpoint is in the

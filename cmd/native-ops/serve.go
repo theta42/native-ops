@@ -358,7 +358,11 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		if cfg.EnableBackup {
 			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup), restoreSource(cfg.Exec, cfg.Pool, lookup)
 		}
-		if cfg.EnableDNSSync {
+		// The DNS source is wired when either the standalone endpoint is asked for (--enable-dns-sync)
+		// or deploys are on: a deploy applies its commit's fleet.yml dns_records, so a record change
+		// lands with the deploy tag. Records are scoped to NATIVE_OPS_DNS_ZONES (synced from the git
+		// server's secrets), so a deploy tag cannot write an arbitrary zone.
+		if cfg.EnableDNSSync || cfg.EnableApply {
 			opts.DNSSync = dnsSyncSource(lookup, cfg.DNSDomains)
 		}
 		if cfg.GitURL != "" || cfg.DeployRepo != "" {

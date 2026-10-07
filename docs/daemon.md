@@ -37,7 +37,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `POST /v1/edge/apply` | deployer | apply the uploaded tree's `edge/Caddyfile` to the edge container (validated, rolled back if Caddy rejects it), as a job (only with `--enable-edge-apply`) |
 | `POST /v1/backups?volume=&prune=1` | deployer | back up one volume, or every volume `fleet.yml` allows, then optionally apply retention, as a job (only with `--enable-backup`) |
 | `POST /v1/backups/restore?volume=&from=&as=&force=1` | admin | restore a volume in place (keeping a copy of the current one) or as a new volume, as a job (only with `--enable-backup`) |
-| `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (only with `--enable-dns-sync`) |
+| `POST /v1/dns/sync` | deployer | create or update `fleet.yml`'s `dns_records`, as a job (with `--enable-dns-sync`; a deploy applies the commit's records without it) |
 | `POST /v1/deploy` | deployer | deploy the commit a protected deploy tag points at, read from the git server (`{"tag": ...}`), as a job (with `--enable-apply`, `--git-url` and `--deploy-repo`) |
 | `POST /v1/deploy/plan` | planner | what deploying a tag would change, read from the git server and planned against the host now, without a job and without changing anything (`{"tag": ...}`; with the same flags as deploys) |
 | `GET /v1/deploys?limit=` | viewer | what the host runs (`current`: the newest deploy that left it matching its tag), the deploy in progress, and the history, each with its tag, commit, result and plan counts |
@@ -239,7 +239,16 @@ ends with, and what to do when one fails.
 2. **downloads that commit's tree from the git server**: the caller sends only the tag name, so a CI job
    (or a leaked deployer token) cannot make the daemon apply anything but a tagged commit;
 3. plans it, refusing a blocked plan, and records the plan as approved by the tag and used by the job;
-4. applies it. A plan with nothing to change ends the job without applying.
+4. applies the commit's declarative DNS records (`fleet.yml` `dns_records`) through the built-in
+   provider, scoped to the zones the daemon may change (`NATIVE_OPS_DNS_ZONES`, or `--dns-domains`). A
+   fleet that declares none is a no-op; a failure stops the deploy before the services are touched, so a
+   record change lands with the tag and never needs a second command;
+5. applies the services. A plan with nothing to change still applies the DNS records, then ends.
+
+The DNS source is wired whenever deploys are on (`--enable-apply`), so a deploy tag converges
+`dns_records` even without `--enable-dns-sync`; that flag only adds the standalone `POST /v1/dns/sync`.
+Only the built-in provider is used from a deploy (never a script plugin from the commit), and only the
+zones the daemon was given — the provider's token reaches every zone in the account.
 
 If the commit's `fleet.yml` pins another daemon version (`daemon:`), the job upgrades the daemon to it
 first and the deploy resumes on the new binary (see [Upgrading the daemon](#upgrading-the-daemon-from-ci)).
@@ -742,7 +751,7 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--deploy-repo` | `NATIVE_OPS_DEPLOY_REPO` | none | the configuration repository there, as `owner/name` |
 | `--deploy-tags` | `NATIVE_OPS_DEPLOY_TAGS` | `deploy-*` | the tags that deploy; the repository must protect them |
 | `--enable-backup` | | off | `POST /v1/backups` and `/v1/backups/restore` |
-| `--enable-dns-sync` | | off | `POST /v1/dns/sync` |
+| `--enable-dns-sync` | | off | the standalone `POST /v1/dns/sync`; a deploy (`--enable-apply`) applies the commit's `dns_records` whether or not this is on |
 | `--edge-container` | `NATIVE_OPS_EDGE_CONTAINER` | `edge` | the container whose routes and certificates the status shows |
 | `--dns-provider` | `NATIVE_OPS_DNS_PROVIDER` | none | `digitalocean`: DNS records on the status page |
 | `--dns-domains` | `NATIVE_OPS_DNS_DOMAINS` | none | zones shown on the status page, and that a DNS sync may change |
