@@ -22,7 +22,7 @@ import (
 // /etc/native-ops/serve.env keeps working.
 //
 //	GET    /v1/secrets          admin: the names, who set each and when -- never a value
-//	PUT    /v1/secrets          admin: {"secrets": {NAME: value, ...}, "prune": bool}
+//	PUT    /v1/secrets          admin, or a secrets token for its SERVICE_* names: {"secrets": {NAME: value, ...}, "prune": bool}
 //	DELETE /v1/secrets/{name}   admin
 
 var secretNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
@@ -114,12 +114,21 @@ func (s *SecretStore) List() []SecretInfo {
 	return out
 }
 
-// Sync sets the given secrets (all or nothing), and with prune removes every other one. It reports which
-// names it changed and which it removed; a value that is already stored is not a change.
+// Sync sets the given secrets (all or nothing), and with prune removes every other one -- every other one
+// within, when within is set (a secrets token prunes only the names it may set). It reports which names it
+// changed and which it removed; a value that is already stored is not a change.
 func (s *SecretStore) Sync(set map[string]string, prune bool, by string) (changed, removed []string, err error) {
+	return s.SyncWithin(set, prune, by, nil)
+}
+
+// SyncWithin is Sync limited to the names within accepts (nil: every name).
+func (s *SecretStore) SyncWithin(set map[string]string, prune bool, by string, within func(string) bool) (changed, removed []string, err error) {
 	for k, v := range set {
 		if !secretNameRe.MatchString(k) {
 			return nil, nil, fmt.Errorf("%q is not a secret name (A-Z, 0-9 and _, starting with a letter)", k)
+		}
+		if within != nil && !within(k) {
+			return nil, nil, fmt.Errorf("this token may not set %s", k)
 		}
 		if v == "" || len(v) > maxSecretBytes || strings.ContainsRune(v, 0) {
 			return nil, nil, fmt.Errorf("the value of %s is empty, too long or has a NUL byte", k)
@@ -129,7 +138,7 @@ func (s *SecretStore) Sync(set map[string]string, prune bool, by string) (change
 	defer s.mu.Unlock()
 	next := make(map[string]secretEntry, len(s.vals)+len(set))
 	for k, e := range s.vals {
-		if prune {
+		if prune && (within == nil || within(k)) {
 			if _, keep := set[k]; !keep {
 				removed = append(removed, k)
 				continue
@@ -222,14 +231,35 @@ func (s *Server) handleSecretSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "send at least one secret")
 		return
 	}
-	by, _ := s.actorScope(r)
-	changed, removed, err := s.opts.Secrets.Sync(body.Secrets, body.Prune, by)
+	by, scope := s.actorScope(r)
+	// A secrets token sets, prunes and sees only the service secrets its scope names.
+	var within func(string) bool
+	if scope.SecretsOnly() {
+		within = scope.AllowsSecret
+		for k := range body.Secrets {
+			if !within(k) {
+				writeError(w, http.StatusForbidden, "forbidden", "this token may not set "+k)
+				return
+			}
+		}
+	}
+	changed, removed, err := s.opts.Secrets.SyncWithin(body.Secrets, body.Prune, by, within)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	auditDetail(r, "secrets synced: changed=%s removed=%s", strings.Join(changed, ","), strings.Join(removed, ","))
-	writeJSON(w, http.StatusOK, map[string]any{"changed": nonNil(changed), "removed": nonNil(removed), "secrets": s.opts.Secrets.List()})
+	list := s.opts.Secrets.List()
+	if within != nil {
+		mine := list[:0:0]
+		for _, info := range list {
+			if within(info.Name) {
+				mine = append(mine, info)
+			}
+		}
+		list = mine
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"changed": nonNil(changed), "removed": nonNil(removed), "secrets": list})
 }
 
 func (s *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {

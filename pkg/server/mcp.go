@@ -464,7 +464,7 @@ func (s *Server) serveMCP(w http.ResponseWriter, r *http.Request, inner http.Han
 
 // mcpAllows reports whether a tool is on, and usable by the caller.
 func (s *Server) mcpAllows(t mcpTool, h *actorHolder) bool {
-	return h != nil && t.enabled(&s.opts) && h.role.Allows(t.min) && (h.scope == nil || t.scoped)
+	return h != nil && !h.scope.SecretsOnly() && t.enabled(&s.opts) && h.role.Allows(t.min) && (h.scope == nil || t.scoped)
 }
 
 // mcpDo runs one request through the daemon's own handler, as the caller: the identity /mcp verified

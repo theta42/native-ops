@@ -322,15 +322,46 @@ func splitPort(value PortRef, defaultAddr string) (addr, port string, err error)
 // accepts): a service's `service:` override must be one.
 var serviceUnitRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 
+// SecretPrefix starts the name of every secret a service may read (env_from). The daemon's own
+// credentials (DNS token, backup keys, OIDC secret) never have it.
+const SecretPrefix = "SERVICE_"
+
+var (
+	envKeyRe        = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
+	serviceSecretRe = regexp.MustCompile(`^SERVICE_[A-Z0-9_]{1,56}$`)
+)
+
+// ValidateEnvFrom checks a service's env_from: environment keys in [A-Z_][A-Z0-9_]*, secret names that
+// start with SecretPrefix (and fit the secret store's names), and no key that env also sets.
+func ValidateEnvFrom(svc *ServiceConfig) error {
+	for key, name := range svc.EnvFrom {
+		if !envKeyRe.MatchString(key) {
+			return fmt.Errorf("env_from: %q is not an environment key (A-Z, 0-9 and _)", key)
+		}
+		if !serviceSecretRe.MatchString(name) {
+			return fmt.Errorf("env_from: %s names %q; a service's secrets are named %s<A-Z, 0-9, _> (at most 64 characters)", key, name, SecretPrefix)
+		}
+		if _, dup := svc.Env[key]; dup {
+			return fmt.Errorf("env_from: %s is also set in env; set it in one place", key)
+		}
+	}
+	return nil
+}
+
 // ServiceConfig defines a static infrastructure service (e.g. gitea, plane, edge).
 type ServiceConfig struct {
-	Name        string            `yaml:"name"`
-	Image       string            `yaml:"image"`               // local alias or OCI image
-	BuildDir    string            `yaml:"build_dir,omitempty"` // path relative to config repo
-	Profiles    []string          `yaml:"profiles"`            // e.g. ["base", "service"]
-	Volumes     []VolumeMount     `yaml:"volumes"`
-	Env         map[string]string `yaml:"env,omitempty"`
-	EnvFile     string            `yaml:"env_file,omitempty"`
+	Name     string            `yaml:"name"`
+	Image    string            `yaml:"image"`               // local alias or OCI image
+	BuildDir string            `yaml:"build_dir,omitempty"` // path relative to config repo
+	Profiles []string          `yaml:"profiles"`            // e.g. ["base", "service"]
+	Volumes  []VolumeMount     `yaml:"volumes"`
+	Env      map[string]string `yaml:"env,omitempty"`
+	EnvFile  string            `yaml:"env_file,omitempty"`
+	// EnvFrom sets environment keys from the daemon's secret store instead of from git:
+	// {ENV_KEY: SERVICE_SECRET_NAME}. The value is written to /etc/default/<service> like env, but the
+	// manifest only names the secret. Only names starting with SecretPrefix are allowed, so a manifest can
+	// never route the daemon's own credentials into a container. See ValidateEnvFrom.
+	EnvFrom     map[string]string `yaml:"env_from,omitempty"`
 	Service     string            `yaml:"service,omitempty"` // systemd unit + /etc/default/<service> when it differs from the instance name
 	Limits      map[string]string `yaml:"limits,omitempty"`  // e.g. limits.cpu: 2
 	HealthCheck HealthCheckConfig `yaml:"healthcheck,omitempty"`
@@ -442,6 +473,9 @@ func LoadServiceConfig(path string) (*ServiceConfig, error) {
 		return nil, fmt.Errorf("service config %s: service %q is not a valid unit name", path, svc.Service)
 	}
 	if err := labels.Validate(svc.Labels); err != nil {
+		return nil, fmt.Errorf("service config %s: %w", path, err)
+	}
+	if err := ValidateEnvFrom(&svc); err != nil {
 		return nil, fmt.Errorf("service config %s: %w", path, err)
 	}
 

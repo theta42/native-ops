@@ -31,6 +31,20 @@ type Deployer struct {
 	// plan does not print (environment values, hook bodies, health checks), so that the hash of a
 	// plan covers what apply would really do. See WithBindKey.
 	bind func(data []byte) string
+	// secrets resolves a service's env_from names. The daemon gives it its secret store (and nothing
+	// else); on a host run without a daemon it is the process environment.
+	secrets SecretLookup
+}
+
+// SecretLookup reads a secret by name; ok is false when it is not set.
+type SecretLookup func(name string) (value string, ok bool)
+
+// SetSecrets makes env_from read from lookup (the daemon's secret store) instead of the process
+// environment.
+func (d *Deployer) SetSecrets(lookup SecretLookup) {
+	if lookup != nil {
+		d.secrets = lookup
+	}
 }
 
 func NewDeployer(exec remote.Executor) *Deployer {
@@ -42,6 +56,7 @@ func NewDeployer(exec remote.Executor) *Deployer {
 		inst:       NewInstanceManager(exec),
 		healthGate: ic.HealthGate,
 		logf:       log.Printf,
+		secrets:    os.LookupEnv,
 	}
 }
 
@@ -104,6 +119,51 @@ func serviceEnv(svc *config.ServiceConfig, configDir string) map[string]string {
 		env[k] = v
 	}
 	return env
+}
+
+// MissingSecretsError says which env_from secrets are not set, by name (never a value).
+type MissingSecretsError struct {
+	Service string
+	Names   []string
+}
+
+func (e *MissingSecretsError) Error() string {
+	return fmt.Sprintf("%s: env_from needs secret(s) %s, which are not set; add them to the git server's secret store and sync them (`native-ops remote secret-sync`)",
+		e.Service, strings.Join(e.Names, ", "))
+}
+
+// declaredEnv is everything a service declares for /etc/default/<service>: env_file, env, then env_from
+// resolved through d.secrets. A secret that is not set is an error (*MissingSecretsError), never an empty
+// value or a key silently left out.
+func (d *Deployer) declaredEnv(svc *config.ServiceConfig, configDir string) (map[string]string, error) {
+	env := serviceEnv(svc, configDir)
+	var missing []string
+	for _, key := range sortedKeys(svc.EnvFrom) {
+		name := svc.EnvFrom[key]
+		v, ok := d.secrets(name)
+		if !ok || v == "" {
+			missing = append(missing, name)
+			continue
+		}
+		env[key] = v
+	}
+	if len(missing) > 0 {
+		return env, &MissingSecretsError{Service: svc.Name, Names: missing}
+	}
+	return env, nil
+}
+
+// envKeyLabels names keys for a plan, saying which secret an env_from key comes from (its name only).
+func envKeyLabels(svc *config.ServiceConfig, keys []string) []string {
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		if name, ok := svc.EnvFrom[k]; ok {
+			out[i] = fmt.Sprintf("%s (from secret %s)", k, name)
+		} else {
+			out[i] = k
+		}
+	}
+	return out
 }
 
 // envState is how the live /etc/default/<service> compares with the declared environment.
@@ -330,7 +390,11 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		}
 	}
 
-	if changed, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), serviceEnv(svc, configDir)); err != nil {
+	freshEnv, err := d.declaredEnv(svc, configDir)
+	if err != nil {
+		return err
+	}
+	if changed, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), freshEnv); err != nil {
 		return fmt.Errorf("write env file: %w", err)
 	} else if changed {
 		d.log("    Wrote /etc/default/%s\n", svc.Unit())
@@ -485,7 +549,10 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 		replace = true
 	}
 
-	declaredEnv := serviceEnv(svc, configDir)
+	declaredEnv, err := d.declaredEnv(svc, configDir)
+	if err != nil {
+		return err
+	}
 	changed := false
 
 	if replace {

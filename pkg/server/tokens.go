@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/engine"
 )
 
@@ -66,16 +67,56 @@ type Scope struct {
 	// {"environment": ["staging","testing"]}: it cannot see, create or change an instance with another
 	// value, or with none, so a non-production token cannot reach production whatever it is asked to do.
 	Labels map[string][]string `json:"labels,omitempty"`
+	// Secrets makes a secrets token: it may set (PUT /v1/secrets) only service secrets whose names match
+	// these globs, all of which start with SERVICE_ (the names a manifest's env_from may read), and do
+	// nothing else -- not read a value, not list the daemon's own credentials, not plan, apply or touch an
+	// instance. It is what a CI job that syncs a service's secrets holds instead of an admin token. A
+	// secret it sets reaches a service only through a plan, whose hash binds the value.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // Any reports whether the scope limits anything.
-func (s Scope) Any() bool { return len(s.Names)+len(s.Images)+len(s.Domains)+len(s.Labels) > 0 }
+func (s Scope) Any() bool {
+	return len(s.Names)+len(s.Images)+len(s.Domains)+len(s.Labels)+len(s.Secrets) > 0
+}
+
+// SecretsOnly reports whether this is a secrets token (see Scope.Secrets).
+func (s *Scope) SecretsOnly() bool { return s != nil && len(s.Secrets) > 0 }
+
+// AllowsSecret reports whether a secrets token may set the secret name.
+func (s *Scope) AllowsSecret(name string) bool {
+	if !s.SecretsOnly() || !strings.HasPrefix(name, config.SecretPrefix) {
+		return false
+	}
+	for _, p := range s.Secrets {
+		if ok, _ := path.Match(p, name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+var secretPatternRe = regexp.MustCompile(`^SERVICE_[A-Z0-9_*?]{1,56}$`)
 
 var patternRe = regexp.MustCompile(`^[A-Za-z0-9*?._:/@-]{1,100}$`)
 
 // Validate checks that the patterns are usable and that a scope names what it allows.
 func (s Scope) Validate() error {
 	if !s.Any() {
+		return nil
+	}
+	if len(s.Secrets) > 0 {
+		if len(s.Names)+len(s.Images)+len(s.Domains)+len(s.Labels) > 0 {
+			return errors.New("a secrets token can only set secrets: give it no instance, image, domain or label patterns")
+		}
+		for _, p := range s.Secrets {
+			if !secretPatternRe.MatchString(p) {
+				return fmt.Errorf("secret pattern %q must start with SERVICE_ (A-Z, 0-9, _, * and ?)", p)
+			}
+			if _, err := path.Match(p, ""); err != nil {
+				return fmt.Errorf("secret pattern %q is not valid: %v", p, err)
+			}
+		}
 		return nil
 	}
 	if len(s.Names) == 0 || len(s.Images) == 0 {

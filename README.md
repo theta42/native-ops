@@ -321,6 +321,13 @@ volumes:
 limits:
   limits.cpu: 2
   limits.memory: 2GB
+# Written to /etc/default/<service>. env values are in git; env_from values come from the daemon's
+# secret store (synced from the git server's secret store; names must start with SERVICE_), and plans
+# show only which secret fills a key. See docs/daemon.md, "Service secrets".
+env:
+  GITEA__server__ROOT_URL: https://git.example.com
+env_from:
+  GITEA__mailer__PASSWD: SERVICE_GITEA_SMTP_PASSWORD
 # What the service is for. `environment` is one of production, staging, testing, development, demo
 # (anything else is refused when the manifest is loaded); other labels are free-form. Declared, the set is
 # exact; a change is a `set-labels` plan item applied live (no restart); absent, the instance's labels are

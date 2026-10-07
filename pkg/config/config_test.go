@@ -315,3 +315,34 @@ func TestAServiceManifestCarriesItsLabelsAndRefusesABadOne(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvFromNamesOnlyServiceSecretsAndValidKeys(t *testing.T) {
+	tmp := t.TempDir()
+	load := func(body string) (*ServiceConfig, error) {
+		f := filepath.Join(tmp, "svc.yml")
+		if err := os.WriteFile(f, []byte("name: crew\nimage: x\n"+body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return LoadServiceConfig(f)
+	}
+
+	svc, err := load("env_from:\n  GOOGLE_KEY: SERVICE_CREW_GOOGLE_KEY\n")
+	if err != nil || svc.EnvFrom["GOOGLE_KEY"] != "SERVICE_CREW_GOOGLE_KEY" {
+		t.Fatalf("a valid env_from: err=%v env_from=%v", err, svc.EnvFrom)
+	}
+
+	for body, want := range map[string]string{
+		// The daemon's own credentials cannot be routed into a service.
+		"env_from:\n  TOKEN: DO_API_TOKEN\n":                          "SERVICE_",
+		"env_from:\n  KEY: BACKUP_S3_SECRET_KEY\n":                    "SERVICE_",
+		"env_from:\n  KEY: SERVICE_\n":                                "SERVICE_",
+		"env_from:\n  KEY: service_lower\n":                           "SERVICE_",
+		"env_from:\n  bad-key: SERVICE_X\n":                           "not an environment key",
+		"env: {KEY: plain}\nenv_from:\n  KEY: SERVICE_X\n":            "also set in env",
+		"env_from:\n  KEY: SERVICE_" + strings.Repeat("A", 57) + "\n": "SERVICE_",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: want an error mentioning %q, got %v", body, want, err)
+		}
+	}
+}

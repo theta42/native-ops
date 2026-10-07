@@ -424,6 +424,7 @@ Tokens are managed over the API by an admin, so nobody needs a shell on the host
 export NATIVE_OPS_TOKEN=$BOOTSTRAP_TOKEN    # or any admin token
 native-ops remote token-create --name ci-plan --role planner          # prints the secret, once
 native-ops remote token-create --name ci-release --role deployer --names 'app-*' --images 'acme-app:*'
+native-ops remote token-create --name ci-secrets --role deployer --secrets 'SERVICE_APP_*'   # may only sync those secrets
 curl -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens"     # list
 curl -X DELETE -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens/<id>"
 ```
@@ -524,6 +525,58 @@ needs:
 - **Backup keys:** keys limited to the one backup bucket (per-bucket access keys), so a leaked pair
   cannot read or delete other backups.
 - **OIDC client secret:** only usable with the redirect URL registered at the identity provider.
+
+
+## Service secrets (`env_from`)
+
+A service's own secrets (an API token, a cloud service-account key) reach its `/etc/default/<service>` the
+same way, so they are never in git and nobody puts them on the host:
+
+```yaml
+# services/crew/service.yml
+env:
+  GITEA_URL: "https://git.example.com"
+env_from:
+  GOOGLE_SERVICE_ACCOUNT_KEY: SERVICE_CREW_GOOGLE_KEY   # ENV_KEY: secret name
+```
+
+CI syncs them with a **secrets token**, not an admin token: one that may only set the `SERVICE_*` names its
+scope matches.
+
+```bash
+native-ops remote token-create --name ci-crew-secrets --role deployer --secrets 'SERVICE_CREW_*'   # admin, once
+```
+
+```yaml
+# the workflow that syncs secrets maps the git server's secret onto the store's name
+- env:
+    NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_SECRETS_TOKEN }}
+    SERVICE_CREW_GOOGLE_KEY: ${{ secrets.CREW_GOOGLE_SERVICE_ACCOUNT_KEY }}
+  run: native-ops remote secret-sync --prune SERVICE_CREW_GOOGLE_KEY
+```
+
+- A secrets token can call `PUT /v1/secrets` and nothing else: it cannot read a value, list the daemon's
+  own credentials, delete, plan, apply, touch an instance, create tokens, call `whoami` or use MCP. Its
+  answer lists only the names it may set, and its `--prune` removes only names within its scope. A plain
+  deployer cannot sync at all; an admin can still sync anything.
+- So a git server that shows a repository's secrets to every branch hands out, at worst, the power to change
+  that service's secrets, and a changed secret reaches the service only through a plan whose hash binds
+  the value.
+
+- **Only `SERVICE_*` names.** A manifest can name only secrets that start with `SERVICE_`, and the daemon
+  reads them from its store alone (never its own environment), so no manifest can route the daemon's
+  credentials (`DO_API_TOKEN`, the backup keys, the OIDC secret) into a container.
+- **The plan names the source, never the value:** `add GOOGLE_SERVICE_ACCOUNT_KEY (from secret
+  SERVICE_CREW_GOOGLE_KEY)`. The value is bound into the plan's keyed hash, so rotating a secret changes
+  the plan and needs a fresh approval, and an approval of one value cannot apply another.
+- **A secret that is not set blocks the service's plan** (and apply stops before touching the service)
+  instead of writing an empty value or leaving the key out.
+- A key is set by `env` or `env_from`, not both. `env_from` wins over the same key in an `env_file`.
+- Values must fit one line of an environment file: encode a multi-line value (a JSON key, a PEM) as
+  base64 and decode it in the service.
+- Without a daemon (`native-ops apply` on the host), `env_from` reads the process environment.
+- If one workflow syncs with `--prune`, it must name every secret, the daemon's and the services': a
+  prune removes whatever it is not given.
 
 ## UI sign-in: local users and OIDC
 

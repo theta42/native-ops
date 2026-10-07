@@ -319,7 +319,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) {
 			return status.CollectFull(ctx, cfg.Exec, status.Options{Pool: cfg.Pool, EdgeContainer: cfg.EdgeContainer, DNS: cfg.DNS, DNSDomains: cfg.DNSDomains})
 		},
-		Plan:    planSource(cfg.Exec, key),
+		Plan:    planSource(cfg.Exec, key, secrets.Get),
 		Secrets: secrets,
 	}
 	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableEdgeApply || cfg.EnableBackup || cfg.EnableDNSSync || cfg.SelfUpgradeDir != "" {
@@ -330,7 +330,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		opts.Jobs = jobs
 		if cfg.EnableApply {
-			opts.Apply = applySource(cfg.Exec)
+			opts.Apply = applySource(cfg.Exec, secrets.Get)
 		}
 		if cfg.EnableInstances {
 			opts.Instances, opts.InstancePolicy = engine.NewInstances(cfg.Exec), cfg.InstancePolicy
@@ -485,19 +485,21 @@ func splitList(s string) []string {
 
 // planSource is what POST /v1/plan plans with. engine.PlanFleet wraps exec in remote.ReadOnly, so
 // an uploaded tree can be planned against this host but never applied to it. The key makes the
-// plan's hash cover the environment values and hook bodies the plan itself does not print.
-func planSource(exec remote.Executor, key []byte) server.PlanFunc {
+// plan's hash cover the environment values and hook bodies the plan itself does not print. A service's
+// env_from reads secrets (the store only: never the daemon's own environment).
+func planSource(exec remote.Executor, key []byte, secrets engine.SecretLookup) server.PlanFunc {
 	return func(ctx context.Context, dir, service string) (*engine.FleetPlan, error) {
-		return engine.PlanFleet(ctx, exec, dir, service, engine.WithBindKey(key))
+		return engine.PlanFleet(ctx, exec, dir, service, engine.WithBindKey(key), engine.WithSecrets(secrets))
 	}
 }
 
 // applySource is what POST /v1/apply applies with, once the server has checked the plan's hash.
 // Progress goes to the job's own log, not the process log.
-func applySource(exec remote.Executor) server.ApplyFunc {
+func applySource(exec remote.Executor, secrets engine.SecretLookup) server.ApplyFunc {
 	return func(ctx context.Context, dir string, plan *engine.FleetPlan, logf func(format string, a ...any)) error {
 		d := engine.NewDeployer(exec)
 		d.SetLogger(logf)
+		d.SetSecrets(secrets)
 		return d.ApplyPlan(ctx, dir, plan)
 	}
 }
