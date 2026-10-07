@@ -100,6 +100,55 @@ func TestADeployWithNothingToChangeAppliesNothing(t *testing.T) {
 	}
 }
 
+// A deploy applies its commit's fleet.yml dns_records, so a record change lands with the deploy tag
+// (docs/daemon.md, "Service secrets" and "DNS as part of a deploy").
+func TestADeploySyncsTheCommitsDNSRecords(t *testing.T) {
+	tree := tgz(t, entry{name: "fleet.yml", body: "name: x\ndns_records:\n  - zone: example.com\n    type: A\n    name: inbound\n    value: 1.2.3.4\n"})
+	src := &fakeSource{protected: true, tree: tree}
+	var roots []string
+	rig := newApplyRigWith(t, func(o *Options) {
+		o.Deploy, o.DeployTags = src, "deploy-*"
+		o.DNSSync = func(_ context.Context, root string, logf func(string, ...any)) error {
+			b, err := os.ReadFile(filepath.Join(root, "fleet.yml"))
+			if err != nil {
+				return err
+			}
+			roots = append(roots, string(b))
+			logf("synced dns_records")
+			return nil
+		}
+	})
+	_, body := rig.post(t, "/v1/deploy", rig.deployerToken, "application/json", []byte(`{"tag":"deploy-1"}`))
+	j := rig.waitJob(t, jobID(t, body), JobSucceeded)
+	if len(roots) != 1 {
+		t.Fatalf("the deploy must sync the commit's dns_records once, got %d: %+v", len(roots), j)
+	}
+	if !strings.Contains(roots[0], "dns_records") {
+		t.Fatalf("dns sync got the deployed commit's root, got %q", roots[0])
+	}
+	if !strings.Contains(j.Log, "dns_records") {
+		t.Fatalf("the deploy log must name the dns sync: %s", j.Log)
+	}
+}
+
+// A record the daemon may not write (a zone outside NATIVE_OPS_DNS_ZONES) fails the deploy, and it
+// fails before the services are applied: the record change is part of the deploy, not a side effect.
+func TestADeployFailsWhenDNSCannotBeApplied(t *testing.T) {
+	tree := tgz(t, entry{name: "fleet.yml", body: "name: x\ndns_records:\n  - zone: example.com\n    type: A\n    name: inbound\n    value: 1.2.3.4\n"})
+	src := &fakeSource{protected: true, tree: tree}
+	rig := newApplyRigWith(t, func(o *Options) {
+		o.Deploy, o.DeployTags = src, "deploy-*"
+		o.DNSSync = func(context.Context, string, func(string, ...any)) error {
+			return errors.New("dns_records name the zone example.com, which this daemon may not change")
+		}
+	})
+	_, body := rig.post(t, "/v1/deploy", rig.deployerToken, "application/json", []byte(`{"tag":"deploy-1"}`))
+	j := rig.waitJob(t, jobID(t, body), JobFailed)
+	if !strings.Contains(j.Error, "dns sync") || rig.applies.Load() != 0 {
+		t.Fatalf("a DNS failure must fail the deploy before the services are applied: %+v", j)
+	}
+}
+
 func TestAPlanMadeBeforeTheHostChangedIsStaleAndCannotBeApproved(t *testing.T) {
 	rig := newApplyRig(t)
 	rig.autoApprove = false
