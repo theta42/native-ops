@@ -620,16 +620,20 @@ func dnsSyncSource(lookup func(string) string, flagZones []string) server.DNSSyn
 		default:
 			return fmt.Errorf("dns_provider %q: the daemon syncs DNS only through a built-in provider (digitalocean); run `native-ops dns sync` for a script plugin", fleet.DNSProvider)
 		}
-		// An upload may only touch the zones the daemon was given (--dns-domains, or the synced secret
-		// NATIVE_OPS_DNS_ZONES): the provider's token reaches every zone in the account.
+		// The zones a change touches are the zones its own dns_records name: the intent is in the
+		// manifest (a protected deploy tag, or an upload), not in a separate allowlist. An operator
+		// who wants a hard limit can still set --dns-domains / NATIVE_OPS_DNS_ZONES; when given, a
+		// record outside it is refused (the provider's token reaches every zone in the account).
 		allowed := append(append([]string{}, flagZones...), splitList(lookup("NATIVE_OPS_DNS_ZONES"))...)
 		byZone, err := fleet.DNSRecordsByZone()
 		if err != nil {
 			return err
 		}
-		for zone := range byZone {
-			if !containsFold(allowed, zone) {
-				return fmt.Errorf("dns_records name the zone %s, which this daemon may not change: set NATIVE_OPS_DNS_ZONES (synced from the git server's secrets) to the zones it may sync", zone)
+		if len(allowed) > 0 {
+			for zone := range byZone {
+				if !containsFold(allowed, zone) {
+					return fmt.Errorf("dns_records name the zone %s, outside the zones this daemon was limited to (%v)", zone, allowed)
+				}
 			}
 		}
 		token := lookup("DO_API_TOKEN")

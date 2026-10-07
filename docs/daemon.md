@@ -240,15 +240,16 @@ ends with, and what to do when one fails.
    (or a leaked deployer token) cannot make the daemon apply anything but a tagged commit;
 3. plans it, refusing a blocked plan, and records the plan as approved by the tag and used by the job;
 4. applies the commit's declarative DNS records (`fleet.yml` `dns_records`) through the built-in
-   provider, scoped to the zones the daemon may change (`NATIVE_OPS_DNS_ZONES`, or `--dns-domains`). A
-   fleet that declares none is a no-op; a failure stops the deploy before the services are touched, so a
-   record change lands with the tag and never needs a second command;
+   provider, in the zones those records name — the intent of the change. A fleet that declares none is a
+   no-op; a failure stops the deploy before the services are touched, so a record change lands with the
+   tag and never needs a second command;
 5. applies the services. A plan with nothing to change still applies the DNS records, then ends.
 
 The DNS source is wired whenever deploys are on (`--enable-apply`), so a deploy tag converges
 `dns_records` even without `--enable-dns-sync`; that flag only adds the standalone `POST /v1/dns/sync`.
-Only the built-in provider is used from a deploy (never a script plugin from the commit), and only the
-zones the daemon was given — the provider's token reaches every zone in the account.
+Only the built-in provider is used from a deploy (never a script plugin from the commit). A daemon may
+still be *limited* to certain zones with `--dns-domains`/`NATIVE_OPS_DNS_ZONES`; when that is set, a
+record outside it is refused. Without a limit, the zones are exactly the ones the commit declares.
 
 If the commit's `fleet.yml` pins another daemon version (`daemon:`), the job upgrades the daemon to it
 first and the deploy resumes on the new binary (see [Upgrading the daemon](#upgrading-the-daemon-from-ci)).
@@ -754,7 +755,7 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--enable-dns-sync` | | off | the standalone `POST /v1/dns/sync`; a deploy (`--enable-apply`) applies the commit's `dns_records` whether or not this is on |
 | `--edge-container` | `NATIVE_OPS_EDGE_CONTAINER` | `edge` | the container whose routes and certificates the status shows |
 | `--dns-provider` | `NATIVE_OPS_DNS_PROVIDER` | none | `digitalocean`: DNS records on the status page |
-| `--dns-domains` | `NATIVE_OPS_DNS_DOMAINS` | none | zones shown on the status page, and that a DNS sync may change |
+| `--dns-domains` | `NATIVE_OPS_DNS_DOMAINS` | none | zones shown on the status page; set, an optional limit on the zones a DNS sync may change (otherwise the records' own zones are used) |
 | `--enable-auth` | `NATIVE_OPS_ENABLE_AUTH=1` | off | local sign-in for the UI |
 | `--oidc-issuer` | `NATIVE_OPS_OIDC_ISSUER` | none | turns on OIDC sign-in |
 | `--oidc-client-id` | `NATIVE_OPS_OIDC_CLIENT_ID` | | |

@@ -131,9 +131,9 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 
 		// The commit's declarative DNS records are part of what the deploy applies, so a record
 		// change lands with the deploy tag and never needs a second command. A fleet that declares
-		// none is a no-op; a failure stops the deploy before the services are touched. The records
-		// are scoped to the zones the daemon may change (NATIVE_OPS_DNS_ZONES), so a deploy tag
-		// cannot write an arbitrary zone.
+		// none is a no-op; a failure stops the deploy before the services are touched. The zones are
+		// the ones the commit's own dns_records name (the intent of the change); a daemon limited
+		// with --dns-domains refuses a record outside that.
 		if s.opts.DNSSync != nil {
 			logf("syncing fleet.yml dns_records")
 			if err := s.opts.DNSSync(ctx, root, logf); err != nil {

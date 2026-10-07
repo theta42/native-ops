@@ -147,10 +147,17 @@ func TestDaemonBackupsGoOnlyToThePinnedDestination(t *testing.T) {
 func TestDaemonDNSSyncTouchesOnlyAllowedZonesAndNeedsAToken(t *testing.T) {
 	dir := writeFleet(t, "name: f\ndns_provider: digitalocean\ndns_records:\n  - zone: victim.example\n    type: A\n    name: www\n    value: 203.0.113.66\n")
 	logf := func(string, ...any) {}
+	// A limit, when given, is enforced: a record outside it is refused.
 	err := dnsSyncSource(lookupOf(map[string]string{"DO_API_TOKEN": "t"}), []string{"example.com"})(context.Background(), dir, logf)
-	if err == nil || !strings.Contains(err.Error(), "may not change") {
-		t.Fatalf("a zone the daemon was not given must be refused: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "outside the zones this daemon was limited to") {
+		t.Fatalf("a zone outside the daemon's limit must be refused: %v", err)
 	}
+	// Without a limit, the zone is the one the change itself declares -- the intent, not a list to
+	// pre-declare. So it passes the zone check and fails only for the missing token.
+	if err := dnsSyncSource(lookupOf(map[string]string{}), nil)(context.Background(), dir, logf); err == nil || !strings.Contains(err.Error(), "DO_API_TOKEN is not set") {
+		t.Fatalf("without a limit the declared zone is the intent; only the token should be missing: %v", err)
+	}
+	// A limit from the synced secret is enforced the same way, and a zone inside it proceeds.
 	err = dnsSyncSource(lookupOf(map[string]string{"NATIVE_OPS_DNS_ZONES": "example.com, victim.example"}), nil)(context.Background(), dir, logf)
 	if err == nil || !strings.Contains(err.Error(), "DO_API_TOKEN is not set") {
 		t.Fatalf("an allowed zone without a token must say what to sync: %v", err)
