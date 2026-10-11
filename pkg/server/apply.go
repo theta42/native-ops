@@ -239,6 +239,7 @@ func (s *Server) launch(t *ticket, spec jobSpec) (Job, error) {
 			s.queue.release()
 		}
 		s.opts.Jobs.Finish(job.ID, err)
+		s.events.publish("plans") // a plan made before this job is stale now
 		outcome, code := "succeeded", http.StatusOK
 		if err != nil {
 			outcome, code = "failed", http.StatusInternalServerError

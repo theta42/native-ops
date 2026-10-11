@@ -29,6 +29,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `GET /auth/oidc`, `GET /auth/oidc/callback` | none | the OIDC sign-in redirect and its callback (with the `--oidc-*` flags) |
 | `GET /v1/whoami` | any token | which token and role you are |
 | `GET /v1/status` | viewer | instances, data volumes, images, host metrics (load, memory, swap, pool disk, uptime) and warnings -- plus, when configured, the edge's routes and certificates and the DNS records in the configured zones |
+| `GET /v1/events` | viewer, unscoped | a WebSocket that says when something changed (jobs, a job, plans, recipes, tokens) and pushes the host status when it changes; the UI follows it instead of polling ([Live updates](#live-updates)) |
 | `POST /v1/plan` | planner | what `apply` would change for the configuration you upload (never changes the host) |
 | `GET /v1/plans`, `GET /v1/plans/{hash}` | viewer | the plans that were made, and where each stands (pending, approved, used, expired, blocked) |
 | `POST /v1/plans/{hash}/approve`, `DELETE /v1/plans/{hash}/approval` | admin | approve one apply of exactly this plan, or take the approval back |
@@ -234,6 +235,27 @@ branch. Because a Git host that shows secrets to every branch cannot keep a depl
 pull request, the approval is what stops that token from changing the host on its own: the most a
 stolen or misused deployer token can do is apply a plan an admin already looked at and approved,
 once, within the hour.
+
+## Live updates
+
+The UI does not poll. It opens `GET /v1/events`, a WebSocket on which the daemon says what changed, and a
+page whose data changed reads it again from its ordinary endpoint and patches itself in place: what you
+are typing, a scrolled job log and a text selection survive the update. While the stream is down the
+footer says "reconnecting" and the page reloads every 30 seconds until it is back.
+
+- **What it says.** `{"type":"change","topics":[...]}`, at most every 300 ms, naming the topics that changed:
+  `jobs`, `job:<id>` (each log line too), `plans`, `recipes`, `tokens` (tokens, the daemon's secrets and
+  agent sign-ins) and `status`. A note never carries data a page would not be allowed to read, except the
+  host status (which any viewer reads): while someone is connected the daemon reads it every 10 seconds and
+  sends it only when it changed (its time aside).
+- **Who may connect.** A viewer or above, with a session cookie (only from the daemon's own pages: the
+  `Origin` must be this origin, because browsers apply no CORS to WebSockets), an `Authorization` header,
+  or a pasted token sent as the first message (`{"token":"nops_..."}`; it never goes in a URL). Tokens
+  scoped to instances or secrets are refused. The caller is checked again every 30 seconds, so a revoked
+  token or a disabled user is disconnected (close code 4001).
+- **Limits.** 64 connections, 16 more waiting to send a token (10 seconds each), 16 KiB per message from the
+  browser. A stopping daemon closes them (1001), and the page reconnects with backoff.
+- **Behind a proxy**, the proxy must pass WebSocket upgrades; Caddy's `reverse_proxy` (the edge) does.
 
 ## Deploying on a tag
 

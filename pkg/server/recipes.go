@@ -40,10 +40,11 @@ type RecipeRecord struct {
 
 // RecipeStore keeps recipe records in one 0600 JSON file.
 type RecipeStore struct {
-	mu   sync.Mutex
-	path string
-	recs map[string]*RecipeRecord
-	now  func() time.Time
+	changeHook // tells the UI it changed (events.go)
+	mu         sync.Mutex
+	path       string
+	recs       map[string]*RecipeRecord
+	now        func() time.Time
 }
 
 const keepRecipes = 200
@@ -109,7 +110,11 @@ func (s *RecipeStore) save() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path)
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
+		return err
+	}
+	s.changed("")
+	return nil
 }
 
 func (s *RecipeStore) listLocked() []RecipeRecord {

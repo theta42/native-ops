@@ -247,11 +247,12 @@ func ValidSecretFormat(s string) bool {
 // daemon without a restart. A bootstrap token (from the environment, provisioned
 // by IaC/CI) is held in memory only.
 type TokenStore struct {
-	path      string
-	mu        sync.Mutex
-	tokens    []Token
-	loaded    os.FileInfo // the file as last read; a change is a different file, mtime or size
-	bootstrap *Token
+	changeHook // tells the UI it changed (events.go)
+	path       string
+	mu         sync.Mutex
+	tokens     []Token
+	loaded     os.FileInfo // the file as last read; a change is a different file, mtime or size
+	bootstrap  *Token
 }
 
 func OpenTokenStore(path string) (*TokenStore, error) {
@@ -343,6 +344,7 @@ func (s *TokenStore) save() error {
 	if fi, err := os.Stat(s.path); err == nil {
 		s.loaded = fi
 	}
+	s.changed("")
 	return nil
 }
 

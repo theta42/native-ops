@@ -85,11 +85,12 @@ const keepPlans = 200
 
 // Plans is the store of plan records: in memory, and one JSON file per plan hash in a 0700 directory.
 type Plans struct {
-	mu   sync.Mutex
-	dir  string
-	ttl  time.Duration
-	now  func() time.Time
-	byID map[string]*PlanRecord
+	changeHook // tells the UI it changed (events.go)
+	mu         sync.Mutex
+	dir        string
+	ttl        time.Duration
+	now        func() time.Time
+	byID       map[string]*PlanRecord
 }
 
 // OpenPlans loads the records in dir (creating it). ttl is how long an approval lasts.
@@ -139,7 +140,11 @@ func (p *Plans) persist(rec *PlanRecord) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(p.dir, rec.Hash+".json"))
+	if err := os.Rename(tmp, filepath.Join(p.dir, rec.Hash+".json")); err != nil {
+		return err
+	}
+	p.changed(rec.Hash)
+	return nil
 }
 
 // prune keeps the newest keepPlans records. One that is approved and still usable is never dropped.

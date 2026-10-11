@@ -77,9 +77,10 @@ type oauthCode struct {
 // OAuthStore keeps clients and grants in a 0600 JSON file, and authorization codes in memory (they live
 // a minute; a restart only means signing in again).
 type OAuthStore struct {
-	path string
-	key  []byte
-	now  func() time.Time
+	changeHook // tells the UI it changed (events.go)
+	path       string
+	key        []byte
+	now        func() time.Time
 
 	mu      sync.Mutex
 	clients []OAuthClient
@@ -136,7 +137,11 @@ func (s *OAuthStore) save() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path)
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
+		return err
+	}
+	s.changed("")
+	return nil
 }
 
 // validRedirectURI accepts what a native or web client needs and nothing that could hand a code to

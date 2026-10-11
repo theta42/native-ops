@@ -108,7 +108,10 @@ type Server struct {
 	planSlots chan struct{}
 	logins    *loginThrottle
 	queue     hostQueue // one change at a time on this host, in the order they were asked for
-	jobsWG    sync.WaitGroup
+	events    *eventHub // change notes for the UI (GET /v1/events)
+	// eventPending bounds the event connections still waiting for a token.
+	eventPending chan struct{}
+	jobsWG       sync.WaitGroup
 }
 
 func New(opts Options) (*Server, error) {
@@ -150,7 +153,34 @@ func New(opts Options) (*Server, error) {
 	if opts.StatusTTL <= 0 {
 		opts.StatusTTL = 5 * time.Second
 	}
-	return &Server{opts: opts, planSlots: make(chan struct{}, maxConcurrentPlans), logins: newLoginThrottle()}, nil
+	s := &Server{opts: opts, planSlots: make(chan struct{}, maxConcurrentPlans), logins: newLoginThrottle(),
+		events: newEventHub(), eventPending: make(chan struct{}, 16)}
+	s.hookEvents()
+	return s, nil
+}
+
+// hookEvents makes every store say when it changed, so the UI hears it (events.go).
+func (s *Server) hookEvents() {
+	if s.opts.Jobs != nil {
+		s.opts.Jobs.SetOnChange(func(id string) {
+			s.events.publish("jobs")
+			s.events.publish("job:" + id)
+		})
+	}
+	topic := func(t string) func(string) { return func(string) { s.events.publish(t) } }
+	if s.opts.Plans != nil {
+		s.opts.Plans.SetOnChange(topic("plans"))
+	}
+	if s.opts.Recipes != nil {
+		s.opts.Recipes.SetOnChange(topic("recipes"))
+	}
+	s.opts.Tokens.SetOnChange(topic("tokens"))
+	if s.opts.Secrets != nil {
+		s.opts.Secrets.SetOnChange(topic("tokens"))
+	}
+	if s.opts.OAuth != nil {
+		s.opts.OAuth.SetOnChange(topic("tokens"))
+	}
 }
 
 type actorHolder struct {
@@ -175,6 +205,9 @@ type statusWriter struct {
 }
 
 func (w *statusWriter) WriteHeader(c int) { w.code = c; w.ResponseWriter.WriteHeader(c) }
+
+// Unwrap lets http.ResponseController reach the connection (a WebSocket hijacks it).
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -448,6 +481,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, out)
 	}))
+	mux.HandleFunc("GET /v1/events", s.handleEvents)
 	mux.Handle("GET /v1/status", s.auth(RoleViewer, func(w http.ResponseWriter, r *http.Request) {
 		snap, err := s.snapshot(r.Context())
 		if err != nil {
@@ -590,6 +624,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
+	go s.runStatusEvents(ctx)
 	select {
 	case err := <-errc:
 		return err
@@ -597,6 +632,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		// Jobs still waiting for the host never start now (their records say nothing was done); the
 		// one that holds it finishes.
 		s.queue.close()
+		s.events.closeAll()
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(sctx); err != nil {
