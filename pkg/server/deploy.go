@@ -44,39 +44,21 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	actor, _ := s.actorScope(r)
 	job, err := s.startDeploy(body.Tag, actor, false)
-	var busy errBusy
-	switch {
-	case errors.As(err, &busy):
-		writeError(w, http.StatusConflict, "busy", busy.Error())
-		return
-	case err != nil:
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was deployed")
+	if err != nil {
+		s.answerNotStarted(w, r, "deploy "+body.Tag, err)
 		return
 	}
 	auditDetail(r, "deploy %s job=%s", body.Tag, job.ID)
-	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "tag": body.Tag})
+	answerJob(w, job, map[string]any{"tag": body.Tag})
 }
 
 type errBusy string
 
 func (e errBusy) Error() string { return string(e) }
 
-// startDeploy starts the deploy job for a tag. resumed is a deploy that an upgrade to fleet.yml's
-// daemon pin interrupted, now running on the new binary: it never upgrades again.
+// startDeploy queues the deploy job for a tag: it runs when the host is free. resumed is a deploy that an
+// upgrade to fleet.yml's daemon pin interrupted, now running on the new binary: it never upgrades again.
 func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
-	if !s.applyMu.TryLock() {
-		msg := "another change is already running on this host"
-		if j, ok := s.opts.Jobs.Running(); ok {
-			msg += " (" + string(j.ID) + ")"
-		}
-		return Job{}, errBusy(msg)
-	}
-	job, err := s.opts.Jobs.CreateKind("deploy", actor, "", tag, "")
-	if err != nil {
-		s.applyMu.Unlock()
-		return Job{}, err
-	}
 	var tmp string
 	cleanup := func() {
 		if tmp != "" {
@@ -87,63 +69,64 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 	if resumed {
 		what += " (resumed on the upgraded daemon)"
 	}
-	result := func(r string) { s.opts.Jobs.update(job.ID, func(j *Job) { j.Result = r }) }
-	s.startJob(job.ID, actor, what, "deploy "+tag, cleanup, func(ctx context.Context, logf func(string, ...any)) error {
-		sha, rule, err := s.resolveTag(ctx, tag)
-		if err != nil {
-			return err
-		}
-		s.opts.Jobs.update(job.ID, func(j *Job) { j.Sha = sha })
-		logf("tag %s is commit %s, protected by the rule %q", tag, sha[:12], rule)
-
-		var root string
-		tmp, root, err = s.fetchCommit(ctx, sha)
-		if err != nil {
-			return err
-		}
-
-		// The protected tag is also the approval of the image recipe in this commit.
-		s.approveRecipeFromTag(root, tag, sha, logf)
-
-		// fleet.yml's daemon pin is the version the commit was written for: move to it first, so the
-		// plan and the apply run on that binary.
-		if upgraded, err := s.followPin(ctx, root, tag, actor, resumed, logf); err != nil || upgraded {
-			if upgraded && err == nil {
-				result(ResultDaemonUpgraded)
+	return s.queueJob(jobSpec{kind: "deploy", actor: actor, subject: tag, what: what, audit: "deploy " + tag, cleanup: cleanup,
+		work: func(ctx context.Context, logf func(string, ...any)) error {
+			id := jobIDOf(ctx)
+			result := func(r string) { s.opts.Jobs.update(id, func(j *Job) { j.Result = r }) }
+			sha, rule, err := s.resolveTag(ctx, tag)
+			if err != nil {
+				return err
 			}
-			return err
-		}
+			s.opts.Jobs.update(id, func(j *Job) { j.Sha = sha })
+			logf("tag %s is commit %s, protected by the rule %q", tag, sha[:12], rule)
 
-		pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		fp, err := s.opts.Plan(pctx, root, "")
-		cancel()
-		if err != nil {
-			return fmt.Errorf("plan commit %s: %w", sha[:12], err)
-		}
-		hash := fp.Hash()
-		s.opts.Plans.Record(PlanSeen{Hash: hash, Actor: actor, Sha: sha, Service: "", Exit: fp.ExitStatus(), Counts: fp.Counts(), Text: fp.Render()})
-		s.opts.Jobs.update(job.ID, func(j *Job) { j.PlanHash = hash })
-		logf("plan %s:\n%s", hash[:12], fp.Render())
-		// The plan covers the services and the network they share (fleet.yml's dns_records, the edge's
-		// Caddyfile), so what the log shows is everything the deploy does.
-		if fp.Blocked() {
-			return errors.New("the plan is blocked: apply would fail, so nothing was changed")
-		}
-		if !fp.Pending() {
-			logf("nothing to change: the host already matches %s", tag)
-			result(ResultNoChanges)
+			var root string
+			tmp, root, err = s.fetchCommit(ctx, sha)
+			if err != nil {
+				return err
+			}
+
+			// The protected tag is also the approval of the image recipe in this commit.
+			s.approveRecipeFromTag(root, tag, sha, logf)
+
+			// fleet.yml's daemon pin is the version the commit was written for: move to it first, so the
+			// plan and the apply run on that binary.
+			if upgraded, err := s.followPin(ctx, root, tag, actor, id, resumed, logf); err != nil || upgraded {
+				if upgraded && err == nil {
+					result(ResultDaemonUpgraded)
+				}
+				return err
+			}
+
+			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			fp, err := s.opts.Plan(pctx, root, "")
+			cancel()
+			if err != nil {
+				return fmt.Errorf("plan commit %s: %w", sha[:12], err)
+			}
+			hash := fp.Hash()
+			s.opts.Plans.Record(PlanSeen{Hash: hash, Actor: actor, Sha: sha, Service: "", Exit: fp.ExitStatus(), Counts: fp.Counts(), Text: fp.Render()})
+			s.opts.Jobs.update(id, func(j *Job) { j.PlanHash = hash })
+			logf("plan %s:\n%s", hash[:12], fp.Render())
+			// The plan covers the services and the network they share (fleet.yml's dns_records, the edge's
+			// Caddyfile), so what the log shows is everything the deploy does.
+			if fp.Blocked() {
+				return errors.New("the plan is blocked: apply would fail, so nothing was changed")
+			}
+			if !fp.Pending() {
+				logf("nothing to change: the host already matches %s", tag)
+				result(ResultNoChanges)
+				return nil
+			}
+			if err := s.opts.Plans.UseForDeploy(hash, "tag "+tag+" ("+sha[:12]+")", id); err != nil {
+				return fmt.Errorf("record the deploy: %w", err)
+			}
+			if err := s.opts.Apply(ctx, root, fp, logf); err != nil {
+				return err
+			}
+			result(ResultApplied)
 			return nil
-		}
-		if err := s.opts.Plans.UseForDeploy(hash, "tag "+tag+" ("+sha[:12]+")", job.ID); err != nil {
-			return fmt.Errorf("record the deploy: %w", err)
-		}
-		if err := s.opts.Apply(ctx, root, fp, logf); err != nil {
-			return err
-		}
-		result(ResultApplied)
-		return nil
-	})
-	return job, nil
+		}})
 }
 
 // approveRecipeFromTag approves the image recipe (scripts/ and images/) of a deploy tag's commit. The
@@ -222,8 +205,8 @@ func (s *Server) lastHostChange() time.Time {
 		return last
 	}
 	for _, j := range s.opts.Jobs.List() {
-		if j.Finished == nil || !changesHost(j.Kind) {
-			continue
+		if j.Finished == nil || !changesHost(j.Kind) || j.Error == notStarted {
+			continue // a job that never got the host changed nothing
 		}
 		if j.Finished.After(last) {
 			last = *j.Finished

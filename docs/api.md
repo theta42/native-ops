@@ -36,7 +36,8 @@ one commit of it.**
    that commit from the git server itself, so the caller uploads nothing and can deploy nothing but a
    tagged commit.
 4. The deploy runs as a **job**. Every change to the host is a job, with a record kept on disk, and
-   **one change runs at a time**.
+   **one change runs at a time**: a change asked for while another runs waits in line (its job is
+   `queued`) and starts when its turn comes, so two pipelines that fire together both succeed.
 
 Nothing about a deploy needs SSH, and nothing on the host needs to be touched by hand.
 
@@ -49,12 +50,20 @@ Every `/v1` call takes an API token: `Authorization: Bearer nops_...`. An admin 
 |---|---|
 | `viewer` | read: status, deploys, jobs (no logs), plans, instances |
 | `planner` | + preview: `POST /v1/deploy/plan`, `POST /v1/plan` |
-| `deployer` | + change: deploy, apply an approved plan, image builds and pruning, edge, backups, DNS; job logs |
-| `admin` | + approvals, tokens, users, secrets, restores, daemon upgrades |
+| `deployer` | + change: deploy, apply an approved plan, image builds and pruning, backups, service secrets (`SERVICE_*`); job logs |
+| `admin` | + approvals, tokens, users, the daemon's own secrets, restores, daemon upgrades |
 
 Roles are ordered: each can do everything the ones above it can. The least role each operation needs is
-`x-native-ops-role` in the OpenAPI document. Give each caller the least it needs: a pull-request job
-gets a planner token, the tag pipeline a deployer token, a dashboard a viewer token.
+`x-native-ops-role` in the OpenAPI document.
+
+**A configuration repository needs one token**: a `deployer`, stored as `NATIVE_OPS_TOKEN`, used by every
+workflow in it (plans, deploys, image builds, pruning, secret sync). Splitting it into a token per workflow
+looks tighter but is not: a git server hands a repository's secrets to any workflow run in it, so whoever
+can push a workflow there can read all of them anyway. What a deployer token cannot do is what makes one
+token safe: it deploys only a commit a **protected** tag points at, builds only a recipe a protected tag
+(or an admin) approved, applies only a plan an admin approved, and sets only service secrets, never the
+daemon's own credentials. Other callers still get the least they need: a dashboard a viewer token, a fleet
+manager a scoped token.
 
 A token can also carry a **scope** (instance names, images, domains). A scoped token, the kind a fleet
 manager uses, can only manage tenant instances within it, and sees only its own jobs.
@@ -112,8 +121,14 @@ api "$NATIVE_OPS_URL/v1/jobs/$job?wait=60" | jq '{status, result, error}'
 native-ops remote deploy --tag deploy-2026.10.03
 ```
 
-`202 Accepted` with the job (and `Location: /v1/jobs/<id>`). `409 busy` means another change is
-running: the message names its job; wait for it and try again.
+`202 Accepted` with the job (and `Location: /v1/jobs/<id>`). If another change is running, the job is
+`queued` (with its `position` in line) and starts when the changes before it end; waiting on it covers
+that time. `429 queue_full` (with `Retry-After`) means 20 changes are already waiting; `native-ops remote`
+asks again by itself.
+
+A deploy whose `fleet.yml` pins another daemon release upgrades the daemon first and ends with
+`result: daemon_upgraded`; the restarted daemon runs the deploy as a new job and records it as the first
+job's `next`. Follow `next` (the CLI does) to see the deploy's real outcome.
 
 ### What is live, and what ran before
 
@@ -191,7 +206,10 @@ over, health gate, automatic rollback on failure.
 
 | You see | It means | Do |
 |---|---|---|
-| `409 busy` | another change is running (named in the message) | wait for that job (`GET /v1/jobs/{id}?wait=60`), then retry |
+| job `queued` | another change runs first; `position` is its place in line | wait for it (`GET /v1/jobs/{id}?wait=60`); nothing to retry |
+| `429 queue_full` | 20 changes are already waiting for the host | retry after `Retry-After` (the CLI does) |
+| `409 busy` | an apply or daemon upgrade, which cannot wait in line, found the host taken | wait for the running job, then retry |
+| job `interrupted`: "before this job's turn came" | the daemon restarted (e.g. an upgrade) while the job waited; nothing was done | run it again |
 | job failed: `tag ... is not protected` | no protection rule covers the tag | protect the deploy tags in the repository's settings, then push the tag again |
 | job failed: `the plan is blocked` | apply would fail (e.g. an image that does not exist yet) | `deploy-plan` shows which service and why; fix the configuration or build the image, tag again |
 | `422 tag_unresolved` | the git server has no such tag, or it does not match the deploy tag pattern | check the tag was pushed, and its name |
@@ -298,7 +316,7 @@ upgrades. Those are the human gates. A daemon upgrade still happens through a de
 change to `fleet.yml`'s pin is tagged.
 
 Tool results carry the endpoint's JSON answer (as text and as `structuredContent`), plus a plan's
-`text` or a job's `log` as plain text. An endpoint's refusal (`403`, `409 busy`, `422`) is a tool
+`text` or a job's `log` as plain text. An endpoint's refusal (`403`, `429 queue_full`, `422`) is a tool
 result with `isError: true` that names the HTTP status and the endpoint's error, so the agent sees why.
 
 ### A typical agent session
@@ -334,8 +352,11 @@ Every error is `{"error": "<for a person>", "code": "<for a program>"}`:
 | `bad_config` | 400 | the configuration tree does not load |
 | `unauthorized` | 401 | no valid token (`WWW-Authenticate` says how) |
 | `forbidden` | 403 | the token's role or scope cannot do that |
+| `cross_origin` | 403 | a change made with a browser session from a page that is not the daemon's own |
 | `not_found` | 404 | no such endpoint, job, plan or instance (or the feature is off on this daemon) |
-| `busy` | 409 (429 for plans) | another change, or too many plans, is running; retry |
+| `busy` | 409 (429 for plans) | an apply or daemon upgrade found the host taken, or too many plans are running; retry |
+| `queue_full` | 429 | too many changes wait for the host; retry after `Retry-After` |
+| `stopping` | 503 | the daemon is restarting; retry |
 | `tag_unresolved` | 422 | the tag does not resolve on the git server |
 | `git_unavailable` | 502 | the commit could not be read from the git server |
 | `host_unavailable` | 502 | the host could not be read (never echoes internal text) |

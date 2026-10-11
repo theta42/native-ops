@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -67,29 +68,18 @@ func (s *Server) handleImageBuild(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if !s.applyMu.TryLock() {
-		u.discard()
-		msg := "another change is already running on this host"
-		if j, ok := s.opts.Jobs.Running(); ok {
-			msg += " (" + string(j.ID) + ")"
-		}
-		auditDetail(r, "image build %s@%s rejected: busy", app, ref)
-		writeError(w, http.StatusConflict, "busy", msg)
-		return
-	}
-	job, err := s.opts.Jobs.CreateKind("image:build", actor, u.sha, app+"@"+ref, "")
+	// The build waits for the host if another change runs (queue.go); the upload waits with it.
+	job, err := s.queueJob(jobSpec{kind: "image:build", actor: actor, sha: u.sha, subject: app + "@" + ref,
+		what: "build " + app + "@" + ref, audit: "image build " + app + "@" + ref, cleanup: u.discard,
+		work: func(ctx context.Context, logf func(string, ...any)) error {
+			return s.opts.ImageBuild(ctx, u.root, app, ref, logf)
+		}})
 	if err != nil {
-		s.applyMu.Unlock()
-		u.discard()
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was built")
+		s.answerNotStarted(w, r, "image build "+app+"@"+ref, err)
 		return
 	}
 	auditDetail(r, "image build %s@%s job=%s", app, ref, job.ID)
-	s.startJob(job.ID, actor, "build "+app+"@"+ref, "image build "+app+"@"+ref, u.discard, func(ctx context.Context, logf func(string, ...any)) error {
-		return s.opts.ImageBuild(ctx, u.root, app, ref, logf)
-	})
-	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
+	answerJob(w, job, nil)
 }
 
 // ImagePruneFunc applies image retention on the host (see engine.ImageRetention); with dryRun it only
@@ -102,31 +92,21 @@ type ImagePruneFunc func(ctx context.Context, dryRun bool, logf func(string, ...
 // themselves; this is for a scheduled maintenance job and for images left before that.
 func (s *Server) handleImagePrune(w http.ResponseWriter, r *http.Request) {
 	dry := r.URL.Query().Get("dry_run") == "1" || r.URL.Query().Get("dry_run") == "true"
-	if !s.applyMu.TryLock() {
-		msg := "another change is already running on this host"
-		if j, ok := s.opts.Jobs.Running(); ok {
-			msg += " (" + string(j.ID) + ")"
-		}
-		writeError(w, http.StatusConflict, "busy", msg)
-		return
-	}
 	actor, _ := s.actorScope(r)
 	what := "image prune"
 	if dry {
 		what += " (dry run)"
 	}
-	job, err := s.opts.Jobs.CreateKind("image:prune", actor, "", "", "")
+	job, err := s.queueJob(jobSpec{kind: "image:prune", actor: actor, what: what, audit: what,
+		work: func(ctx context.Context, logf func(string, ...any)) error {
+			return s.opts.ImagePrune(ctx, dry, logf)
+		}})
 	if err != nil {
-		s.applyMu.Unlock()
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was deleted")
+		s.answerNotStarted(w, r, what, err)
 		return
 	}
 	auditDetail(r, "%s job=%s", what, job.ID)
-	s.startJob(job.ID, actor, what, what, nil, func(ctx context.Context, logf func(string, ...any)) error {
-		return s.opts.ImagePrune(ctx, dry, logf)
-	})
-	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "dry_run": dry})
+	answerJob(w, job, map[string]any{"dry_run": dry})
 }
 
 // RunImageRetention applies image retention on its own, every `every`, until ctx ends (0 turns it off). Nothing
@@ -135,7 +115,7 @@ func (s *Server) handleImagePrune(w http.ResponseWriter, r *http.Request) {
 // instance, and the retention rule runs only when something calls it. Left to a person or a pipeline to
 // remember, the host fills up; it is the daemon's own housekeeping. It is the same rule as POST
 // /v1/images/prune (an image an instance runs is never deleted) and is a recorded job like any other change.
-// It does not wait for a busy host: another change running means skipping this round, and the next one runs.
+// It does not queue: another change running or waiting means skipping this round, and the next one runs.
 func (s *Server) RunImageRetention(ctx context.Context, every time.Duration) {
 	if s.opts.ImagePrune == nil || s.opts.Jobs == nil || every <= 0 {
 		return
@@ -161,16 +141,12 @@ const scheduledActor = "native-ops (scheduled)"
 
 // pruneImagesNow runs one retention job unless the host is busy.
 func (s *Server) pruneImagesNow() {
-	if !s.applyMu.TryLock() {
-		return
-	}
-	job, err := s.opts.Jobs.CreateKind("image:prune", scheduledActor, "", "", "")
-	if err != nil {
-		s.applyMu.Unlock()
+	_, err := s.runJobNow(jobSpec{kind: "image:prune", actor: scheduledActor, what: "image prune (scheduled)", audit: "image prune",
+		work: func(ctx context.Context, logf func(string, ...any)) error {
+			return s.opts.ImagePrune(ctx, false, logf)
+		}})
+	var busy errBusy
+	if err != nil && !errors.As(err, &busy) {
 		log.Printf("scheduled image retention: could not record the job: %v", err)
-		return
 	}
-	s.startJob(job.ID, scheduledActor, "image prune (scheduled)", "image prune", nil, func(ctx context.Context, logf func(string, ...any)) error {
-		return s.opts.ImagePrune(ctx, false, logf)
-	})
 }

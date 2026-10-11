@@ -47,6 +47,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "local_signin_off", "local sign-in is not enabled on this daemon")
 		return
 	}
+	if !sameOrigin(r) { // another site must not sign a browser in to an account of its choosing
+		writeError(w, http.StatusForbidden, "cross_origin", "sign in from this daemon's own page")
+		return
+	}
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`

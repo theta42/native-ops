@@ -5,7 +5,10 @@ info:
   summary: Plan, deploy and inspect one Incus host from CI, an agent or a dashboard.
   description: |
     The native-ops daemon runs on the host it manages. Every change to the host is a **job** with a
-    record; one change runs at a time (a second gets `409 busy`).
+    record; one change runs at a time. A change asked for while another runs is **queued**: it is
+    accepted (`202`, job status `queued` with its `position`) and starts when the ones before it end, so
+    callers need not retry. Only an apply and a daemon upgrade, which need the host as it is now, are
+    refused while anything runs or waits (`409 busy`); a full queue is `429 queue_full`.
 
     **Deploys** are the normal way to change the host: push a protected `deploy-*` tag in the
     configuration repository and call `POST /v1/deploy` with it. The daemon reads that commit from the
@@ -486,7 +489,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
 
   /v1/deploy/plan:
     post:
@@ -532,7 +535,8 @@ paths:
       description: |
         `current` is the newest deploy that left the host matching its tag (result `applied` or
         `no_changes`). Changes made since by other means (an apply, an instance change, an image build)
-        are in `GET /v1/jobs`. `running` is the deploy in progress, if any.
+        are in `GET /v1/jobs`. `running` is the deploy in progress, if any; `queued`, the deploys waiting
+        for the host, next first.
       x-native-ops-role: viewer
       x-native-ops-enabled-by: --enable-apply, --git-url and --deploy-repo
       parameters:
@@ -548,6 +552,7 @@ paths:
                 properties:
                   current: { oneOf: [{ $ref: "#/components/schemas/Deploy" }, { type: "null" }] }
                   running: { oneOf: [{ $ref: "#/components/schemas/Deploy" }, { type: "null" }] }
+                  queued: { type: array, items: { $ref: "#/components/schemas/Deploy" } }
                   deploys: { type: array, items: { $ref: "#/components/schemas/Deploy" } }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -585,13 +590,13 @@ paths:
       tags: [jobs]
       summary: One job
       description: |
-        The log is included for deployers and admins only. With `wait`, a running job is answered as soon
-        as it ends, or when the wait is over (still running), so a client need not poll.
+        The log is included for deployers and admins only. With `wait`, a queued or running job is answered
+        as soon as it ends, or when the wait is over (still queued or running), so a client need not poll.
       x-native-ops-role: viewer
       x-native-ops-scoped: true
       parameters:
         - { name: id, in: path, required: true, schema: { type: string, pattern: "^j-[0-9]{9,12}-[0-9a-f]{8}$" } }
-        - { name: wait, in: query, description: "Seconds to wait for a running job to end.", schema: { type: integer, minimum: 0, maximum: 60 } }
+        - { name: wait, in: query, description: "Seconds to wait for a queued or running job to end.", schema: { type: integer, minimum: 0, maximum: 60 } }
       responses:
         "200": { description: "The job.", content: { application/json: { schema: { $ref: "#/components/schemas/Job" } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -739,7 +744,7 @@ paths:
         "202": { $ref: "#/components/responses/JobStarted" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
     delete:
       operationId: deleteInstance
       tags: [instances]
@@ -753,7 +758,7 @@ paths:
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
   /v1/instances/{name}/update:
     post:
       operationId: updateInstance
@@ -779,7 +784,7 @@ paths:
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
   /v1/instances/{name}/resize:
     post:
       operationId: resizeInstance
@@ -801,7 +806,7 @@ paths:
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
         "400": { $ref: "#/components/responses/BadRequest" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
   /v1/instances/{name}/labels:
     patch:
       operationId: patchInstanceLabels
@@ -827,7 +832,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { description: "Outside the token's scope, or not a tenant instance." }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
   /v1/instances/{name}/suspend:
     post:
       operationId: suspendInstance
@@ -851,7 +856,7 @@ paths:
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
         "400": { $ref: "#/components/responses/BadRequest" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
 
   /v1/images/build:
     post:
@@ -869,7 +874,7 @@ paths:
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
         "403": { description: "The recipe is not approved (an admin approves its digest), or the scope does not allow the image." }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
   /v1/images/recipes:
     get:
       operationId: listRecipes
@@ -914,10 +919,11 @@ paths:
         - { name: dry_run, in: query, description: "Only report.", schema: { type: string, enum: ["1", "true"] } }
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
 
   /v1/edge/apply:
     post:
+      deprecated: true
       operationId: applyEdge
       tags: [maintenance]
       summary: Apply the tree's edge/Caddyfile to the edge container
@@ -926,8 +932,7 @@ paths:
       x-native-ops-enabled-by: --enable-edge-apply
       requestBody: { $ref: "#/components/requestBodies/Tree" }
       responses:
-        "202": { $ref: "#/components/responses/JobStarted" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "410": { description: "Retired: the change is part of the plan; commit it and push a deploy tag (gone).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/backups:
     post:
       operationId: backup
@@ -941,7 +946,7 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/Tree" }
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
   /v1/backups/restore:
     post:
       operationId: restore
@@ -957,9 +962,10 @@ paths:
       requestBody: { $ref: "#/components/requestBodies/Tree" }
       responses:
         "202": { $ref: "#/components/responses/JobStarted" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "429": { $ref: "#/components/responses/QueueFull" }
   /v1/dns/sync:
     post:
+      deprecated: true
       operationId: syncDNS
       tags: [maintenance]
       summary: Create or update fleet.yml's dns_records
@@ -967,8 +973,7 @@ paths:
       x-native-ops-enabled-by: --enable-dns-sync
       requestBody: { $ref: "#/components/requestBodies/Tree" }
       responses:
-        "202": { $ref: "#/components/responses/JobStarted" }
-        "409": { $ref: "#/components/responses/Busy" }
+        "410": { description: "Retired: the change is part of the plan; commit it and push a deploy tag (gone).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /v1/daemon/upgrade:
     post:
@@ -1004,7 +1009,12 @@ paths:
       operationId: syncSecrets
       tags: [admin]
       summary: Push secrets from the git server's secret store
-      x-native-ops-role: admin
+      description: |
+        An admin may set any secret. A deployer may set only service secrets (`SERVICE_*`, what a
+        manifest's `env_from` reads), so the configuration repository's one CI token can sync them; the
+        daemon's own credentials stay an admin's. A secrets token sets only the `SERVICE_*` names its scope
+        names. A prune removes only names the caller may set.
+      x-native-ops-role: deployer
       requestBody:
         required: true
         content:
@@ -1013,7 +1023,7 @@ paths:
               type: object
               properties:
                 secrets: { type: object, additionalProperties: { type: string } }
-                prune: { type: boolean, description: "Remove every secret not named." }
+                prune: { type: boolean, description: "Remove every secret the caller may set that is not named." }
       responses:
         "200": { description: "What changed, by name." }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1172,7 +1182,7 @@ components:
 
   responses:
     JobStarted:
-      description: The job started. Location names it; follow it with GET /v1/jobs/{id}?wait=60.
+      description: The job started, or is queued behind the change that runs now (its status says which). Location names it; follow it with GET /v1/jobs/{id}?wait=60.
       headers:
         Location: { schema: { type: string } }
       content:
@@ -1194,7 +1204,12 @@ components:
       description: No such thing (not_found).
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Busy:
-      description: Another change is running on this host (busy); the message names its job. Wait for it and retry.
+      description: Another change is running or waiting on this host (busy); the message names the running job. Wait for it and retry.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    QueueFull:
+      description: Too many changes are already waiting for this host (queue_full); retry after the Retry-After header. A 503 (stopping) means the daemon is restarting.
+      headers:
+        Retry-After: { schema: { type: integer } }
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     HostUnavailable:
       description: The host could not be read (host_unavailable).
@@ -1209,7 +1224,7 @@ components:
         code:
           type: string
           description: Stable, for a program.
-          examples: [bad_request, bad_config, unauthorized, forbidden, not_found, busy, tag_unresolved, git_unavailable, host_unavailable, plan_changed, blocked, stale, not_approvable, not_approved, approval_used, approval_expired, not_managed, internal]
+          examples: [bad_request, bad_config, unauthorized, forbidden, cross_origin, not_found, busy, queue_full, stopping, tag_unresolved, git_unavailable, host_unavailable, plan_changed, blocked, stale, not_approvable, not_approved, approval_used, approval_expired, not_managed, internal]
     Role:
       type: string
       enum: [viewer, planner, deployer, admin]
@@ -1232,8 +1247,8 @@ components:
         tag: { type: string, description: "A deploy tag pushed in the configuration repository.", examples: [deploy-2026.10.03] }
     JobStatus:
       type: string
-      enum: [running, succeeded, failed, interrupted]
-      description: interrupted means the daemon stopped while the job ran; run it again (applies converge).
+      enum: [queued, running, succeeded, failed, interrupted]
+      description: queued means it waits for the change before it (position says where it is in line). interrupted means the daemon stopped while the job ran, or before it started (the error says which); run it again (applies converge).
     Job:
       type: object
       required: [id, kind, status, actor, created]
@@ -1245,10 +1260,13 @@ components:
         sha: { type: string, description: "The commit (a deploy's, once resolved)." }
         service: { type: string, description: "What the job is about; for a deploy, the tag." }
         plan_hash: { type: string }
-        created: { type: string, format: date-time }
+        created: { type: string, format: date-time, description: "When it was asked for." }
+        started: { type: string, format: date-time, description: "When it got the host; absent while queued." }
         finished: { type: string, format: date-time }
+        position: { type: integer, description: "A queued job's place in line (1 runs next)." }
         error: { type: string }
         result: { $ref: "#/components/schemas/DeployResult" }
+        next: { type: string, description: "A deploy that upgraded the daemon (result daemon_upgraded) continues as this job; follow it." }
         log: { type: string, description: "For deployers and admins; not in lists." }
         log_truncated: { type: boolean }
     DeployResult:

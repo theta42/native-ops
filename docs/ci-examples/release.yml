@@ -1,0 +1,52 @@
+name: Release an app
+# Builds images/<app> at a git ref on the host, from this repository's recipe, through the daemon. An app
+# repository dispatches it (on a merge to main, or on a release tag). If another change is running on the
+# host, the build waits in line for it; the job does not fail.
+#
+# A build only moves <prefix><app>:<ref> (and :latest); the running service changes with the next deploy
+# tag, whose plan shows the replace-image first. The recipe (scripts/ and images/) must have been approved,
+# by a deploy tag at a commit that has it, or by an admin.
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: the app to build (a directory under images/)
+        required: true
+      ref:
+        description: the app repository's ref to build (main, or a release tag)
+        required: true
+        default: main
+
+env:
+  NATIVE_OPS_URL: https://native-ops.example.com
+  NATIVE_OPS_VERSION: vX.Y.Z
+  NATIVE_OPS_SHA256: "<sha256 of the linux_amd64 tarball>"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      APP: ${{ inputs.app }}
+      REF: ${{ inputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      # The inputs come from whoever dispatched this: build only reviewed code (main or a release tag).
+      - name: Check the ref
+        shell: bash
+        run: |
+          [[ "${APP}" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo "::error::app '${APP}' is not an app name"; exit 1; }
+          [[ "${REF}" =~ ^(main|v[0-9][0-9A-Za-z.-]*)$ ]] || { echo "::error::ref '${REF}' is not main or a v* tag"; exit 1; }
+      - name: Install native-ops (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"   # outside the checkout: the tree a plan or build uploads must not carry the tool
+          curl -fsSL --proto '=https' --tlsv1.2 -o native-ops.tgz \
+            "https://github.com/theta42/native-ops/releases/download/${NATIVE_OPS_VERSION}/native-ops_${NATIVE_OPS_VERSION}_linux_amd64.tar.gz"
+          echo "${NATIVE_OPS_SHA256}  native-ops.tgz" | sha256sum -c -
+          tar -xzf native-ops.tgz
+          install -D -m 0755 "native-ops_${NATIVE_OPS_VERSION}_linux_amd64" "$HOME/.local/bin/native-ops"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build on the host and wait
+        env:
+          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_TOKEN }}   # the repository's one deployer token
+        run: native-ops remote image-build --config-dir . --app "${APP}" --ref "${REF}"

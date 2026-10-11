@@ -166,7 +166,7 @@ HASH=$(jq -r .hash plan.json)
 
 # 3. apply that plan: the same tree, and the hash. 202 with a job; poll it
 curl ... -X POST "$URL/v1/apply?sha=$COMMIT&expect=$HASH" --data-binary @conf.tgz -o job.json
-curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succeeded | failed | interrupted
+curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: queued | running | succeeded | failed | interrupted
 ```
 
 - **`expect` is required.** The daemon plans the upload again, and unless that plan has the hash
@@ -187,7 +187,10 @@ curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succe
   nothing to change, cannot be approved. Approvals survive a restart of the daemon and are audited.
 - **A blocked plan is never applied** (`409 blocked`), and a plan with nothing to change starts no
   job (`200 nothing_to_do`).
-- **One apply at a time** on the host (`409 busy`, naming the running job), taken before the
+- **An apply needs the host free** (`409 busy`, naming the running job, while another change runs or
+  waits). It is the one change besides a daemon upgrade that does not queue (see
+  [One change at a time](#one-change-at-a-time)): it checks the plan against the host as it is and uses
+  the approval up, so run later it would apply a plan nobody reviewed. The host is taken before the
   upload is read and released even when the request is refused.
 - **Only what the plan lists is applied**, in plan order, stopping at the first failure. Services
   after it are untouched; running the same apply again is safe and continues.
@@ -196,6 +199,23 @@ curl ... "$URL/v1/jobs/$(jq -r .job.id job.json)"      # status: running | succe
   kept. A job that was still running when the daemon stopped is marked `interrupted` on the next
   start, with the log so far: the host may be part-way through it, and the fix is to apply again.
   A stop waits up to 5 minutes for a running apply to finish first (`TimeoutStopSec=6min` in the unit).
+
+### One change at a time
+
+Every job that changes the host (a deploy, an image build or prune, an instance change, a backup or
+restore) takes the host for as long as it runs. A change asked for while another runs is **queued**: the
+request is accepted at once (`202`, the job's status `queued`, its `position` in line), the job starts
+when the ones before it end, first come first served, and its record says how long it waited. So two app
+pipelines that dispatch builds at the same moment, or a build during a deploy, both succeed: nobody has
+to retry a "busy" error.
+
+- At most 20 changes wait; one more is `429 queue_full` with `Retry-After` (`native-ops remote` retries).
+- An apply and a daemon upgrade do not queue: they need the host free and nothing waiting (`409 busy`),
+  and so never jump the line. The daemon's scheduled image retention skips a round instead of waiting.
+- A daemon that stops (a restart, an upgrade by a deploy) lets the running job finish; jobs still waiting
+  end `interrupted`, with the error "the daemon stopped before this job's turn came, so nothing was done".
+  Run them again. A job record left `queued` by a daemon that died is marked the same way at the next start.
+- `GET /v1/jobs?status=queued` lists the line; `GET /v1/deploys` names the queued deploys.
 - The audit log records the request (`apply job=... sha=... hash=...`, or why it was refused) and
   the end of the job.
 
@@ -335,9 +355,10 @@ What stops a fleet manager, or anyone holding its token, from doing more than th
 - **Only tenants.** An instance can be changed or removed here only if it was launched from a template
   (`user.native-ops.template`). gitea, plane and every other static service carry none and are refused, for
   every token, an admin's included; an instance of another template is never taken over.
-- **One change at a time**, shared with apply: `409 busy` while a job runs, and a finished job means the host
-  is free. Each change is a job with a record; tenant secrets in `env` never appear in a job log, the audit log
-  or any answer.
+- **One change at a time**, shared with every other job: a change asked for while one runs is queued and runs
+  in its turn ([One change at a time](#one-change-at-a-time)), and a finished job means the host is free (or
+  handed to the next in line). Each change is a job with a record; tenant secrets in `env` never appear in a
+  job log, the audit log or any answer.
 
 ## Image builds and recipe approval
 
@@ -452,9 +473,9 @@ Tokens are managed over the API by an admin, so nobody needs a shell on the host
 
 ```bash
 export NATIVE_OPS_TOKEN=$BOOTSTRAP_TOKEN    # or any admin token
-native-ops remote token-create --name ci-plan --role planner          # prints the secret, once
-native-ops remote token-create --name ci-release --role deployer --names 'app-*' --images 'acme-app:*'
-native-ops remote token-create --name ci-secrets --role deployer --secrets 'SERVICE_APP_*'   # may only sync those secrets
+native-ops remote token-create --name ci --role deployer               # the config repo's NATIVE_OPS_TOKEN; prints the secret, once
+native-ops remote token-create --name fleet-manager --role deployer --names 'app-*' --images 'acme-app:*' --domains '*.example.com'
+native-ops remote token-create --name dashboard --role viewer
 curl -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens"     # list
 curl -X DELETE -H "Authorization: Bearer $NATIVE_OPS_TOKEN" "$NATIVE_OPS_URL/v1/tokens/<id>"
 ```
@@ -563,28 +584,27 @@ env_from:
   GOOGLE_SERVICE_ACCOUNT_KEY: SERVICE_CREW_GOOGLE_KEY   # ENV_KEY: secret name
 ```
 
-CI syncs them with a **secrets token**, not an admin token: one that may only set the `SERVICE_*` names its
-scope matches.
-
-```bash
-native-ops remote token-create --name ci-crew-secrets --role deployer --secrets 'SERVICE_CREW_*'   # admin, once
-```
+CI syncs them with the configuration repository's one **deployer** token (`NATIVE_OPS_TOKEN`): a deployer
+may set service secrets (`SERVICE_*`) and nothing else in the store.
 
 ```yaml
 # the workflow that syncs secrets maps the git server's secret onto the store's name
 - env:
-    NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_SECRETS_TOKEN }}
+    NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_TOKEN }}
     SERVICE_CREW_GOOGLE_KEY: ${{ secrets.CREW_GOOGLE_SERVICE_ACCOUNT_KEY }}
-  run: native-ops remote secret-sync --prune SERVICE_CREW_GOOGLE_KEY
+  run: native-ops remote secret-sync SERVICE_CREW_GOOGLE_KEY
 ```
 
-- A secrets token can call `PUT /v1/secrets` and nothing else: it cannot read a value, list the daemon's
-  own credentials, delete, plan, apply, touch an instance, create tokens, call `whoami` or use MCP. Its
-  answer lists only the names it may set, and its `--prune` removes only names within its scope. A plain
-  deployer cannot sync at all; an admin can still sync anything.
-- So a git server that shows a repository's secrets to every branch hands out, at worst, the power to change
-  that service's secrets, and a changed secret reaches the service only through a plan whose hash binds
-  the value.
+- A deployer sets, sees and prunes only `SERVICE_*` names: it cannot read a value, list or change the
+  daemon's own credentials (the git token, the DNS and backup keys, the backup pins), or delete one. Its
+  `--prune` removes only service secrets. An admin can still sync anything.
+- A changed secret reaches the service only through a deploy of a protected tag, whose plan names the key
+  and whose hash binds the value.
+- For a stricter split, a **secrets token** may set only the `SERVICE_*` names its scope matches and can call
+  nothing else (not plan, deploy, read a job, call `whoami` or use MCP):
+  `native-ops remote token-create --name ci-crew-secrets --role deployer --secrets 'SERVICE_CREW_*'`. It is
+  worth it only where it is stored apart from the deployer token (another repository, a protected
+  environment): two secrets in one repository are read by the same workflows.
 
 - **Only `SERVICE_*` names.** A manifest can name only secrets that start with `SERVICE_`, and the daemon
   reads them from its store alone (never its own environment), so no manifest can route the daemon's
@@ -625,7 +645,12 @@ UI calls the API with it. API tokens keep working unchanged, for CI and machines
 - After 5 failed sign-ins in a row for one username, further attempts for it are refused (`429`,
   `Retry-After`) for 30 seconds, doubling up to 15 minutes; a success clears it.
 - The OIDC flow uses PKCE (S256). Without `--oidc-allowed-domain` the daemon warns at startup: with a
-  public identity provider, anyone it vouches for may sign in.
+  public identity provider, anyone it vouches for may sign in. With it, the email must be verified and at
+  that domain, and with Google the account must belong to that Workspace domain (its `hd` claim): a
+  personal Google account opened on a work address is refused. Any provider that sends `hd` is held to it.
+- A browser signed in with a session cookie may change things only from the daemon's own pages
+  (`Sec-Fetch-Site`/`Origin` must be this origin, else `403 cross_origin`). The cookie is `SameSite=Lax`,
+  which a page on a sibling subdomain (a tenant app on the same parent domain) would otherwise get past.
 - Admins can manage users over the API too (`/v1/users`), and cannot demote or disable the account
   they are signed in with.
 
@@ -774,7 +799,7 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--oidc-client-id` | `NATIVE_OPS_OIDC_CLIENT_ID` | | |
 | `--oidc-client-secret` | `NATIVE_OPS_OIDC_CLIENT_SECRET` | | better synced to the secret store |
 | `--oidc-redirect-url` | `NATIVE_OPS_OIDC_REDIRECT_URL` | | `https://<daemon>/auth/oidc/callback` |
-| `--oidc-allowed-domain` | `NATIVE_OPS_OIDC_ALLOWED_DOMAIN` | any | only emails at this domain may sign in |
+| `--oidc-allowed-domain` | `NATIVE_OPS_OIDC_ALLOWED_DOMAIN` | any | only verified emails at this domain may sign in (with Google: accounts of that Workspace domain) |
 | `--oidc-role` | `NATIVE_OPS_OIDC_ROLE` | `viewer` | the role a newly seen OIDC user gets |
 | `--oidc-label` | `NATIVE_OPS_OIDC_LABEL` | `single sign-on` | the sign-in button's text |
 | `--mcp-oauth` | `NATIVE_OPS_MCP_OAUTH` | on (with sign-in) | MCP clients connect by signing their person in (OAuth), acting with that person's role; `false` turns it off ([api.md](api.md#connect-by-signing-in-oauth)) |

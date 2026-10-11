@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/theta42/native-ops/pkg/config"
 )
 
 // The daemon's own credentials -- the DNS provider's token, the object store's keys, the OIDC client
@@ -22,7 +24,8 @@ import (
 // /etc/native-ops/serve.env keeps working.
 //
 //	GET    /v1/secrets          admin: the names, who set each and when -- never a value
-//	PUT    /v1/secrets          admin, or a secrets token for its SERVICE_* names: {"secrets": {NAME: value, ...}, "prune": bool}
+//	PUT    /v1/secrets          admin; a deployer for SERVICE_* names; a secrets token for the SERVICE_* names
+//	                            it is scoped to: {"secrets": {NAME: value, ...}, "prune": bool}
 //	DELETE /v1/secrets/{name}   admin
 
 var secretNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
@@ -232,15 +235,19 @@ func (s *Server) handleSecretSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	by, scope := s.actorScope(r)
-	// A secrets token sets, prunes and sees only the service secrets its scope names.
+	// A secrets token sets, prunes and sees only the service secrets its scope names; a deployer, only
+	// service secrets; an admin, every secret.
 	var within func(string) bool
-	if scope.SecretsOnly() {
+	switch h, _ := r.Context().Value(actorKey{}).(*actorHolder); {
+	case scope.SecretsOnly():
 		within = scope.AllowsSecret
-		for k := range body.Secrets {
-			if !within(k) {
-				writeError(w, http.StatusForbidden, "forbidden", "this token may not set "+k)
-				return
-			}
+	case h == nil || !h.role.Allows(RoleAdmin):
+		within = func(name string) bool { return strings.HasPrefix(name, config.SecretPrefix) }
+	}
+	for k := range body.Secrets {
+		if within != nil && !within(k) {
+			writeError(w, http.StatusForbidden, "forbidden", "this token may not set "+k+": only an admin sets the daemon's own credentials (a deployer sets service secrets, SERVICE_*)")
+			return
 		}
 	}
 	changed, removed, err := s.opts.Secrets.SyncWithin(body.Secrets, body.Prune, by, within)

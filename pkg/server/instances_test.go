@@ -519,16 +519,22 @@ func TestInstanceChangesShareTheHostWithApplyAndAFinishedJobMeansFree(t *testing
 	}
 	<-rig.ops.started
 
-	// One change at a time on the host, whoever asks.
+	// One change at a time on the host, whoever asks: the others wait in line, in order.
 	res, b := rig.do2(t, "PUT", "/v1/instances/demo-b", rig.scoped, tenantSpecFor("demo-b"))
-	if res.StatusCode != 409 || !strings.Contains(b, `"code":"busy"`) {
+	if res.StatusCode != 202 || !strings.Contains(b, `"status":"queued"`) || !strings.Contains(b, `"position":1`) {
 		t.Fatalf("a second change while one runs: %d %s", res.StatusCode, b)
 	}
-	if res, _ := rig.do2(t, "DELETE", "/v1/instances/demo-old", rig.deployer, nil); res.StatusCode != 409 {
-		t.Fatalf("a delete while one runs: %d", res.StatusCode)
+	res, del := rig.do2(t, "DELETE", "/v1/instances/demo-old", rig.deployer, nil)
+	if res.StatusCode != 202 || !strings.Contains(del, `"position":2`) {
+		t.Fatalf("a delete while one runs and one waits: %d %s", res.StatusCode, del)
 	}
 	close(rig.ops.block)
-	rig.wait(t, body, JobSucceeded)
+	first := rig.wait(t, body, JobSucceeded)
+	second := rig.wait(t, b, JobSucceeded)
+	third := rig.wait(t, del, JobSucceeded)
+	if second.Started.Before(*first.Finished) || third.Started.Before(*second.Finished) {
+		t.Fatalf("queued changes run one after another, in order: %+v %+v %+v", first, second, third)
+	}
 	rig.ops.block = nil
 	// The moment the job reports succeeded, the next change is accepted.
 	if res, b := rig.do2(t, "PUT", "/v1/instances/demo-c", rig.scoped, tenantSpecFor("demo-c")); res.StatusCode != 202 {

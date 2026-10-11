@@ -39,7 +39,7 @@ Deploys: a deploy applies the commit a protected deploy-* tag points at; the dae
 - To roll back, push a new deploy tag at the earlier commit and deploy that.
 
 Jobs: every change to the host is a job (list_jobs, get_job). get_job with wait_seconds waits for it to end; the log is shown to deployers and admins.
-Only one change runs at a time: a "busy" error means another job is running; wait for it and retry.`
+Only one change runs at a time: one asked for while another runs is queued (status queued, with its position) and starts when its turn comes; wait for it with get_job. A "queue_full" error means many changes are waiting; retry later.`
 
 type mcpTool struct {
 	name, title, description string
@@ -69,7 +69,7 @@ func intProp(desc string, min, max int) map[string]any {
 	return map[string]any{"type": "integer", "description": desc, "minimum": min, "maximum": max}
 }
 
-var waitProp = intProp("Seconds to wait for the job to end before answering (0 to 60). The answer is the job, finished or still running.", 0, 60)
+var waitProp = intProp("Seconds to wait for the job to end before answering (0 to 60). The answer is the job, finished or still queued or running.", 0, 60)
 
 // get is a tool that is one GET.
 func get(path func(args map[string]any) (string, error)) func(context.Context, map[string]any, mcpDo) (int, []byte, error) {
@@ -183,7 +183,7 @@ var mcpTools = []mcpTool{
 	},
 	{
 		name: "deploy", title: "Deploy a tag",
-		description: "Deploy the commit a protected deploy tag points at, as a job: plan it, refuse a blocked plan, apply it. The tag must already be pushed in git (the push is the approval). Changes the host: show the person plan_deploy's plan first. Returns the job; with wait_seconds, the job once it ends (or still running when the wait is over; follow it with get_job).",
+		description: "Deploy the commit a protected deploy tag points at, as a job: plan it, refuse a blocked plan, apply it. The tag must already be pushed in git (the push is the approval). Changes the host: show the person plan_deploy's plan first. Returns the job (queued if another change runs first); with wait_seconds, the job once it ends (or still queued or running when the wait is over; follow it with get_job). A deploy that upgrades the daemon first ends with result daemon_upgraded; the deploy continues as the job named in next.",
 		schema: obj(map[string]any{
 			"tag":          strProp("The deploy tag, e.g. deploy-2026.10.03."),
 			"wait_seconds": waitProp,
@@ -202,7 +202,7 @@ var mcpTools = []mcpTool{
 		description: "Jobs (every change to the host is one), newest first, without logs.",
 		schema: obj(map[string]any{
 			"kind":   strProp(`A job kind: deploy, apply, image:build, image:prune, edge:apply, backup, restore, dns:sync, daemon:upgrade; or a family ending in a colon, e.g. "instance:".`),
-			"status": map[string]any{"type": "string", "enum": []string{"running", "succeeded", "failed", "interrupted"}},
+			"status": map[string]any{"type": "string", "enum": []string{"queued", "running", "succeeded", "failed", "interrupted"}},
 			"limit":  intProp("How many jobs to list.", 1, keepJobs),
 		}),
 		min: RoleViewer, scoped: true, readOnly: true, enabled: func(o *Options) bool { return o.Jobs != nil },
@@ -213,7 +213,7 @@ var mcpTools = []mcpTool{
 	},
 	{
 		name: "get_job", title: "Get a job",
-		description: "One job: its status (running, succeeded, failed, interrupted), error, result and, for deployers and admins, its log.",
+		description: "One job: its status (queued with its position, running, succeeded, failed, interrupted), error, result, next (a deploy that upgraded the daemon continues as that job) and, for deployers and admins, its log.",
 		schema: obj(map[string]any{
 			"id":           strProp("The job id, j-<seconds>-<hex>."),
 			"wait_seconds": waitProp,

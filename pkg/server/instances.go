@@ -161,29 +161,18 @@ func trim(s string) string {
 	return s
 }
 
-// startInstanceJob takes the host, records a job, and runs work as it. It answers the request itself.
+// startInstanceJob records a job that runs work when the host is free (queue.go). It answers the request
+// itself.
 func (s *Server) startInstanceJob(w http.ResponseWriter, r *http.Request, op, name string, work func(ctx context.Context, logf func(string, ...any)) error) {
-	if !s.applyMu.TryLock() {
-		msg := "another change is already running on this host"
-		if j, ok := s.opts.Jobs.Running(); ok {
-			msg += " (" + string(j.ID) + ")"
-		}
-		auditDetail(r, "instance %s %s rejected: busy", op, name)
-		writeError(w, http.StatusConflict, "busy", msg)
-		return
-	}
 	actor, _ := s.actorScope(r)
-	job, err := s.opts.Jobs.CreateKind("instance:"+op, actor, "", name, "")
+	what := "instance " + op + " " + name
+	job, err := s.queueJob(jobSpec{kind: "instance:" + op, actor: actor, subject: name, what: what, audit: what, work: work})
 	if err != nil {
-		s.applyMu.Unlock()
-		log.Printf("instance %s: create job: %v", op, err)
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was changed")
+		s.answerNotStarted(w, r, what, err)
 		return
 	}
 	auditDetail(r, "instance %s %s job=%s", op, name, job.ID)
-	s.startJob(job.ID, actor, "instance "+op+" "+name, "instance "+op+" "+name, nil, work)
-	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
+	answerJob(w, job, nil)
 }
 
 // handleInstancePut is PUT /v1/instances/{name}: make the instance exist as the spec says (create it, or

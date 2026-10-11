@@ -21,6 +21,7 @@ jobs:
       - name: Install native-ops (pinned, checksum verified)
         run: |
           set -euo pipefail
+          cd "$(mktemp -d)"   # outside the checkout: the tree a plan or build uploads must not carry the tool
           curl -fsSL --proto '=https' --tlsv1.2 -o native-ops.tgz \
             "https://github.com/theta42/native-ops/releases/download/${NATIVE_OPS_VERSION}/native-ops_${NATIVE_OPS_VERSION}_linux_amd64.tar.gz"
           echo "${NATIVE_OPS_SHA256}  native-ops.tgz" | sha256sum -c -
@@ -29,7 +30,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Apply the approved plan
         env:
-          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_DEPLOY_TOKEN }}   # a deployer token
+          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_TOKEN }}   # the repository's one deployer token
         # Refused (and nothing changes) if the host or the tree moved since the plan, or if the plan
         # was not approved; waits for the job and prints its log.
         run: native-ops remote apply --config-dir . --expect "${{ inputs.hash }}"

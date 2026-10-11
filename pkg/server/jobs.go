@@ -14,10 +14,11 @@ import (
 	"time"
 )
 
-// JobStatus is where an apply job is.
+// JobStatus is where a job is.
 type JobStatus string
 
 const (
+	JobQueued      JobStatus = "queued" // waiting for the host: another change runs first (see queue.go)
 	JobRunning     JobStatus = "running"
 	JobSucceeded   JobStatus = "succeeded"
 	JobFailed      JobStatus = "failed"
@@ -35,11 +36,17 @@ type Job struct {
 	Service      string     `json:"service,omitempty"`
 	PlanHash     string     `json:"plan_hash"`
 	Created      time.Time  `json:"created"`
+	Started      *time.Time `json:"started,omitempty"` // when it got the host; unset while queued
 	Finished     *time.Time `json:"finished,omitempty"`
 	Error        string     `json:"error,omitempty"`
 	Result       string     `json:"result,omitempty"` // how a deploy ended: applied, no_changes or daemon_upgraded
 	Log          string     `json:"log,omitempty"`
 	LogTruncated bool       `json:"log_truncated,omitempty"`
+	// Position is where a queued job is in line (1 runs next). It is worked out when the job is read.
+	Position int `json:"position,omitempty"`
+	// Next is the job that carries on this one: a deploy that upgraded the daemon to fleet.yml's pin
+	// ends here, and the new binary resumes it as Next (see pin.go).
+	Next JobID `json:"next,omitempty"`
 }
 
 // JobID is j-<unix seconds>-<8 hex>. Anything else is never used to build a file name.
@@ -64,6 +71,7 @@ type Jobs struct {
 // OpenJobs loads the jobs in dir (creating it). A job that was still running when the previous
 // daemon stopped did not finish: it is marked interrupted, which is the truth about what state
 // the host may be in, and the fix is to run the apply again (it converges and is safe to repeat).
+// A job that was still queued never started, and is marked interrupted saying so.
 func OpenJobs(dir string) (*Jobs, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -89,10 +97,16 @@ func OpenJobs(dir string) (*Jobs, error) {
 		if json.Unmarshal(b, &job) != nil || string(job.ID) != name {
 			continue
 		}
-		if job.Status == JobRunning {
+		switch job.Status {
+		case JobRunning:
 			now := time.Now().UTC()
 			job.Status, job.Finished = JobInterrupted, &now
 			job.Error = "the daemon stopped while this was running; the host may be part-way through it. Run the apply again: it converges and is safe to repeat."
+			_ = j.persist(&job)
+		case JobQueued:
+			now := time.Now().UTC()
+			job.Status, job.Finished = JobInterrupted, &now
+			job.Error = notStarted
 			_ = j.persist(&job)
 		}
 		j.jobs[job.ID] = &job
@@ -113,7 +127,10 @@ func (j *Jobs) persist(job *Job) error {
 	return os.Rename(tmp, filepath.Join(j.dir, string(job.ID)+".json"))
 }
 
-// prune keeps the newest keepJobs jobs. A running job is never removed.
+// notStarted is the error of a queued job the daemon stopped before it ran.
+const notStarted = "the daemon stopped before this job's turn came, so nothing was done. Run it again."
+
+// prune keeps the newest keepJobs jobs. A running or queued job is never removed.
 func (j *Jobs) prune() {
 	if len(j.jobs) <= keepJobs {
 		return
@@ -124,7 +141,7 @@ func (j *Jobs) prune() {
 	}
 	sort.Slice(all, func(a, b int) bool { return all[a].Created.After(all[b].Created) })
 	for _, job := range all[keepJobs:] {
-		if job.Status == JobRunning {
+		if job.Status == JobRunning || job.Status == JobQueued {
 			continue
 		}
 		delete(j.jobs, job.ID)
@@ -146,16 +163,39 @@ func (j *Jobs) Create(actor, sha, service, planHash string) (Job, error) {
 // CreateKind records a new running job of the given kind ("apply", "instance:put", ...). service is the
 // service or instance the job is about.
 func (j *Jobs) CreateKind(kind, actor, sha, service, planHash string) (Job, error) {
+	return j.create(JobRunning, kind, actor, sha, service, planHash)
+}
+
+// CreateQueued records a job that waits for the host; Start marks it running when its turn comes.
+func (j *Jobs) CreateQueued(kind, actor, sha, service, planHash string) (Job, error) {
+	return j.create(JobQueued, kind, actor, sha, service, planHash)
+}
+
+func (j *Jobs) create(status JobStatus, kind, actor, sha, service, planHash string) (Job, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	now := time.Now().UTC()
-	job := &Job{ID: newJobID(now), Kind: kind, Status: JobRunning, Actor: actor, Sha: sha, Service: service, PlanHash: planHash, Created: now}
+	job := &Job{ID: newJobID(now), Kind: kind, Status: status, Actor: actor, Sha: sha, Service: service, PlanHash: planHash, Created: now}
+	if status == JobRunning {
+		job.Started = &now
+	}
 	if err := j.persist(job); err != nil {
 		return Job{}, err
 	}
 	j.jobs[job.ID] = job
 	j.prune()
 	return *job, nil
+}
+
+// pending reports whether the job has not ended: queued or running.
+func (j Job) pending() bool { return j.Status == JobQueued || j.Status == JobRunning }
+
+// Start marks a queued job running: it has the host.
+func (j *Jobs) Start(id JobID) {
+	j.update(id, func(job *Job) {
+		now := time.Now().UTC()
+		job.Status, job.Started = JobRunning, &now
+	})
 }
 
 // update changes a job's record (its commit, plan or result, once known) and saves it.
@@ -184,6 +224,14 @@ func (j *Jobs) Logf(id JobID, format string, a ...any) {
 		job.Log += line
 	}
 	_ = j.persist(job)
+}
+
+// Interrupt ends a job that never ran (see notStarted).
+func (j *Jobs) Interrupt(id JobID, reason string) {
+	j.update(id, func(job *Job) {
+		now := time.Now().UTC()
+		job.Status, job.Finished, job.Error = JobInterrupted, &now, reason
+	})
 }
 
 // Finish ends a job: succeeded when err is nil, else failed with the error.

@@ -233,20 +233,39 @@ func TestADeployMovesTheDaemonToFleetYmlsPinFirst(t *testing.T) {
 		t.Fatalf("log: %s", j.Log)
 	}
 	b, err := os.ReadFile(p.resume)
-	if err != nil || !strings.Contains(string(b), `"tag":"deploy-1"`) || !strings.Contains(string(b), `"version":"v1.59.0"`) {
+	if err != nil || !strings.Contains(string(b), `"tag":"deploy-1"`) || !strings.Contains(string(b), `"version":"v1.59.0"`) ||
+		!strings.Contains(string(b), `"job":"`+string(j.ID)+`"`) {
 		t.Fatalf("resume record: %s %v", b, err)
 	}
+	if j.Result != ResultDaemonUpgraded || j.Next != "" {
+		t.Fatalf("the upgrading deploy ends as daemon_upgraded, with no next yet: %+v", j)
+	}
+}
+
+// upgradedJob records the deploy job an upgrade ended, as the old binary left it, and a resume record
+// naming it.
+func (p *pinRig) upgradedJob(t *testing.T) JobID {
+	t.Helper()
+	old, _ := p.serverUnderTest.opts.Jobs.CreateKind("deploy", "ci-deploy", "", "deploy-1", "")
+	p.serverUnderTest.opts.Jobs.Finish(old.ID, nil)
+	rec := `{"job":"` + string(old.ID) + `","tag":"deploy-1","version":"v1.59.0","actor":"ci-deploy"}`
+	if err := os.WriteFile(p.resume, []byte(rec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return old.ID
 }
 
 func TestTheUpgradedDaemonResumesTheDeploy(t *testing.T) {
 	p := newPinRig(t, "v1.59.0", "v1.59.0", true)
-	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.59.0","actor":"ci-deploy"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	old := p.upgradedJob(t)
 	p.serverUnderTest.ResumeDeploy()
 	j := p.waitLatest(t, JobSucceeded)
 	if p.appliedCount() != 1 || len(p.upgrades) != 0 || !strings.Contains(j.Log, "resumed on the upgraded daemon") {
 		t.Fatalf("applied %d, upgrades %v, log: %s", p.appliedCount(), p.upgrades, j.Log)
+	}
+	// A client still waiting on the job that upgraded is pointed at this one (remote deploy follows it).
+	if o, _ := p.serverUnderTest.opts.Jobs.Get(old); o.Next != j.ID {
+		t.Fatalf("the upgrading job must name the resumed one: next=%q, resumed %s", o.Next, j.ID)
 	}
 	if _, err := os.Stat(p.resume); !os.IsNotExist(err) {
 		t.Fatal("the resume record is used once")
@@ -255,13 +274,14 @@ func TestTheUpgradedDaemonResumesTheDeploy(t *testing.T) {
 
 func TestARolledBackUpgradeRecordsTheDeployAsFailed(t *testing.T) {
 	p := newPinRig(t, "v1.58.0", "v1.59.0", true)
-	if err := os.WriteFile(p.resume, []byte(`{"tag":"deploy-1","version":"v1.59.0","actor":"ci-deploy"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	old := p.upgradedJob(t)
 	p.serverUnderTest.ResumeDeploy()
 	j := p.waitLatest(t, JobFailed)
 	if p.appliedCount() != 0 || len(p.upgrades) != 0 || !strings.Contains(j.Error, "rolled back") {
 		t.Fatalf("the old binary must not deploy or upgrade again: applied %d, upgrades %v, %+v", p.appliedCount(), p.upgrades, j)
+	}
+	if o, _ := p.serverUnderTest.opts.Jobs.Get(old); o.Next != j.ID {
+		t.Fatalf("the upgrading job must name the failed record, so a waiting client fails too: next=%q", o.Next)
 	}
 	if _, err := os.Stat(p.resume); !os.IsNotExist(err) {
 		t.Fatal("the resume record is used once")

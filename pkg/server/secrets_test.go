@@ -181,13 +181,40 @@ func TestASecretsScopeNamesOnlyServiceSecretsAndOnlySecrets(t *testing.T) {
 	if !ok.AllowsSecret("SERVICE_CREW_GOOGLE_KEY") || ok.AllowsSecret("SERVICE_GITEA_OTHER") || ok.AllowsSecret("DO_API_TOKEN") {
 		t.Fatal("AllowsSecret must follow the patterns")
 	}
-	// A plain deployer still cannot sync anything.
+	// A plain deployer -- the configuration repository's one CI token -- syncs service secrets, prunes only
+	// them, and never touches the daemon's own credentials.
 	rig := newAdminRig(t)
 	store, _ := OpenSecretStore(filepath.Join(t.TempDir(), "secrets.json"))
+	if _, _, err := store.Sync(map[string]string{"NATIVE_OPS_GIT_TOKEN": "git", "SERVICE_OLD": "old"}, false, "admin"); err != nil {
+		t.Fatal(err)
+	}
 	rig.srv.opts.Secrets = store
 	rig.reload(t)
-	deployer, _, _ := rig.tokens.Create("ci-deploy", RoleDeployer)
-	if code, _, _ := rig.call(t, "PUT", "/v1/secrets", deployer, map[string]any{"secrets": map[string]string{"SERVICE_CREW_X": "v"}}); code != http.StatusForbidden {
-		t.Fatalf("an unscoped deployer must not sync secrets: %d", code)
+	deployer, _, _ := rig.tokens.Create("ci", RoleDeployer)
+	code, out, _ := rig.call(t, "PUT", "/v1/secrets", deployer, map[string]any{"secrets": map[string]string{"SERVICE_CREW_X": "v"}, "prune": true})
+	if code != http.StatusOK || toJSON(out["removed"]) != `["SERVICE_OLD"]` {
+		t.Fatalf("a deployer syncs and prunes service secrets: %d %v", code, out)
+	}
+	if listed := toJSON(out["secrets"]); strings.Contains(listed, "NATIVE_OPS_GIT_TOKEN") {
+		t.Fatalf("a deployer sees only service secrets: %s", listed)
+	}
+	if v, _ := store.Get("NATIVE_OPS_GIT_TOKEN"); v != "git" {
+		t.Fatal("a deployer's prune removed the daemon's own credential")
+	}
+	for _, name := range []string{"NATIVE_OPS_GIT_TOKEN", "DO_API_TOKEN", "NATIVE_OPS_BACKUP_ENDPOINT"} {
+		if code, _, _ := rig.call(t, "PUT", "/v1/secrets", deployer, map[string]any{"secrets": map[string]string{name: "evil"}}); code != http.StatusForbidden {
+			t.Errorf("a deployer set %s: %d", name, code)
+		}
+	}
+	if v, _ := store.Get("NATIVE_OPS_GIT_TOKEN"); v != "git" {
+		t.Fatal("the daemon's own credential was changed")
+	}
+	// Still not the list or a delete (admin), and not for a planner.
+	if code, _, _ := rig.call(t, "GET", "/v1/secrets", deployer, nil); code != http.StatusForbidden {
+		t.Errorf("a deployer listed the secrets: %d", code)
+	}
+	planner, _, _ := rig.tokens.Create("pr", RolePlanner)
+	if code, _, _ := rig.call(t, "PUT", "/v1/secrets", planner, map[string]any{"secrets": map[string]string{"SERVICE_CREW_X": "v"}}); code != http.StatusForbidden {
+		t.Errorf("a planner synced a secret: %d", code)
 	}
 }

@@ -104,9 +104,9 @@ The daemon (runs on each host; CI drives it over HTTPS):
   serve            Run the authenticated API + UI daemon (needs a state dir; see README)
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
-  remote           Drive a daemon from CI: plan, apply, deploy, backup, restore, wait,
-                   token-create, recipe-approve, secret-sync, daemon-upgrade, deploy,
-                   image-prune
+  remote           Drive a daemon from CI: plan, deploy, deploy-plan, deploys, image-build,
+                   image-prune, secret-sync, wait, apply, backup, restore, token-create,
+                   recipe-approve, daemon-upgrade
                    (NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
 
 Core Commands:
@@ -496,10 +496,14 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
 
 - **Setting a host up without logging in.** `native-ops host create --daemon-version vX.Y.Z
   --daemon-sha256 <sha>` has cloud-init install and start the daemon, with only the SHA-256 of a
-  bootstrap admin token (`NATIVE_OPS_BOOTSTRAP_TOKEN` in the caller's environment). CI then creates
-  every other token over the API: `native-ops remote token-create --name ci-plan --role planner`.
-- **Changes are gated.** An apply runs only a plan an admin approved; an image build runs only a
-  recipe (`scripts/` + `images/`) an admin approved; a scoped token can touch only its own instances.
+  bootstrap admin token (`NATIVE_OPS_BOOTSTRAP_TOKEN` in the caller's environment). An admin then creates
+  the configuration repository's one CI token over the API: `native-ops remote token-create --name ci
+  --role deployer`, stored there as `NATIVE_OPS_TOKEN` for every workflow.
+- **Changes are gated.** A deploy runs only a commit a protected tag points at; an apply runs only a plan
+  an admin approved; an image build runs only a recipe (`scripts/` + `images/`) a protected tag or an admin
+  approved; a scoped token can touch only its own instances.
+- **One change at a time, in order.** A change asked for while another runs waits in line (job status
+  `queued`) instead of failing, so pipelines that fire together all succeed.
 - **Maintenance is CI-scheduled.** Backups and retention are daemon jobs a scheduled pipeline starts
   (`native-ops remote backup --prune`).
 - **The network is in the plan.** `fleet.yml`'s `dns_records`, the repo's `edge/Caddyfile` and each
