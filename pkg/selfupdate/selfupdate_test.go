@@ -7,12 +7,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -164,5 +166,30 @@ func TestTheShippedUnitCarriesTheGuard(t *testing.T) {
 	}
 	if !strings.Contains(string(unit), "ExecStart=/var/lib/native-ops/bin/native-ops serve") {
 		t.Fatal("the unit must start the binary in the state directory, which the daemon can replace")
+	}
+}
+
+// A binary still open for writing somewhere (a process forked while the daemon was writing it holds the
+// descriptor until it execs) cannot be executed: ETXTBSY. The check waits it out instead of failing.
+func TestTheVersionCheckWaitsOutATextFileBusy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "native-ops.new")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho native-ops v9.9.9\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := os.OpenFile(path, os.O_WRONLY, 0) // a writer, as the forked child would be
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait := textBusyWait
+	textBusyWait = 20 * time.Millisecond
+	t.Cleanup(func() { textBusyWait = wait })
+	if _, err := exec.Command(path, "version").CombinedOutput(); !errors.Is(err, syscall.ETXTBSY) {
+		holder.Close()
+		t.Skipf("this system does not refuse to run a file open for writing: %v", err)
+	}
+	go func() { time.Sleep(150 * time.Millisecond); holder.Close() }()
+	out, err := runVersion(context.Background(), path)
+	if err != nil || !strings.Contains(string(out), "v9.9.9") {
+		t.Fatalf("the check must succeed once the writer is gone: %q %v", out, err)
 	}
 }
