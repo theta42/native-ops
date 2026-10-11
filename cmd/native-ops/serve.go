@@ -125,7 +125,8 @@ func handleServeCommand(ctx context.Context, args []string) {
 	imageOrphanAge := flags.Duration("image-orphan-age", 24*time.Hour, "Image retention: how old an image with no alias that no instance runs must be before POST /v1/images/prune deletes it (an image a build displaces goes at once); 0 keeps them")
 	imagePruneEvery := flags.Duration("image-prune-interval", envDuration("NATIVE_OPS_IMAGE_PRUNE_INTERVAL", 12*time.Hour), "Image retention: how often the daemon applies it by itself, as a recorded job (the same rule as POST /v1/images/prune: nothing an instance runs is deleted), because a build leaves the image it displaced while an instance still runs it and nothing else would ever delete it; 0 turns it off. Needs --enable-image-build. Env: NATIVE_OPS_IMAGE_PRUNE_INTERVAL")
 	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "app-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
-	gitURL := flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server (Gitea) holding the configuration repository, e.g. https://git.example.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
+	gitURL := flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server holding the configuration repository, e.g. https://git.example.com (Gitea) or https://github.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
+	gitProvider := flags.String("git-provider", envOr("NATIVE_OPS_GIT_PROVIDER", ""), "The API --git-url speaks: gitea, or github (GitHub, or GitHub Enterprise Server at --git-url). Default: github for https://github.com, else gitea. Env: NATIVE_OPS_GIT_PROVIDER")
 	deployRepo := flags.String("deploy-repo", envOr("NATIVE_OPS_DEPLOY_REPO", ""), "The configuration repository on --git-url, as owner/name: a protected deploy tag there deploys its commit. Env: NATIVE_OPS_DEPLOY_REPO")
 	deployTags := flags.String("deploy-tags", envOr("NATIVE_OPS_DEPLOY_TAGS", "deploy-*"), "Glob of the tags that deploy; the repository must protect them. Env: NATIVE_OPS_DEPLOY_TAGS")
 	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Retired: edge/Caddyfile is part of the plan and changes with a deploy tag. Accepted so an old unit still starts")
@@ -172,6 +173,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		ImagePrefix:      *imagePrefix,
 		ImageRetention:   engine.ImageRetention{Prefix: *imagePrefix, KeepTags: *imageKeep, OrphanAge: *imageOrphanAge},
 		GitURL:           *gitURL,
+		GitProvider:      *gitProvider,
 		DeployRepo:       *deployRepo,
 		DeployTags:       *deployTags,
 		EnableBackup:     *enableBackup,
@@ -242,6 +244,7 @@ type daemonConfig struct {
 	// GitURL, DeployRepo and DeployTags, with EnableApply, enable POST /v1/deploy (see pkg/gitsource);
 	// the git server's token is the secret NATIVE_OPS_GIT_TOKEN.
 	GitURL       string
+	GitProvider  string // gitea or github; empty: from GitURL
 	DeployRepo   string
 	DeployTags   string
 	EnableBackup bool
@@ -364,7 +367,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 				audit.Close()
 				return nil, nil, errors.New("--git-url/--deploy-repo deploy tags by applying them: they need --enable-apply")
 			}
-			src := &gitsource.Source{BaseURL: cfg.GitURL, Repo: cfg.DeployRepo, TagPattern: cfg.DeployTags,
+			src := &gitsource.Source{BaseURL: cfg.GitURL, Provider: cfg.GitProvider, Repo: cfg.DeployRepo, TagPattern: cfg.DeployTags,
 				Token: func() string { return lookup("NATIVE_OPS_GIT_TOKEN") }}
 			if err := src.Validate(); err != nil {
 				audit.Close()

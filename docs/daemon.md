@@ -254,7 +254,8 @@ ends with, and what to do when one fails.
 
 1. resolves the tag on the git server, and checks that a **tag protection rule** covers it, so only the
    people the repository allows could have pushed it (a rule the daemon cannot read, or no rule, stops
-   the deploy);
+   the deploy). On GitHub that is an active **tag ruleset** that covers the tag and restricts both
+   creations and updates (see [The git server](#the-git-server));
 2. **downloads that commit's tree from the git server**: the caller sends only the tag name, so a CI job
    (or a leaked deployer token) cannot make the daemon apply anything but a tagged commit;
 3. plans it -- the services **and the network they share** (DNS records, the edge's Caddyfile; see
@@ -262,6 +263,21 @@ ends with, and what to do when one fails.
    plan as approved by the tag and used by the job;
 4. applies exactly that plan: the network first, then the services. A plan with nothing to change ends
    the job without touching anything.
+
+### The git server
+
+`--git-url` names the server; `--git-provider` the API it speaks (by default `github` for
+`https://github.com`, else `gitea`). The daemon reads the tag, its protection and the commit's archive with
+the token `NATIVE_OPS_GIT_TOKEN` from its secret store (an admin syncs it), and never writes.
+
+| | Gitea | GitHub (and GitHub Enterprise Server: `--git-provider github --git-url https://ghe.example.com`) |
+|---|---|---|
+| Protect the tags | Settings → Tags: a protected tag pattern (e.g. `deploy-*`) naming who may push | Settings → Rules → Rulesets: a **tag** ruleset, enforcement **Active**, targeting `refs/tags/deploy-*`, with **Restrict creations** and **Restrict updates**, and the people who may deploy in its bypass list. A ruleset in evaluate mode, or one that only restricts deletion, does not protect a tag |
+| The token | a user who is an admin of the repository (only an admin can read tag protections), scoped to read the repository | a fine-grained token on the repository with **Contents: read** and **Metadata: read** (rulesets are read with Metadata) |
+| The tag | lightweight or annotated | lightweight or annotated (followed to its commit); a branch of the same name is never taken for it |
+
+The archive GitHub answers with is a redirect to another host, whose URL carries its own access; the
+daemon never sends the token beyond the API host.
 
 ### The network is in the plan
 
@@ -786,7 +802,8 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--image-prune-interval` | `NATIVE_OPS_IMAGE_PRUNE_INTERVAL` | `12h` | how often the daemon applies image retention by itself (0: never) |
 | `--image-orphan-age` | | `24h` | how old an unaliased image no instance runs must be before a prune deletes it |
 | `--enable-edge-apply` | | off | retired, does nothing (the edge's Caddyfile is in the plan); still accepted so an old unit starts |
-| `--git-url` | `NATIVE_OPS_GIT_URL` | none | the git server (Gitea) holding the configuration repository; with `--deploy-repo` and `--enable-apply`, `POST /v1/deploy` |
+| `--git-url` | `NATIVE_OPS_GIT_URL` | none | the git server (Gitea, GitHub or GitHub Enterprise Server) holding the configuration repository; with `--deploy-repo` and `--enable-apply`, `POST /v1/deploy` |
+| `--git-provider` | `NATIVE_OPS_GIT_PROVIDER` | from the URL | `gitea` or `github`; default `github` for `https://github.com`, else `gitea` ([The git server](#the-git-server)) |
 | `--deploy-repo` | `NATIVE_OPS_DEPLOY_REPO` | none | the configuration repository there, as `owner/name` |
 | `--deploy-tags` | `NATIVE_OPS_DEPLOY_TAGS` | `deploy-*` | the tags that deploy; the repository must protect them |
 | `--enable-backup` | | off | `POST /v1/backups` and `/v1/backups/restore` |

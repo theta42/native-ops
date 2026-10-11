@@ -14,7 +14,7 @@
   - **Level 1 (Incus & Edge Workloads)**: Declarative service deployments, template-driven dynamic tenant instances, storage volume management (`security.shifted=true`), cgroup live resizing, and automated health checks.
   - **Level 2 (Workload Mobility)**: Cross-host container and volume migration (`native-ops instance migrate`) across cloud providers and on-prem nodes.
 - **Pluggable DNS Architecture**: Native DigitalOcean DNS support + extensible Python/Bash script plugins (`providers/dns/*.py`) defined in user configuration repos.
-- **Git + CI is the only control path**: nobody installs or runs a control app on their own machine. A pull request plans, an admin approves the exact plan, and the merge applies it -- all from CI (GitHub Actions, Gitea Actions) talking over HTTPS to the **native-ops daemon that runs on each host**. CI never holds an SSH key.
+- **Git + CI is the only control path**: nobody installs or runs a control app on their own machine. A pull request plans, and pushing a protected deploy tag deploys that commit (the daemon reads it from Gitea or GitHub itself; or an admin approves an exact plan and CI applies it) -- all from CI (GitHub Actions, Gitea Actions) talking over HTTPS to the **native-ops daemon that runs on each host**. CI never holds an SSH key.
 - **Edge caching and rate limiting per route**: a manifest's `routing.cache` and `routing.rate_limit` become Caddy configuration for that route only.
 - **Immutable Container Lifecycle**: Rebuild and replace, never live patch. Automated volume snapshotting before updates.
 - **One static Go binary**: the same binary is the daemon on the host and the client in CI (`native-ops remote ...`).
