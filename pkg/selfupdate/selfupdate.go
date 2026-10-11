@@ -30,6 +30,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -145,7 +146,7 @@ func (u *Updater) Install(ctx context.Context, version, sha string, logf func(st
 	// The new binary must run here and say it is the version asked for.
 	vctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(vctx, newPath, "version").CombinedOutput()
+	out, err := runVersion(vctx, newPath)
 	if err != nil || !strings.Contains(string(out), version) {
 		return fmt.Errorf("the new binary does not run here or is not %s (%v): %s; nothing was changed", version, err, strings.TrimSpace(string(out)))
 	}
@@ -167,6 +168,30 @@ func (u *Updater) Install(ctx context.Context, version, sha string, logf func(st
 	logf("installed %s; the previous binary is kept as %s and is restored if the new one cannot stay up", version, PrevName)
 	return nil
 }
+
+// runVersion runs a freshly written binary's `version`. Executing a file just written can fail with
+// ETXTBSY ("text file busy") when another goroutine forked a process (the daemon runs commands all the
+// time) while the file was still open for writing: the child holds the descriptor until it execs. It is
+// over in moments, so it is retried rather than failing the upgrade (opsavor's deploy-2026.10.11.14).
+func runVersion(ctx context.Context, path string) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		out, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
+		if err == nil || !errors.Is(err, syscall.ETXTBSY) || attempt >= textBusyRetries {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return out, err
+		case <-time.After(textBusyWait):
+		}
+	}
+}
+
+// How often, and how long apart, a busy new binary is tried again (variables so tests can shorten them).
+var (
+	textBusyRetries = 20
+	textBusyWait    = 100 * time.Millisecond
+)
 
 // Commit marks a pending upgrade done, once the new binary has served for CommitAfter. It is called at
 // startup; it returns at once when there is nothing pending.
