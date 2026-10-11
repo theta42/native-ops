@@ -37,9 +37,13 @@ one, a required check is either unsatisfiable (blocks everything) or absent.
 
 Publish releases as **tags**, and protect the tag pattern:
 
-- Protect e.g. `app-v*` (and `manager-v*`, …).
+- Protect e.g. `app-v*` (and `manager-v*`, …), and the configuration repository's `deploy-*`.
 - Whitelist only the people allowed to cut a release.
 - Production deploys run **only on tags** — never on a branch push.
+- **Gitea:** Settings → Tags, a protected tag pattern. **GitHub:** a tag *ruleset* (Settings → Rules),
+  enforcement Active, with *Restrict creations* and *Restrict updates* and the release people in its
+  bypass list. The native-ops daemon checks this before a deploy tag deploys, and refuses a tag no such
+  rule covers.
 
 Combined with branch protection, this means production is touched only by an
 authorized person performing a deliberate act.
