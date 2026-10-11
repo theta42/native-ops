@@ -18,6 +18,7 @@ jobs:
       - name: Install native-ops (pinned, checksum verified)
         run: |
           set -euo pipefail
+          cd "$(mktemp -d)"   # outside the checkout: the tree a plan or build uploads must not carry the tool
           curl -fsSL --proto '=https' --tlsv1.2 -o native-ops.tgz \
             "https://github.com/theta42/native-ops/releases/download/${NATIVE_OPS_VERSION}/native-ops_${NATIVE_OPS_VERSION}_linux_amd64.tar.gz"
           echo "${NATIVE_OPS_SHA256}  native-ops.tgz" | sha256sum -c -
@@ -27,7 +28,7 @@ jobs:
       - run: native-ops validate --config-dir .
       - name: Plan against the host (changes nothing)
         env:
-          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_PLAN_TOKEN }}   # a planner token
+          NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_TOKEN }}   # the repository's one deployer token (planning changes nothing)
         run: |
           set -euo pipefail
           # exits 1 only when the plan is blocked (apply would fail); the last line is "plan <hash>"

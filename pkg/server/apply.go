@@ -30,7 +30,8 @@ const maxApplyDuration = 30 * time.Minute
 //     409 and the new plan, unless the plan it just made from this upload has that hash. What the
 //     caller saw is what runs; if the host or the tree changed since, nothing is touched.
 //   - A blocked plan is never applied, and a plan with nothing to change starts no job.
-//   - One apply at a time on this host (409 while one runs), enforced before the upload is read.
+//   - It needs the host free: 409 while another change runs or waits (an apply cannot wait in line, see
+//     queue.go), checked before the upload is read.
 //   - It runs as a job that outlives the request: 202 with the job, whose progress and outcome
 //     are at /v1/jobs/{id} and are kept on disk.
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -39,19 +40,17 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "expect is required: the 64-character hash of the plan you reviewed (from /v1/plan)")
 		return
 	}
-	if !s.applyMu.TryLock() {
-		msg := "an apply is already running on this host"
-		if j, ok := s.opts.Jobs.Running(); ok {
-			msg += " (" + string(j.ID) + ")"
-		}
-		auditDetail(r, "apply rejected: busy")
-		writeError(w, http.StatusConflict, "busy", msg)
+	// An apply checks the plan against the host as it is now and uses its approval up, so it cannot wait
+	// in line: it takes the host only if nothing runs or waits (see queue.go), and holds it while it plans.
+	t, free := s.queue.tryTicket()
+	if !free {
+		s.answerNotStarted(w, r, "apply", errBusy(s.busyMessage()))
 		return
 	}
 	handedOff := false
 	defer func() {
 		if !handedOff {
-			s.applyMu.Unlock()
+			s.queue.release()
 		}
 	}()
 
@@ -109,87 +108,216 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
 		actor = h.name
 	}
-	job, err := s.opts.Jobs.Create(actor, u.sha, u.service, hash)
+	handedOff = true // launch releases the host from here on, whatever happens
+	job, err := s.launch(t, jobSpec{
+		kind: "apply", actor: actor, sha: u.sha, subject: u.service, planHash: hash,
+		what: "apply of plan " + hash[:12], audit: "apply", cleanup: u.discard,
+		// One approval, one apply: it is used up here, before anything runs. This request holds the host,
+		// so no other apply can have used it since Check.
+		prepare: func(job Job) error {
+			if err := s.opts.Plans.Consume(hash, job.ID); err != nil {
+				return fmt.Errorf("the approval could not be used: %v", err)
+			}
+			return nil
+		},
+		work: func(ctx context.Context, logf func(string, ...any)) error {
+			return s.opts.Apply(ctx, u.root, fp, logf)
+		},
+	})
 	if err != nil {
-		log.Printf("apply: create job: %v", err)
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was applied")
-		return
-	}
-	// One approval, one apply: it is used up here, before anything runs. The apply lock is held, so no
-	// other apply can have used it since Check.
-	if err := s.opts.Plans.Consume(hash, job.ID); err != nil {
-		s.opts.Jobs.Finish(job.ID, fmt.Errorf("the approval could not be used: %v", err))
-		writeError(w, http.StatusInternalServerError, "internal", "could not use the approval, so nothing was applied")
+		log.Printf("apply: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal", "could not record the job or use the approval, so nothing was applied")
 		return
 	}
 	auditDetail(r, "apply job=%s sha=%s service=%s hash=%s", job.ID, orDash(u.sha), orDash(u.service), hash[:12])
-	handedOff = true
-	s.runApply(job.ID, actor, u, fp) // returns at once: the job runs in the background
+	answerJob(w, job, map[string]any{"hash": hash, "plan": fp, "text": fp.Render()})
+}
 
+// jobSpec is a change to run as a job.
+type jobSpec struct {
+	kind, actor, sha, subject, planHash string
+	what                                string // what the job is, for its log: "build crew@main"
+	audit                               string // how its end is named in the audit log
+	cleanup                             func() // run when the job ends (or will never run), before the host is released
+	// prepare, when set, runs before the job is handed to the background, with the job recorded; an
+	// error ends the job as failed before anything else happens.
+	prepare func(Job) error
+	work    func(ctx context.Context, logf func(string, ...any)) error
+}
+
+type jobIDKey struct{}
+
+// jobIDOf is the job a job's work runs as.
+func jobIDOf(ctx context.Context) JobID {
+	id, _ := ctx.Value(jobIDKey{}).(JobID)
+	return id
+}
+
+// queueJob records a change and runs it when the host is free: at once if it is, else after the
+// changes queued before it (see queue.go). It fails only when the queue is full, the daemon is
+// stopping or the job cannot be recorded; the caller answers with answerNotStarted.
+func (s *Server) queueJob(spec jobSpec) (Job, error) {
+	t, err := s.queue.enqueue()
+	if err != nil {
+		return Job{}, err
+	}
+	return s.launch(t, spec)
+}
+
+// runJobNow is queueJob for a change that cannot wait in line: errBusy unless the host is free.
+func (s *Server) runJobNow(spec jobSpec) (Job, error) {
+	t, ok := s.queue.tryTicket()
+	if !ok {
+		return Job{}, errBusy(s.busyMessage())
+	}
+	return s.launch(t, spec)
+}
+
+// busyMessage says what the host is doing, for a change that needed it free.
+func (s *Server) busyMessage() string {
+	msg := "another change is already running on this host"
+	if j, ok := s.opts.Jobs.Running(); ok {
+		msg += " (" + string(j.ID) + ")"
+	}
+	if n := s.queue.waitingCount(); n > 0 {
+		msg += fmt.Sprintf(" and %d more wait for it", n)
+	}
+	return msg
+}
+
+// answerNotStarted answers a request whose job could not be queued or started.
+func (s *Server) answerNotStarted(w http.ResponseWriter, r *http.Request, what string, err error) {
+	var busy errBusy
+	switch {
+	case errors.As(err, &busy):
+		auditDetail(r, "%s rejected: busy", what)
+		writeError(w, http.StatusConflict, "busy", busy.Error())
+	case errors.Is(err, errQueueFull):
+		auditDetail(r, "%s rejected: queue full", what)
+		w.Header().Set("Retry-After", "30")
+		writeError(w, http.StatusTooManyRequests, "queue_full", fmt.Sprintf("%d changes are already waiting for this host; retry shortly", maxQueuedJobs))
+	case errors.Is(err, errQueueClosed):
+		w.Header().Set("Retry-After", "10")
+		writeError(w, http.StatusServiceUnavailable, "stopping", "the daemon is stopping; retry in a moment")
+	default:
+		log.Printf("%s: %v", what, err)
+		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was done")
+	}
+}
+
+// answerJob answers 202 with a job that was queued or started.
+func answerJob(w http.ResponseWriter, job Job, extra map[string]any) {
+	out := map[string]any{"job": job}
+	for k, v := range extra {
+		out[k] = v
+	}
 	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "hash": hash, "plan": fp, "text": fp.Render()})
+	writeJSON(w, http.StatusAccepted, out)
 }
 
-// runApply runs one apply job to its end and releases everything the request handed to it.
-func (s *Server) runApply(id JobID, actor string, u *upload, fp *engine.FleetPlan) {
-	s.startJob(id, actor, "apply of plan "+fp.Hash()[:12], "apply", u.discard, func(ctx context.Context, logf func(string, ...any)) error {
-		return s.opts.Apply(ctx, u.root, fp, logf)
-	})
-}
+// launch records the job of a ticket and runs it in the background when the ticket is granted. The host
+// is released, and cleanup run, BEFORE the job is reported finished: a client that sees "succeeded" and
+// starts the next change must find the host free (or its own change next in line), not still taken by a
+// job that is over.
+func (s *Server) launch(t *ticket, spec jobSpec) (Job, error) {
+	job, err := s.opts.Jobs.CreateQueued(spec.kind, spec.actor, spec.sha, spec.subject, spec.planHash)
+	if err != nil {
+		s.queue.abandon(t)
+		if spec.cleanup != nil {
+			spec.cleanup()
+		}
+		return Job{}, err
+	}
+	s.queue.name(t, job.ID)
+	// end finishes the job. release is false only for a job that gave its place in line up (abandon) and
+	// so holds nothing to release.
+	end := func(err error, release bool) {
+		if spec.cleanup != nil {
+			spec.cleanup()
+		}
+		if release {
+			s.queue.release()
+		}
+		s.opts.Jobs.Finish(job.ID, err)
+		outcome, code := "succeeded", http.StatusOK
+		if err != nil {
+			outcome, code = "failed", http.StatusInternalServerError
+		}
+		s.opts.Audit.Log(AuditEntry{Time: time.Now().UTC(), Actor: spec.actor, Method: "JOB", Path: "/v1/jobs/" + string(job.ID), Status: code, Detail: spec.audit + " " + outcome})
+	}
+	if t.granted {
+		s.opts.Jobs.Start(job.ID)
+	}
+	if spec.prepare != nil {
+		if err := spec.prepare(job); err != nil {
+			if t.granted {
+				end(err, true)
+			} else {
+				s.queue.abandon(t) // its place in line, or the host if it was handed over meanwhile
+				end(err, false)
+			}
+			return Job{}, err
+		}
+	}
+	if job, _ = s.opts.Jobs.Get(job.ID); !t.granted {
+		job.Position = s.queue.position(job.ID)
+	}
+	job.Log = ""
 
-// startJob runs work as the job id in the background. The caller holds the host lock (applyMu); it is
-// released, and cleanup run, BEFORE the job is reported finished: a client that sees "succeeded" and
-// starts the next change must find the host free, not a 409 for a job that is over. what says what the
-// job is, for its log; audit is how its end is named in the audit log.
-func (s *Server) startJob(id JobID, actor, what, audit string, cleanup func(), work func(ctx context.Context, logf func(string, ...any)) error) {
 	s.jobsWG.Add(1)
 	go func() {
 		defer s.jobsWG.Done()
-		logf := func(format string, a ...any) { s.opts.Jobs.Logf(id, format, a...) }
+		if !<-t.ch {
+			// The daemon is stopping and this never got the host: nothing ran, and nothing is released.
+			if spec.cleanup != nil {
+				spec.cleanup()
+			}
+			s.opts.Jobs.Interrupt(job.ID, notStarted)
+			s.opts.Audit.Log(AuditEntry{Time: time.Now().UTC(), Actor: spec.actor, Method: "JOB", Path: "/v1/jobs/" + string(job.ID), Status: http.StatusServiceUnavailable, Detail: spec.audit + " not started"})
+			return
+		}
+		if !t.granted {
+			s.opts.Jobs.Start(job.ID)
+		}
+		logf := func(format string, a ...any) { s.opts.Jobs.Logf(job.ID, format, a...) }
 		var err error
 		func() {
 			defer func() {
 				if p := recover(); p != nil {
-					err = fmt.Errorf("%s panicked: %v", what, p)
-					log.Printf("job %s: panic: %v", id, p)
+					err = fmt.Errorf("%s panicked: %v", spec.what, p)
+					log.Printf("job %s: panic: %v", job.ID, p)
 				}
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), maxApplyDuration)
+			ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), jobIDKey{}, job.ID), maxApplyDuration)
 			defer cancel()
-			logf("%s started by %s", what, actor)
-			err = work(ctx, logf)
+			if !t.granted {
+				logf("%s started by %s (it waited %s for the host)", spec.what, spec.actor, time.Since(job.Created).Round(time.Second))
+			} else {
+				logf("%s started by %s", spec.what, spec.actor)
+			}
+			err = spec.work(ctx, logf)
 		}()
 		if err != nil {
 			logf("FAILED: %v", err)
 		} else {
 			logf("done")
 		}
-
-		if cleanup != nil {
-			cleanup()
-		}
-		s.applyMu.Unlock()
-
-		s.opts.Jobs.Finish(id, err)
-		outcome, code := "succeeded", http.StatusOK
-		if err != nil {
-			outcome, code = "failed", http.StatusInternalServerError
-		}
-		s.opts.Audit.Log(AuditEntry{Time: time.Now().UTC(), Actor: actor, Method: "JOB", Path: "/v1/jobs/" + string(id), Status: code, Detail: audit + " " + outcome})
+		end(err, true)
 	}()
+	return job, nil
 }
 
 // handleJobs is GET /v1/jobs?kind=&status=&limit=: the recent jobs, newest first, without logs. kind is a
 // job kind ("deploy", "apply", "image:build"), or a family of them ending in a colon ("instance:");
-// status is running, succeeded, failed or interrupted. A token with a scope sees only its own jobs (see
+// status is queued, running, succeeded, failed or interrupted. A token with a scope sees only its own jobs (see
 // scopeSees).
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	kind, status := q.Get("kind"), JobStatus(q.Get("status"))
 	switch status {
-	case "", JobRunning, JobSucceeded, JobFailed, JobInterrupted:
+	case "", JobQueued, JobRunning, JobSucceeded, JobFailed, JobInterrupted:
 	default:
-		writeError(w, http.StatusBadRequest, "bad_request", "status must be running, succeeded, failed or interrupted")
+		writeError(w, http.StatusBadRequest, "bad_request", "status must be queued, running, succeeded, failed or interrupted")
 		return
 	}
 	limit, ok := queryLimit(w, r, keepJobs)
@@ -204,6 +332,9 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 			kind != "" && j.Kind != kind && !(strings.HasSuffix(kind, ":") && strings.HasPrefix(j.Kind, kind)),
 			status != "" && j.Status != status:
 			continue
+		}
+		if j.Status == JobQueued {
+			j.Position = s.queue.position(j.ID)
 		}
 		if out = append(out, j); len(out) == limit {
 			break
@@ -226,8 +357,9 @@ func scopeSees(scope *Scope, actor string, j Job) bool {
 const maxJobWait = 60 * time.Second
 
 // handleJob is GET /v1/jobs/{id}?wait=<seconds>. The log (which can hold whatever a hook printed) is for
-// deployers and admins; a viewer sees the outcome. With wait (up to 60), a running job is answered when it
-// ends or when the wait is over, whichever is first, so a client need not poll.
+// deployers and admins; a viewer sees the outcome. With wait (up to 60), a queued or running job is
+// answered when it ends or when the wait is over, whichever is first, so a client need not poll. A queued
+// job's position says where it is in line.
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validJobID(id) {
@@ -244,7 +376,7 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 		wait = time.Duration(n) * time.Second
 	}
 	job, ok := s.opts.Jobs.Get(JobID(id))
-	for deadline := time.Now().Add(wait); ok && job.Status == JobRunning && time.Now().Before(deadline); {
+	for deadline := time.Now().Add(wait); ok && job.pending() && time.Now().Before(deadline); {
 		select {
 		case <-r.Context().Done():
 			return
@@ -262,10 +394,14 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	if h, ok := r.Context().Value(actorKey{}).(*actorHolder); !ok || !h.role.Allows(RoleDeployer) {
 		job.Log = ""
 	}
+	if job.Status == JobQueued {
+		job.Position = s.queue.position(job.ID)
+	}
 	writeJSON(w, http.StatusOK, job)
 }
 
-// WaitForJobs waits, up to timeout, for a running apply to finish, so a shutdown does not cut one off.
+// WaitForJobs waits, up to timeout, for a running job to finish, so a shutdown does not cut one off. Jobs
+// still queued end at once when the queue is closed (Serve closes it first).
 func (s *Server) WaitForJobs(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() { s.jobsWG.Wait(); close(done) }()

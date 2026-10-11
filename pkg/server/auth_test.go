@@ -197,6 +197,36 @@ func TestOIDCRejectsUnverifiedEmailAndWrongDomain(t *testing.T) {
 	}
 }
 
+// With Google, an address at the domain proves nothing on its own: anyone can open a personal Google
+// account on their work address. Only an account the Workspace domain owns carries its hd.
+func TestOIDCAllowedDomainNeedsTheHostedDomainWithGoogle(t *testing.T) {
+	const google = "https://accounts.google.com"
+	for _, c := range []struct {
+		email, hd, issuer string
+		ok                bool
+	}{
+		{"will@opsavor.ai", "opsavor.ai", google, true},
+		{"will@opsavor.ai", "", google, false}, // a personal account on the work address
+		{"will@opsavor.ai", "elsewhere.com", google, false},
+		{"will@opsavor.ai", "", "https://sso.example.com", true}, // a provider that sends no hd
+		{"will@opsavor.ai", "elsewhere.com", "https://sso.example.com", false},
+		{"will@gmail.com", "", google, false},
+	} {
+		if err := inAllowedDomain(c.email, c.hd, c.issuer, "opsavor.ai"); (err == nil) != c.ok {
+			t.Errorf("%s hd=%q from %s: %v", c.email, c.hd, c.issuer, err)
+		}
+	}
+	if err := inAllowedDomain("anyone@gmail.com", "", google, ""); err != nil {
+		t.Errorf("no allowed domain allows any verified email: %v", err)
+	}
+	// End to end: a provider that says the account belongs elsewhere is refused.
+	idp := fakeIdP(t, map[string]any{"email": "will@opsavor.ai", "email_verified": true, "hd": "elsewhere.com"})
+	cfg, _ := NewOIDC(OIDCSettings{Issuer: idp.URL, ClientID: "c", ClientSecret: "s", RedirectURL: idp.URL + "/cb", AllowedDomain: "opsavor.ai"})
+	if _, err := cfg.Identity(context.Background(), "at-123"); err == nil {
+		t.Fatal("an account of another organization was accepted")
+	}
+}
+
 func TestLoginSetsACookieAndTheAPIHonoursIt(t *testing.T) {
 	dir := t.TempDir()
 	tokens, _ := OpenTokenStore(filepath.Join(dir, "tokens.json"))
@@ -302,6 +332,57 @@ func TestLoginSetsACookieAndTheAPIHonoursIt(t *testing.T) {
 	_ = json.NewDecoder(sres.Body).Decode(&sm)
 	if sm["local_signin"] != true {
 		t.Fatalf("session methods: %v", sm)
+	}
+
+	// A page on a sibling subdomain is "same site", so the browser sends the Lax cookie with its POST: a
+	// change made with the cookie must come from the daemon's own origin. Reads are not affected.
+	send := func(method, path string, headers map[string]string) int {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(`{"name":"x","role":"viewer"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(cookie)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+	host := strings.TrimPrefix(ts.URL, "http://")
+	for _, h := range []map[string]string{
+		{"Sec-Fetch-Site": "same-site", "Origin": "https://tenant.example.com"},
+		{"Sec-Fetch-Site": "cross-site"},
+		{"Origin": "https://tenant.example.com"},
+	} {
+		if code := send("POST", "/v1/tokens", h); code != http.StatusForbidden {
+			t.Errorf("a cookie-authenticated change from %v: %d", h, code)
+		}
+	}
+	// From the daemon's own page it reaches the handler (a deployer may not create tokens: 403 forbidden,
+	// not cross_origin), and a GET from anywhere is a read.
+	for _, h := range []map[string]string{{"Sec-Fetch-Site": "same-origin"}, {"Origin": "http://" + host}} {
+		req, _ := http.NewRequest("POST", ts.URL+"/v1/tokens", strings.NewReader(`{}`))
+		req.AddCookie(cookie)
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
+		res, _ := http.DefaultClient.Do(req)
+		var e map[string]string
+		_ = json.NewDecoder(res.Body).Decode(&e)
+		if res.StatusCode != http.StatusForbidden || e["code"] != "forbidden" {
+			t.Errorf("a same-origin change reaches the role check: %d %v", res.StatusCode, e)
+		}
+	}
+	if code := send("GET", "/v1/whoami", map[string]string{"Sec-Fetch-Site": "cross-site"}); code != http.StatusOK {
+		t.Errorf("a read is never refused for its origin: %d", code)
+	}
+	// Nor may another site sign the browser in.
+	req, _ = http.NewRequest("POST", ts.URL+"/api/login", strings.NewReader(`{"username":"sam","password":"a long enough password"}`))
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	if res, _ := http.DefaultClient.Do(req); res.StatusCode != http.StatusForbidden {
+		t.Errorf("a login posted from another site: %d", res.StatusCode)
 	}
 }
 

@@ -40,10 +40,13 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   deploys     [--json]            what the host runs now and the recent deploys (no upload)
   backup      [--volume v] [--prune]
   restore     --volume v [--from key|latest] [--as name] [--force]   (admin)
+  image-build --app a --ref r     build images/<a> at the git ref r on the host from --config-dir's recipe,
+                                  and wait for it (deployer, or a token scoped to the image)
   wait        <job-id>            wait for a job (no upload)
   recipe-approve [<digest>]       approve an image recipe; without a digest, the one of --config-dir (admin)
   secret-sync [--prune] NAME...   push these environment variables to the daemon's secret store, e.g.
-                                  from the git server's secrets; --prune removes every other one (admin)
+                                  from the git server's secrets; --prune removes every other one it may set
+                                  (a deployer: service secrets, SERVICE_*; an admin: any)
   secret-list                     the names in the daemon's secret store, never the values (admin)
   daemon-upgrade --version v --sha256 s
                                   upgrade the daemon to a pinned release and wait until it runs it (admin)
@@ -52,7 +55,11 @@ Actions (each uploads --config-dir unless noted, and waits for the job it starts
   token-create --name n --role r [--names g --images g --domains g --labels k=v1,v2 | --secrets g]   (admin; no upload)
 
 Common flags: --url (NATIVE_OPS_URL), --token-env (default NATIVE_OPS_TOKEN), --config-dir (.),
-              --sha (commit, recorded in the audit log; default GITHUB_SHA), --timeout (default 30m)`
+              --sha (commit, recorded in the audit log; default GITHUB_SHA), --timeout (default 30m)
+
+The host runs one change at a time: a change asked for while another runs waits in line (its job is
+"queued"), and the wait covers that time too. A full queue (429) or a restarting daemon (503) is retried
+until --timeout.`
 
 type remoteClient struct {
 	base  string
@@ -91,6 +98,8 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 	upSHA := flags.String("sha256", "", "daemon-upgrade: the SHA-256 of native-ops_<version>_linux_<arch>.tar.gz, from the release's checksums.txt")
 	dryRun := flags.Bool("dry-run", false, "image-prune: only report what would be deleted")
 	asJSON := flags.Bool("json", false, "deploys: print the daemon's answer as JSON")
+	app := flags.String("app", "", "image-build: the app (a directory under images/)")
+	ref := flags.String("ref", "", "image-build: the git ref to build (a branch or tag)")
 	prune2 := flags.Bool("prune-secrets", false, "secret-sync: remove every secret on the daemon not named here (also --prune)")
 	_ = flags.Parse(args[1:])
 
@@ -125,16 +134,12 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		if *tag == "" {
 			fatalf("deploy needs --tag")
 		}
-		var out struct {
-			Job struct {
-				ID string `json:"id"`
-			} `json:"job"`
-		}
-		if code, raw := c.json(ctx, "POST", "/v1/deploy", map[string]string{"tag": *tag}, &out); code != http.StatusAccepted {
-			fatalf("the daemon answered %d: %s", code, raw)
-		}
-		fmt.Printf("deploying %s (job %s)\n", *tag, out.Job.ID)
-		os.Exit(c.wait(ctx, out.Job.ID))
+		id := c.start(ctx, "deploy "+*tag, func() (int, string, *startedJob) {
+			var out startedJob
+			code, raw := c.json(ctx, "POST", "/v1/deploy", map[string]string{"tag": *tag}, &out)
+			return code, raw, &out
+		})
+		os.Exit(c.wait(ctx, id))
 	case "deploy-plan":
 		if *tag == "" {
 			fatalf("deploy-plan needs --tag")
@@ -213,15 +218,19 @@ func handleRemoteCommand(ctx context.Context, args []string) {
 		if *dryRun {
 			path += "?dry_run=1"
 		}
-		var out struct {
-			Job struct {
-				ID string `json:"id"`
-			} `json:"job"`
+		id := c.start(ctx, "image prune", func() (int, string, *startedJob) {
+			var out startedJob
+			code, raw := c.json(ctx, "POST", path, nil, &out)
+			return code, raw, &out
+		})
+		os.Exit(c.wait(ctx, id))
+	case "image-build":
+		if *app == "" || *ref == "" {
+			fatalf("image-build needs --app and --ref")
 		}
-		if code, raw := c.json(ctx, "POST", path, nil, &out); code != http.StatusAccepted {
-			fatalf("the daemon answered %d: %s", code, raw)
-		}
-		os.Exit(c.wait(ctx, out.Job.ID))
+		q.Set("app", *app)
+		q.Set("ref", *ref)
+		c.uploadAndWait(ctx, "/v1/images/build", *configDir, q)
 	case "secret-list":
 		var out struct {
 			Secrets []struct {
@@ -393,43 +402,85 @@ func (c *remoteClient) deploys(ctx context.Context, asJSON bool) {
 	}
 }
 
+// startedJob is the answer of an endpoint that starts a job (202), or of one that refused.
+type startedJob struct {
+	Job struct {
+		ID       string `json:"id"`
+		Status   string `json:"status"`
+		Position int    `json:"position"`
+	} `json:"job"`
+	Status string `json:"status"`
+	Text   string `json:"text"`
+	Error  string `json:"error"`
+}
+
+// retryStart is how long start waits before asking again after a 429 or 503 that names no Retry-After.
+var retryStart = 10 * time.Second
+
+// start asks the daemon to start a job until it does, and returns its id. A full queue (429) or a daemon
+// that is restarting (503, or a proxy's 502 while it is down) is asked again until the context ends; any
+// other refusal is fatal. A 200 "nothing_to_do" (an apply with nothing to change) exits 0.
+func (c *remoteClient) start(ctx context.Context, what string, send func() (int, string, *startedJob)) string {
+	for {
+		code, raw, out := send()
+		switch {
+		case code == http.StatusAccepted && out.Job.ID != "":
+			if out.Job.Status == "queued" {
+				fmt.Printf("%s: job %s is queued (#%d): another change runs on the host first\n", what, out.Job.ID, out.Job.Position)
+			} else {
+				fmt.Printf("%s: job %s started\n", what, out.Job.ID)
+			}
+			return out.Job.ID
+		case code == http.StatusOK && out.Status == "nothing_to_do":
+			fmt.Println("nothing to do: the host already matches")
+			os.Exit(0)
+		case code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusBadGateway:
+			fmt.Fprintf(os.Stderr, "%s: the daemon answered %d (%s); asking again\n", what, code, firstNonEmpty(out.Error, "unavailable"))
+			select {
+			case <-ctx.Done():
+				fatalf("%s: gave up: the daemon kept answering %d", what, code)
+			case <-time.After(retryStart):
+			}
+		default:
+			if out.Text != "" {
+				fmt.Fprint(os.Stderr, out.Text)
+			}
+			fatalf("the daemon answered %d: %s", code, firstNonEmpty(out.Error, raw))
+		}
+	}
+}
+
 // uploadAndWait uploads the tree to an endpoint that starts a job, then waits for the job. It exits.
 func (c *remoteClient) uploadAndWait(ctx context.Context, path, dir string, q url.Values) {
-	var out struct {
-		Job struct {
-			ID string `json:"id"`
-		} `json:"job"`
-		Status string `json:"status"`
-		Text   string `json:"text"`
-		Error  string `json:"error"`
+	body, err := packTree(dir)
+	if err != nil {
+		fatalf("pack %s: %v", dir, err)
 	}
-	code, raw := c.upload(ctx, path, dir, q, &out)
-	switch {
-	case code == http.StatusOK && out.Status == "nothing_to_do":
-		fmt.Println("nothing to do: the host already matches")
-		os.Exit(0)
-	case code != http.StatusAccepted:
-		if out.Text != "" {
-			fmt.Fprint(os.Stderr, out.Text)
-		}
-		fatalf("the daemon answered %d: %s", code, firstNonEmpty(out.Error, raw))
-	}
-	fmt.Printf("job %s started\n", out.Job.ID)
-	os.Exit(c.wait(ctx, out.Job.ID))
+	id := c.start(ctx, strings.TrimPrefix(path, "/v1/"), func() (int, string, *startedJob) {
+		var out startedJob
+		code, raw := c.uploadBytes(ctx, path, body, q, &out)
+		return code, raw, &out
+	})
+	os.Exit(c.wait(ctx, id))
 }
 
 // wait polls a job until it ends and prints its log (when the token may read it). It returns 0 when the
-// job succeeded. A deploy that upgrades the daemon ends as succeeded (ResultDaemonUpgraded) just before
-// the daemon restarts, so the wait tolerates the restart: transport errors and 5xx (the proxy's 502 while
-// the daemon is down) are retried for a few minutes rather than failing the deploy.
+// job succeeded. A queued job is waited for through its turn. A deploy that upgrades the daemon ends as
+// succeeded (ResultDaemonUpgraded) just before the daemon restarts, and the new binary resumes the deploy
+// as another job, which the first one names as its next: the wait follows it, so the exit status is the
+// deploy's, not the upgrade's. Transport errors and 5xx (the proxy's 502 while the daemon is down) are
+// retried for a few minutes rather than failing the wait.
 func (c *remoteClient) wait(ctx context.Context, id string) int {
 	const maxTransient = 80 // ~4 minutes at 3s: the daemon restarts and resumes within seconds
-	transient := 0
+	transient, lastPosition, followUntil := 0, -1, time.Time{}
 	for {
 		var job struct {
-			Status string `json:"status"`
-			Error  string `json:"error"`
-			Log    string `json:"log"`
+			Status   string `json:"status"`
+			Error    string `json:"error"`
+			Log      string `json:"log"`
+			Result   string `json:"result"`
+			Next     string `json:"next"`
+			Position int    `json:"position"`
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/jobs/"+url.PathEscape(id)+"?wait=30", nil)
 		if err != nil {
@@ -448,7 +499,7 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 			case <-ctx.Done():
 				fmt.Fprintf(os.Stderr, "gave up waiting for job %s (the daemon is unreachable)\n", id)
 				return 1
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitPoll):
 			}
 			continue
 		}
@@ -456,24 +507,52 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 		if code != http.StatusOK {
 			fatalf("reading job %s: the daemon answered %d: %s", id, code, raw)
 		}
-		switch job.Status {
-		case "succeeded":
+		switch {
+		case job.Status == "succeeded" && job.Result == server.ResultDaemonUpgraded && job.Next != "":
+			printLog(job.Log)
+			fmt.Printf("job %s upgraded the daemon; the deploy continues as job %s\n", id, job.Next)
+			id, lastPosition, followUntil = job.Next, -1, time.Time{}
+			continue
+		case job.Status == "succeeded" && job.Result == server.ResultDaemonUpgraded:
+			// The daemon is restarting; the new binary links the resumed deploy once it is up.
+			if followUntil.IsZero() {
+				printLog(job.Log)
+				fmt.Printf("job %s upgraded the daemon; waiting for it to resume the deploy\n", id)
+				followUntil = time.Now().Add(resumeWindow)
+			} else if time.Now().After(followUntil) {
+				fmt.Fprintf(os.Stderr, "the daemon was upgraded but did not resume the deploy within %s (see its Jobs page); push the tag again\n", resumeWindow)
+				return 1
+			}
+		case job.Status == "succeeded":
 			printLog(job.Log)
 			fmt.Printf("job %s succeeded\n", id)
 			return 0
-		case "failed", "interrupted":
+		case job.Status == "failed" || job.Status == "interrupted":
 			printLog(job.Log)
 			fmt.Fprintf(os.Stderr, "job %s %s: %s\n", id, job.Status, job.Error)
 			return 1
+		case job.Status == "queued" && job.Position != lastPosition:
+			fmt.Printf("job %s is queued (#%d)\n", id, job.Position)
+			lastPosition = job.Position
+		case job.Status == "running" && lastPosition > 0:
+			fmt.Printf("job %s is running\n", id)
+			lastPosition = 0
 		}
 		select {
 		case <-ctx.Done():
 			fmt.Fprintf(os.Stderr, "gave up waiting for job %s (it is still %s)\n", id, job.Status)
 			return 1
-		case <-time.After(3 * time.Second):
+		case <-time.After(waitPoll):
 		}
 	}
 }
+
+// How wait polls, and how long it waits for an upgraded daemon to resume a deploy (variables so tests
+// can shorten them).
+var (
+	waitPoll     = 3 * time.Second
+	resumeWindow = 5 * time.Minute
+)
 
 func printLog(log string) {
 	if log != "" {
@@ -496,6 +575,11 @@ func (c *remoteClient) upload(ctx context.Context, path, dir string, q url.Value
 	if err != nil {
 		fatalf("pack %s: %v", dir, err)
 	}
+	return c.uploadBytes(ctx, path, body, q, out)
+}
+
+// uploadBytes posts an already packed tree.
+func (c *remoteClient) uploadBytes(ctx context.Context, path string, body []byte, q url.Values, out any) (int, string) {
 	u := c.base + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()

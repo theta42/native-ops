@@ -109,9 +109,9 @@ The daemon (runs on each host; CI drives it over HTTPS):
   serve            Run the authenticated API + UI daemon (needs a state dir; see README)
   token create     Create an API token (also: token list, token revoke)
   user create      Create a local UI user (also: user list, user passwd, user role, user disable)
-  remote           Drive a daemon from CI: plan, apply, deploy, backup, restore, wait,
-                   token-create, recipe-approve, secret-sync, daemon-upgrade, deploy,
-                   image-prune
+  remote           Drive a daemon from CI: plan, deploy, deploy-plan, deploys, image-build,
+                   image-prune, secret-sync, wait, apply, backup, restore, token-create,
+                   recipe-approve, daemon-upgrade
                    (NATIVE_OPS_URL, NATIVE_OPS_TOKEN)
 
 Core Commands:

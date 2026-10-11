@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"sync"
@@ -106,7 +107,7 @@ type Server struct {
 
 	planSlots chan struct{}
 	logins    *loginThrottle
-	applyMu   sync.Mutex // one apply at a time on this host
+	queue     hostQueue // one change at a time on this host, in the order they were asked for
 	jobsWG    sync.WaitGroup
 }
 
@@ -206,14 +207,20 @@ func (s *Server) authScoped(min Role, next http.HandlerFunc) http.Handler {
 	return s.authWith(min, true, false, next)
 }
 
-// authSecretSync is auth for PUT /v1/secrets, the one endpoint a secrets token may call: an admin, or a
-// deployer token whose scope is Secrets (the handler checks each name against it). A plain deployer is
-// refused, as is a token scoped to instances.
+// authSecretSync is auth for PUT /v1/secrets, the one endpoint a secrets token may call: an admin (any
+// secret), a deployer (service secrets, SERVICE_*), or a deployer token whose scope is Secrets (the service
+// secrets it names). The handler checks each name. A token scoped to instances is refused.
+//
+// A deployer may set service secrets because that is what the configuration repository's CI does with
+// the one token it holds (docs/git-organization.md): a service secret reaches a service only through a
+// deploy of a protected tag, whose plan names every changed key. The daemon's own credentials (the git
+// token, the DNS and object-store keys, the backup pins) stay an admin's: they decide what the daemon
+// trusts and where its data goes.
 func (s *Server) authSecretSync(next http.HandlerFunc) http.Handler {
 	return s.authWith(RoleDeployer, true, true, func(w http.ResponseWriter, r *http.Request) {
 		h, _ := r.Context().Value(actorKey{}).(*actorHolder)
-		if h == nil || !(h.scope.SecretsOnly() || (h.scope == nil && h.role.Allows(RoleAdmin))) {
-			writeError(w, http.StatusForbidden, "forbidden", "syncing secrets needs an admin, or a token scoped to service secrets")
+		if h == nil || !(h.scope.SecretsOnly() || (h.scope == nil && h.role.Allows(RoleDeployer))) {
+			writeError(w, http.StatusForbidden, "forbidden", "syncing secrets needs a deployer (service secrets), an admin, or a token scoped to service secrets")
 			return
 		}
 		next(w, r)
@@ -252,6 +259,10 @@ func (s *Server) authWith(min Role, allowScoped, allowSecrets bool, next http.Ha
 				if h, ok := r.Context().Value(actorKey{}).(*actorHolder); ok {
 					h.name, h.role = username, role
 				}
+				if !sameOrigin(r) {
+					writeError(w, http.StatusForbidden, "cross_origin", "a signed-in browser may change things only from this daemon's own pages")
+					return
+				}
 				if !role.Allows(min) {
 					writeError(w, http.StatusForbidden, "forbidden", "this account's role cannot do that")
 					return
@@ -286,6 +297,25 @@ func (s *Server) authWith(min Role, allowScoped, allowSecrets bool, next http.Ha
 		}
 		next(w, r)
 	})
+}
+
+// sameOrigin reports whether a request that carries the session cookie may act on it: a read always,
+// a change only when the browser says it comes from this origin. SameSite=Lax is not enough on its own:
+// "same site" includes every sibling subdomain (tenant apps on *.example.com), whose pages a browser lets
+// POST to the daemon with its cookie. A client that is not a browser sends neither header.
+func sameOrigin(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site == "same-origin" || site == "none" // none: typed in by the person, not sent by a page
+	}
+	if o := r.Header.Get("Origin"); o != "" {
+		u, err := url.Parse(o)
+		return err == nil && u.Host == r.Host
+	}
+	return true
 }
 
 // currentSession reads the session cookie and checks it against the user store, so a user who has
@@ -564,6 +594,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
+		// Jobs still waiting for the host never start now (their records say nothing was done); the
+		// one that holds it finishes.
+		s.queue.close()
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(sctx); err != nil {

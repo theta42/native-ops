@@ -49,6 +49,7 @@ func releaseBefore(a, b string) bool {
 }
 
 type deployResume struct {
+	Job     JobID     `json:"job,omitempty"` // the deploy job that upgraded; its record names the resumed one
 	Tag     string    `json:"tag"`
 	Version string    `json:"version"` // the version the deploy upgraded to
 	Actor   string    `json:"actor"`
@@ -57,7 +58,7 @@ type deployResume struct {
 
 // followPin moves the daemon to fleet.yml's pin. It reports whether it upgraded, in which case the
 // daemon is restarting and the caller's job ends here.
-func (s *Server) followPin(ctx context.Context, root, tag, actor string, resumed bool, logf func(string, ...any)) (bool, error) {
+func (s *Server) followPin(ctx context.Context, root, tag, actor string, job JobID, resumed bool, logf func(string, ...any)) (bool, error) {
 	fleet, err := config.LoadFleetConfig(root)
 	if err != nil {
 		return false, err
@@ -89,7 +90,7 @@ func (s *Server) followPin(ctx context.Context, root, tag, actor string, resumed
 	if err := s.opts.Upgrade(ctx, pin.Version, pin.SHA256, logf); err != nil {
 		return false, fmt.Errorf("upgrade the daemon to %s: %w; nothing was deployed", pin.Version, err)
 	}
-	b, _ := json.Marshal(deployResume{Tag: tag, Version: pin.Version, Actor: actor, At: time.Now().UTC()})
+	b, _ := json.Marshal(deployResume{Job: job, Tag: tag, Version: pin.Version, Actor: actor, At: time.Now().UTC()})
 	if err := os.WriteFile(s.opts.ResumeFile, b, 0o600); err != nil {
 		return false, fmt.Errorf("%s is installed, but the deploy could not be recorded to resume after the restart (%v): the daemon runs %s from its next start; push the tag again then", pin.Version, err, pin.Version)
 	}
@@ -101,7 +102,8 @@ func (s *Server) followPin(ctx context.Context, root, tag, actor string, resumed
 // ResumeDeploy runs a deploy that an upgrade to fleet.yml's daemon pin interrupted. The daemon calls it
 // at startup, once a pending upgrade has committed. The record is used once: if this daemon is not the
 // version the deploy upgraded to (the new binary did not stay up and was rolled back), the deploy is
-// recorded as a failed job instead of run.
+// recorded as a failed job instead of run. Either way the job that upgraded names the new one as its
+// next, so a client waiting on it (`native-ops remote deploy`) follows the deploy to its real end.
 func (s *Server) ResumeDeploy() {
 	if s.opts.ResumeFile == "" || s.opts.Deploy == nil || s.opts.Jobs == nil {
 		return
@@ -122,6 +124,7 @@ func (s *Server) ResumeDeploy() {
 		if job, err := s.opts.Jobs.CreateKind("deploy", r.Actor, "", r.Tag, ""); err == nil {
 			s.opts.Jobs.Logf(job.ID, "%s", msg)
 			s.opts.Jobs.Finish(job.ID, errors.New(msg))
+			s.linkNext(r.Job, job.ID)
 		}
 		return
 	}
@@ -130,5 +133,13 @@ func (s *Server) ResumeDeploy() {
 		log.Printf("deploy resume: could not resume the deploy of %s: %v", r.Tag, err)
 		return
 	}
+	s.linkNext(r.Job, job.ID)
 	log.Printf("resumed the deploy of %s on %s as job %s", r.Tag, s.opts.Version, job.ID)
+}
+
+// linkNext records on a deploy that upgraded the daemon which job carries it on.
+func (s *Server) linkNext(from, next JobID) {
+	if validJobID(string(from)) {
+		s.opts.Jobs.update(from, func(j *Job) { j.Next = next })
+	}
 }

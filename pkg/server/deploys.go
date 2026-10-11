@@ -50,7 +50,8 @@ func (d DeployView) live() bool {
 
 // handleDeploys is GET /v1/deploys?limit=50 (viewer): the deploys, newest first; current, the newest one
 // that left the host matching its tag (what it runs now, as far as deploys go: an apply, an instance
-// change or an image build since then is in /v1/jobs); and running, the deploy in progress, if any.
+// change or an image build since then is in /v1/jobs); running, the deploy in progress, if any; and
+// queued, the deploys waiting for the host, next first.
 func (s *Server) handleDeploys(w http.ResponseWriter, r *http.Request) {
 	limit, ok := queryLimit(w, r, 50)
 	if !ok {
@@ -59,6 +60,7 @@ func (s *Server) handleDeploys(w http.ResponseWriter, r *http.Request) {
 	var (
 		all             []DeployView
 		current, active *DeployView
+		queued          = []DeployView{}
 	)
 	for _, j := range s.opts.Jobs.List() {
 		if j.Kind != "deploy" {
@@ -73,6 +75,9 @@ func (s *Server) handleDeploys(w http.ResponseWriter, r *http.Request) {
 			a := d
 			active = &a
 		}
+		if d.Status == JobQueued {
+			queued = append([]DeployView{d}, queued...) // the list is newest first; the queue is oldest first
+		}
 		if len(all) < limit {
 			all = append(all, d)
 		}
@@ -80,7 +85,7 @@ func (s *Server) handleDeploys(w http.ResponseWriter, r *http.Request) {
 	if all == nil {
 		all = []DeployView{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"current": current, "running": active, "deploys": all})
+	writeJSON(w, http.StatusOK, map[string]any{"current": current, "running": active, "queued": queued, "deploys": all})
 }
 
 // queryLimit reads ?limit= (1..keepJobs, default def).

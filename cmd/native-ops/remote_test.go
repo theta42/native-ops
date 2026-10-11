@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -84,6 +85,115 @@ func TestWaitFollowsAJobToItsEnd(t *testing.T) {
 	}
 	if polls.Load() != 2 {
 		t.Fatalf("polled %d times", polls.Load())
+	}
+}
+
+func shortWaits(t *testing.T) {
+	poll, window, retry := waitPoll, resumeWindow, retryStart
+	waitPoll, resumeWindow, retryStart = 5*time.Millisecond, 300*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { waitPoll, resumeWindow, retryStart = poll, window, retry })
+}
+
+// A deploy that moves the daemon to fleet.yml's pin ends with the upgrade; the deploy itself runs as the
+// job the new binary starts. The wait follows it, through the restart, and exits with the deploy's
+// outcome, not the upgrade's.
+func TestWaitFollowsADeployThroughTheDaemonUpgrade(t *testing.T) {
+	shortWaits(t)
+	var polls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/jobs/j-1-aaaaaaaa":
+			switch n := polls.Add(1); {
+			case n == 1:
+				_, _ = w.Write([]byte(`{"status":"running"}`))
+			case n == 2:
+				_, _ = w.Write([]byte(`{"status":"succeeded","result":"daemon_upgraded"}`))
+			case n < 5:
+				w.WriteHeader(http.StatusBadGateway) // restarting
+			default:
+				_, _ = w.Write([]byte(`{"status":"succeeded","result":"daemon_upgraded","next":"j-2-bbbbbbbb"}`))
+			}
+		case "/v1/jobs/j-2-bbbbbbbb":
+			_, _ = w.Write([]byte(`{"status":"failed","error":"the plan is blocked"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	c := &remoteClient{base: ts.URL, token: "tok", http: ts.Client()}
+	if code := c.wait(context.Background(), "j-1-aaaaaaaa"); code != 1 {
+		t.Fatalf("the resumed deploy failed, so the wait must exit 1, got %d", code)
+	}
+
+	// An upgraded daemon that never names a resumed deploy is a failure, not a success.
+	never := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"succeeded","result":"daemon_upgraded"}`))
+	}))
+	defer never.Close()
+	c = &remoteClient{base: never.URL, token: "tok", http: never.Client()}
+	if code := c.wait(context.Background(), "j-1-aaaaaaaa"); code != 1 {
+		t.Fatalf("a deploy that was never resumed must exit 1, got %d", code)
+	}
+}
+
+func TestWaitRidesOutTheQueue(t *testing.T) {
+	shortWaits(t)
+	var polls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch n := polls.Add(1); {
+		case n < 3:
+			_, _ = w.Write([]byte(`{"status":"queued","position":1}`))
+		case n < 4:
+			_, _ = w.Write([]byte(`{"status":"running"}`))
+		default:
+			_, _ = w.Write([]byte(`{"status":"succeeded"}`))
+		}
+	}))
+	defer ts.Close()
+	c := &remoteClient{base: ts.URL, token: "tok", http: ts.Client()}
+	if code := c.wait(context.Background(), "j-1-aaaaaaaa"); code != 0 || polls.Load() != 4 {
+		t.Fatalf("a queued job is waited for to its end: exit %d after %d polls", code, polls.Load())
+	}
+}
+
+// A full queue or a restarting daemon is asked again; the build runs once it is accepted.
+func TestImageBuildRetriesAFullQueueAndWaits(t *testing.T) {
+	shortWaits(t)
+	var builds atomic.Int32
+	var got struct{ app, ref, ct string }
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/v1/images/build":
+			got.app, got.ref, got.ct = r.URL.Query().Get("app"), r.URL.Query().Get("ref"), r.Header.Get("Content-Type")
+			switch builds.Add(1) {
+			case 1:
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"code":"queue_full","error":"20 changes are already waiting"}`))
+			case 2:
+				w.WriteHeader(http.StatusServiceUnavailable)
+			default:
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"job":{"id":"j-3-cccccccc","status":"queued","position":2}}`))
+			}
+		case r.URL.Path == "/v1/jobs/j-3-cccccccc":
+			_, _ = w.Write([]byte(`{"status":"succeeded","log":"built\n"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	c := &remoteClient{base: ts.URL, token: "tok", http: ts.Client()}
+	id := c.start(context.Background(), "build", func() (int, string, *startedJob) {
+		var out startedJob
+		code, raw := c.uploadBytes(context.Background(), "/v1/images/build", []byte("x"), url.Values{"app": {"crew"}, "ref": {"main"}}, &out)
+		return code, raw, &out
+	})
+	if id != "j-3-cccccccc" || builds.Load() != 3 || got.app != "crew" || got.ref != "main" || got.ct != "application/gzip" {
+		t.Fatalf("start: id %q after %d tries, %+v", id, builds.Load(), got)
+	}
+	if code := c.wait(context.Background(), id); code != 0 {
+		t.Fatalf("wait: %d", code)
 	}
 }
 

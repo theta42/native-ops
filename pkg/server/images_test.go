@@ -213,25 +213,40 @@ func TestImageBuildNeedsADeployerRole(t *testing.T) {
 	}
 }
 
-func TestImageBuildSharesTheHostLockAndAFinishedJobMeansFree(t *testing.T) {
+// Two apps' CI dispatching builds at once is the normal case: the second waits for the first instead of
+// failing with "busy" (the 409s that made a release workflow fail whenever another one was running).
+func TestASecondBuildWaitsForTheFirstAndRunsAfterIt(t *testing.T) {
 	rig := newImageRig(t)
 	rig.b.block, rig.b.started = make(chan struct{}), make(chan struct{}, 4)
 
 	code, body := rig.build(t, rig.deployer, "?app=platform&ref=main", goodTree(t))
-	if code != 202 {
-		t.Fatalf("%d %s", code, body)
+	if code != 202 || !strings.Contains(body, `"status":"running"`) {
+		t.Fatalf("a build on a free host runs at once: %d %s", code, body)
 	}
 	<-rig.b.started
 
-	if code, b := rig.build(t, rig.deployer, "?app=home&ref=main", goodTree(t)); code != 409 {
-		t.Fatalf("a second build while one runs: %d %s", code, b)
+	code, second := rig.build(t, rig.deployer, "?app=home&ref=main", goodTree(t))
+	if code != 202 || !strings.Contains(second, `"status":"queued"`) || !strings.Contains(second, `"position":1`) {
+		t.Fatalf("a second build while one runs is queued: %d %s", code, second)
+	}
+	select {
+	case <-rig.b.started:
+		t.Fatal("the queued build must not start while the first runs")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if j, _ := rig.srv2.opts.Jobs.Get(JobID(jobID(t, second))); j.Status != JobQueued || j.Started != nil {
+		t.Fatalf("the waiting build's record: %+v", j)
 	}
 	close(rig.b.block)
-	rig.waitJob(t, jobID(t, body), JobSucceeded)
-
-	rig.b.block = nil
-	if code, b := rig.build(t, rig.deployer, "?app=home&ref=main", goodTree(t)); code != 202 {
-		t.Fatalf("the host must be free once the first job is done, got %d %s", code, b)
+	first := rig.waitJob(t, jobID(t, body), JobSucceeded)
+	next := rig.waitJob(t, jobID(t, second), JobSucceeded)
+	if next.Started.Before(*first.Finished) || !strings.Contains(next.Log, "waited") {
+		t.Fatalf("the second build runs after the first and says it waited: %+v", next)
+	}
+	rig.b.mu.Lock()
+	defer rig.b.mu.Unlock()
+	if len(rig.b.calls) != 2 || rig.b.calls[1].app != "home" || !rig.b.calls[1].sawFleetYML {
+		t.Fatalf("both builds ran, in order, the second with its upload still there: %+v", rig.b.calls)
 	}
 }
 
@@ -368,7 +383,8 @@ func TestImageRetentionRunsByItself(t *testing.T) {
 
 func TestImageRetentionWaitsOutABusyHostAndCanBeTurnedOff(t *testing.T) {
 	rig := newImageRig(t)
-	rig.srv2.applyMu.Lock() // a change is running
+	held, _ := rig.srv2.queue.tryTicket() // a change is running
+	_ = held
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go rig.srv2.RunImageRetention(ctx, 20*time.Millisecond)
@@ -377,7 +393,7 @@ func TestImageRetentionWaitsOutABusyHostAndCanBeTurnedOff(t *testing.T) {
 		t.Fatal("retention must not run over another change")
 	case <-time.After(200 * time.Millisecond):
 	}
-	rig.srv2.applyMu.Unlock()
+	rig.srv2.queue.release()
 	select {
 	case <-rig.prunes:
 	case <-time.After(3 * time.Second):

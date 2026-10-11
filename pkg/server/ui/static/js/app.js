@@ -81,7 +81,10 @@ let applyEnabled = true; // from /v1/plans: without apply a plan can be reviewed
 let deployTags = "";     // from /v1/plans: the tags that deploy, when the daemon deploys tags
 // What a plan's state means here: "pending" only when something could apply it.
 const planState = (s) => (s === "pending" && !applyEnabled ? "review only" : s);
-const JOB_STATE = { running: "primary", succeeded: "success", failed: "danger", interrupted: "warning" };
+const JOB_STATE = { queued: "info", running: "primary", succeeded: "success", failed: "danger", interrupted: "warning" };
+// A queued job's badge names its place in line: "queued (#2)".
+const jobBadge = (j) => (j.status === "queued" && j.position
+  ? badge(`queued (#${j.position})`, JOB_STATE.queued) : stateBadge(j.status, JOB_STATE));
 const stateBadge = (state, kinds) => badge(state, kinds[state] || "secondary");
 const RECIPE_STATE = { approved: "success", waiting: "warning" };
 
@@ -460,7 +463,7 @@ function jobsView(d) {
   if (d.disabled) return card("list-check", "Jobs", empty("Nothing that changes the host is enabled on this daemon, so there are no jobs."));
   const rows = (d.jobs || []).map((j) => [
     when(j.created),
-    stateBadge(j.status, JOB_STATE),
+    jobBadge(j),
     j.actor,
     j.sha ? j.sha.slice(0, 8) : "",
     [j.kind || "apply", j.service].filter(Boolean).join(" "),
@@ -475,13 +478,14 @@ function jobsView(d) {
 function jobView(j) {
   return h("div", {},
     card("list-check", `Job ${j.id}`, infoTable([
-      ["Status", stateBadge(j.status, JOB_STATE)],
+      ["Status", jobBadge(j)],
       ["Started by", j.actor],
       ["Commit", j.sha],
       ["Kind", j.kind],
       ["Subject", j.service],
       ["Plan", j.plan_hash ? h("a", { href: "#/plans/" + j.plan_hash }, short(j.plan_hash)) : ""],
-      ["Started", when(j.created)],
+      ["Asked for", when(j.created)],
+      ["Started", j.started ? when(j.started) : (j.status === "queued" ? "waiting for the host" : when(j.created))],
       ["Finished", when(j.finished)],
       ["Error", j.error],
     ]), h("span", {})),

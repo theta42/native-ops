@@ -78,7 +78,8 @@ func TestApplyAndInstancesShareTheHostAndABusyApplyKeepsItsApproval(t *testing.T
 		t.Fatalf("the approval is single-use: %d", res.StatusCode)
 	}
 
-	// And the other way round: an apply in flight makes an instance change wait.
+	// And the other way round: an apply in flight makes an instance change wait in line, and it runs
+	// once the apply is over.
 	rig.block, rig.started = make(chan struct{}), make(chan struct{}, 4)
 	rig.autoApprove = true
 	res, b = rig.apply(t, rig.deployerToken, query, tree)
@@ -87,11 +88,16 @@ func TestApplyAndInstancesShareTheHostAndABusyApplyKeepsItsApproval(t *testing.T
 	}
 	<-rig.started
 	spec, _ = json.Marshal(tenantSpecFor("demo-b"))
-	if res, b := rig.send(t, "PUT", "/v1/instances/demo-b", scoped, "application/json", spec); res.StatusCode != 409 || !strings.Contains(b, `"code":"busy"`) {
-		t.Fatalf("an instance change while an apply runs: %d %s", res.StatusCode, b)
+	res, queued := rig.send(t, "PUT", "/v1/instances/demo-b", scoped, "application/json", spec)
+	if res.StatusCode != 202 || !strings.Contains(queued, `"status":"queued"`) || !strings.Contains(queued, `"position":1`) {
+		t.Fatalf("an instance change while an apply runs waits for it: %d %s", res.StatusCode, queued)
 	}
 	close(rig.block)
-	rig.waitJob(t, jobID(t, b), JobSucceeded)
+	applied := rig.waitJob(t, jobID(t, b), JobSucceeded)
+	waited := rig.waitJob(t, jobID(t, queued), JobSucceeded)
+	if waited.Started == nil || applied.Finished == nil || waited.Started.Before(*applied.Finished) {
+		t.Fatalf("the queued change must start after the apply ends: apply finished %v, change started %v", applied.Finished, waited.Started)
+	}
 
 	// A scoped token sees jobs (to follow its own changes) and instances, and nothing else: not the plans
 	// (whose approval is an admin's), not apply, not the plan endpoint, not the status.

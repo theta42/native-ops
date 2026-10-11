@@ -206,6 +206,7 @@ func (o *OIDCConfig) Identity(ctx context.Context, accessToken string) (OIDCIden
 		Email         string `json:"email"`
 		EmailVerified any    `json:"email_verified"`
 		Name          string `json:"name"`
+		HostedDomain  string `json:"hd"` // Google: the Workspace domain the account belongs to
 	}
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&u); err != nil {
 		return OIDCIdentity{}, fmt.Errorf("oidc userinfo: %w", err)
@@ -217,10 +218,35 @@ func (o *OIDCConfig) Identity(ctx context.Context, accessToken string) (OIDCIden
 	if !truthy(u.EmailVerified) {
 		return OIDCIdentity{}, errors.New("the provider says the email is not verified")
 	}
-	if o.AllowedDomain != "" && !strings.HasSuffix(email, "@"+strings.ToLower(o.AllowedDomain)) {
-		return OIDCIdentity{}, fmt.Errorf("email %s is not at %s", email, o.AllowedDomain)
+	if err := inAllowedDomain(email, u.HostedDomain, p.Issuer, o.AllowedDomain); err != nil {
+		return OIDCIdentity{}, err
 	}
 	return OIDCIdentity{Email: email, Name: u.Name}, nil
+}
+
+// inAllowedDomain checks a verified email against --oidc-allowed-domain (empty allows any). A verified
+// address at the domain is not enough with Google: a personal Google account can be opened, and its
+// address verified, on a Workspace domain's address. Google's hd claim names the Workspace domain an
+// account belongs to, so with Google it must be the allowed domain; any provider that sends hd is held
+// to it too.
+func inAllowedDomain(email, hd, issuer, allowed string) error {
+	domain := strings.ToLower(allowed)
+	if domain == "" {
+		return nil
+	}
+	if !strings.HasSuffix(email, "@"+domain) {
+		return fmt.Errorf("email %s is not at %s", email, allowed)
+	}
+	if hd = strings.ToLower(hd); (hd != "" || isGoogle(issuer)) && hd != domain {
+		return fmt.Errorf("%s is not an account of the %s organization", email, allowed)
+	}
+	return nil
+}
+
+// isGoogle reports whether the issuer is Google's, whose accounts carry hd for a Workspace domain.
+func isGoogle(issuer string) bool {
+	issuer = strings.TrimRight(issuer, "/")
+	return issuer == "https://accounts.google.com" || issuer == "accounts.google.com"
 }
 
 // truthy accepts the boolean and the string form of an OIDC claim.

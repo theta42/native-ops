@@ -30,31 +30,23 @@ func (s *Server) handleDaemonUpgrade(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	if !s.applyMu.TryLock() {
-		msg := "another change is already running on this host"
-		if j, ok := s.opts.Jobs.Running(); ok {
-			msg += " (" + string(j.ID) + ")"
-		}
-		writeError(w, http.StatusConflict, "busy", msg)
-		return
-	}
+	// An upgrade restarts the daemon, and a restart ends the queue (jobs still waiting never run), so it
+	// does not wait in line: it needs the host free and nothing waiting.
 	actor, _ := s.actorScope(r)
-	job, err := s.opts.Jobs.CreateKind("daemon:upgrade", actor, "", body.Version, "")
+	version, sha := body.Version, body.SHA256
+	job, err := s.runJobNow(jobSpec{kind: "daemon:upgrade", actor: actor, subject: version, what: "daemon upgrade to " + version, audit: "daemon upgrade",
+		work: func(ctx context.Context, logf func(string, ...any)) error {
+			if err := s.opts.Upgrade(ctx, version, sha, logf); err != nil {
+				return err
+			}
+			logf("restarting on %s (the job record is kept; GET /healthz shows the running version)", version)
+			go s.opts.Restart()
+			return nil
+		}})
 	if err != nil {
-		s.applyMu.Unlock()
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was changed")
+		s.answerNotStarted(w, r, "daemon upgrade to "+version, err)
 		return
 	}
-	auditDetail(r, "daemon upgrade to %s job=%s (from %s)", body.Version, job.ID, s.opts.Version)
-	version, sha := body.Version, body.SHA256
-	s.startJob(job.ID, actor, "daemon upgrade to "+version, "daemon upgrade", nil, func(ctx context.Context, logf func(string, ...any)) error {
-		if err := s.opts.Upgrade(ctx, version, sha, logf); err != nil {
-			return err
-		}
-		logf("restarting on %s (the job record is kept; GET /healthz shows the running version)", version)
-		go s.opts.Restart()
-		return nil
-	})
-	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "from": s.opts.Version, "to": version})
+	auditDetail(r, "daemon upgrade to %s job=%s (from %s)", version, job.ID, s.opts.Version)
+	answerJob(w, job, map[string]any{"from": s.opts.Version, "to": version})
 }

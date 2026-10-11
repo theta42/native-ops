@@ -97,35 +97,22 @@ func goneToDeployTag(what string) http.HandlerFunc {
 	}
 }
 
-// runTreeJob receives an uploaded configuration tree, takes the host lock, and runs work on the tree as
-// a job of the given kind. It answers 202 with the job (or the reason it could not start).
+// runTreeJob receives an uploaded configuration tree and runs work on it as a job of the given kind,
+// when the host is free (queue.go). It answers 202 with the job (or the reason it could not be queued).
 func (s *Server) runTreeJob(w http.ResponseWriter, r *http.Request, kind, subject, what string, work func(ctx context.Context, root string, logf func(string, ...any)) error) {
 	u, ok := s.receiveTree(w, r, what)
 	if !ok {
 		return
 	}
-	if !s.applyMu.TryLock() {
-		u.discard()
-		msg := "another change is already running on this host"
-		if j, ok := s.opts.Jobs.Running(); ok {
-			msg += " (" + string(j.ID) + ")"
-		}
-		auditDetail(r, "%s rejected: busy", what)
-		writeError(w, http.StatusConflict, "busy", msg)
-		return
-	}
 	actor, _ := s.actorScope(r)
-	job, err := s.opts.Jobs.CreateKind(kind, actor, u.sha, subject, "")
+	job, err := s.queueJob(jobSpec{kind: kind, actor: actor, sha: u.sha, subject: subject, what: what, audit: kind, cleanup: u.discard,
+		work: func(ctx context.Context, logf func(string, ...any)) error {
+			return work(ctx, u.root, logf)
+		}})
 	if err != nil {
-		s.applyMu.Unlock()
-		u.discard()
-		writeError(w, http.StatusInternalServerError, "internal", "could not record the job, so nothing was done")
+		s.answerNotStarted(w, r, what, err)
 		return
 	}
 	auditDetail(r, "%s job=%s sha=%s", what, job.ID, orDash(u.sha))
-	s.startJob(job.ID, actor, what, kind, u.discard, func(ctx context.Context, logf func(string, ...any)) error {
-		return work(ctx, u.root, logf)
-	})
-	w.Header().Set("Location", "/v1/jobs/"+string(job.ID))
-	writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
+	answerJob(w, job, nil)
 }

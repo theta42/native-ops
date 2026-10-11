@@ -67,6 +67,26 @@ cannot touch production and a release cannot touch staging.
   set it **raw**. A base64 value is delivered to the runner as-is and fails
   authentication in a way that looks like an invalid token.
 
+## One CI token per configuration repository
+
+The configuration repository holds **one** native-ops credential, `NATIVE_OPS_TOKEN`: a `deployer` token
+that every workflow there uses (plan, deploy, image builds, image pruning, service-secret sync). Do not
+mint a token per workflow. A token per workflow in one repository protects nothing (see the trust
+boundary below: any workflow run reads every secret of its repository), and it multiplies what has to be
+rotated. The token is safe to share between workflows because of what the daemon refuses it:
+
+- it **deploys** only the commit a **protected** deploy tag points at, read from the git server by the
+  daemon itself, so it cannot deploy anything unreviewed;
+- it **builds** only an image recipe a protected deploy tag (or an admin) approved;
+- it **applies** an uploaded tree only with a plan an admin approved, once;
+- it **sets** only service secrets (`SERVICE_*`), never the daemon's own credentials;
+- it cannot approve, create tokens or users, restore a volume or upgrade the daemon outside a deploy.
+
+Application repositories hold no native-ops token at all: they dispatch the configuration repository's
+release workflow with a git-server token that can only start workflows there. Other credentials (a cloud
+token for `reconcile`, a control-plane API token) are not native-ops tokens and are kept per their own
+least privilege; the bootstrap admin token lives in a protected environment, never with the others.
+
 ## Runner scoping
 
 A runner registered **instance-wide** executes jobs for **any** repository on
@@ -94,16 +114,16 @@ review + branch protection gates production."
 ## Reference implementation (Opsavor)
 
 - **engine**: `theta42/native-ops` (public, github).
-- **config**: `opsavor/native-ops-conf` (git.opsavor.work).
-- **apps / control plane**: `opsavor/platform`, `opsavor/management`.
-- `main` protected on all deploy repos: 1 approval, direct push disabled, and
-  the `test` status check required.
-- Release tags protected: `platform-v*`, `manager-v*`.
-- Secrets **repo-scoped, none org-wide**: `MANAGER_TOKEN` (a scoped manager API
-  token) on `platform`; `DO_API_TOKEN` and `SSH_PRIVATE_KEY` on
-  `native-ops-conf`.
-- Lanes: merge to `main` → staging (`class=staging`); tag `platform-v*` →
-  production (`class=production`), both via the manager REST API.
+- **config**: `opsavor/native-ops-conf` (git.opsavor.work), forked from `theta42/native-ops-conf`.
+- **apps**: `opsavor/platform`, `opsavor/fleet-manager`, `opsavor/crew`, `opsavor/opsavor.ai`,
+  `opsavor/investor-vision`. Each dispatches the configuration repository's build workflow for its app on a
+  merge to `main` or a release tag; nothing in an app repository talks to the daemon.
+- `deploy-*` tags protected in `native-ops-conf`: pushing one is the only way the host changes.
+- Secrets in `native-ops-conf`: `NATIVE_OPS_TOKEN` (the one deployer token), `FLEET_TOKEN` (the fleet
+  manager's API, for platform rollouts) and the services' own secrets, copied to the daemon by the
+  secrets workflow. The daemon's own credentials are synced by an admin.
+- Lanes: a merge to `platform`'s `main` → staging; a `platform-v*` tag → a production rollout in the
+  fleet manager.
 
 ## Checklist
 
@@ -114,5 +134,6 @@ review + branch protection gates production."
 - [ ] Instances carry a lane: an `environment` label (`labels:` in `service.yml`, or `labels` on a tenant instance), and a roll is done with a token scoped to the environments it may touch (`token-create --labels environment=staging,testing`).
 - [ ] No powerful secrets at the organization level; secrets are repo-scoped.
 - [ ] CI credentials are least-privilege; exposed ones rotated.
+- [ ] The configuration repository holds one native-ops token (`NATIVE_OPS_TOKEN`, a deployer); app repositories hold none.
 - [ ] The runner is scoped to trusted repositories.
 - [ ] On Gitea ≥ 1.28: deploy secrets live in a reviewer-gated environment.
