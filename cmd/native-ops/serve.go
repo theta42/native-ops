@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
@@ -30,6 +31,7 @@ import (
 	"github.com/theta42/native-ops/pkg/provider/digitalocean"
 	"github.com/theta42/native-ops/pkg/remote"
 	"github.com/theta42/native-ops/pkg/selfupdate"
+	"github.com/theta42/native-ops/pkg/serveflags"
 	"github.com/theta42/native-ops/pkg/server"
 	"github.com/theta42/native-ops/pkg/status"
 )
@@ -109,44 +111,129 @@ func openStateDir(dir string) string {
 	return dir
 }
 
-func handleServeCommand(ctx context.Context, args []string) {
-	flags := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := flags.String("addr", "127.0.0.1:8686", "Listen address (put TLS in front of it, e.g. the Caddy edge)")
-	pool := flags.String("pool", "default", "Storage pool holding the data volumes")
-	enableApply := flags.Bool("enable-apply", false, "Serve POST /v1/apply (off by default: without it the daemon can read and plan, never change). An apply also needs an admin's approval of the plan")
-	approvalTTL := flags.Duration("approval-ttl", time.Hour, "How long an admin's approval of a plan lasts")
-	enableInstances := flags.Bool("enable-instances", false, "Serve the tenant-instance endpoints (PUT/DELETE /v1/instances/{name}); a token with a scope may use only these")
-	instanceProfiles := flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
-	instanceImports := flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
-	enableImageBuild := flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
-	enableBackup := flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as the uploaded fleet.yml's backup section says, only to the destination pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT/_BUCKET). The keys and pins come from the secret store (synced from the git server), else the environment")
-	enableDNSSync := flags.Bool("enable-dns-sync", false, "Retired: fleet.yml's dns_records are part of the plan and change with a deploy tag. Accepted so an old unit still starts")
-	imageKeep := flags.Int("image-keep", envInt("NATIVE_OPS_IMAGE_KEEP", 5), "Image retention: tagged images kept per app (<prefix><app>:<ref>; :latest and any image an instance runs are always kept); 0 keeps every tag. Env: NATIVE_OPS_IMAGE_KEEP")
-	imageOrphanAge := flags.Duration("image-orphan-age", 24*time.Hour, "Image retention: how old an image with no alias that no instance runs must be before POST /v1/images/prune deletes it (an image a build displaces goes at once); 0 keeps them")
-	imagePruneEvery := flags.Duration("image-prune-interval", envDuration("NATIVE_OPS_IMAGE_PRUNE_INTERVAL", 12*time.Hour), "Image retention: how often the daemon applies it by itself, as a recorded job (the same rule as POST /v1/images/prune: nothing an instance runs is deleted), because a build leaves the image it displaced while an instance still runs it and nothing else would ever delete it; 0 turns it off. Needs --enable-image-build. Env: NATIVE_OPS_IMAGE_PRUNE_INTERVAL")
-	imagePrefix := flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "app-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
-	gitURL := flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server holding the configuration repository, e.g. https://git.example.com (Gitea) or https://github.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
-	gitProvider := flags.String("git-provider", envOr("NATIVE_OPS_GIT_PROVIDER", ""), "The API --git-url speaks: gitea, or github (GitHub, or GitHub Enterprise Server at --git-url). Default: github for https://github.com, else gitea. Env: NATIVE_OPS_GIT_PROVIDER")
-	deployRepo := flags.String("deploy-repo", envOr("NATIVE_OPS_DEPLOY_REPO", ""), "The configuration repository on --git-url, as owner/name: a protected deploy tag there deploys its commit. Env: NATIVE_OPS_DEPLOY_REPO")
-	deployTags := flags.String("deploy-tags", envOr("NATIVE_OPS_DEPLOY_TAGS", "deploy-*"), "Glob of the tags that deploy; the repository must protect them. Env: NATIVE_OPS_DEPLOY_TAGS")
-	enableEdgeApply := flags.Bool("enable-edge-apply", false, "Retired: edge/Caddyfile is part of the plan and changes with a deploy tag. Accepted so an old unit still starts")
+// serveFlags are `native-ops serve`'s flags. They are declared in one place so that a deploy can check a flag
+// set (fleet.yml's daemon.flags) against exactly what the daemon will parse, before it restarts into it.
+type serveFlags struct {
+	addr              *string
+	pool              *string
+	enableApply       *bool
+	approvalTTL       *time.Duration
+	enableInstances   *bool
+	instanceProfiles  *string
+	instanceImports   *string
+	enableImageBuild  *bool
+	enableBackup      *bool
+	enableDNSSync     *bool
+	imageKeep         *int
+	imageOrphanAge    *time.Duration
+	imagePruneEvery   *time.Duration
+	imagePrefix       *string
+	gitURL            *string
+	gitProvider       *string
+	deployRepo        *string
+	deployTags        *string
+	enableEdgeApply   *bool
+	enableAuth        *bool
+	oidcIssuer        *string
+	oidcClientID      *string
+	oidcClientSecret  *string
+	oidcRedirectURL   *string
+	oidcAllowedDomain *string
+	oidcRole          *string
+	oidcLabel         *string
+	mcpOAuth          *bool
+	publicURL         *string
+	edgeContainer     *string
+	dnsProviderFlag   *string
+	dnsDomains        *string
+	stateDir          *string
+}
+
+// defineServeFlags declares serve's flags on fs.
+func defineServeFlags(fs *flag.FlagSet) *serveFlags {
+	flags := fs
+	v := &serveFlags{}
+	v.addr = flags.String("addr", "127.0.0.1:8686", "Listen address (put TLS in front of it, e.g. the Caddy edge)")
+	v.pool = flags.String("pool", "default", "Storage pool holding the data volumes")
+	v.enableApply = flags.Bool("enable-apply", false, "Serve POST /v1/apply (off by default: without it the daemon can read and plan, never change). An apply also needs an admin's approval of the plan")
+	v.approvalTTL = flags.Duration("approval-ttl", time.Hour, "How long an admin's approval of a plan lasts")
+	v.enableInstances = flags.Bool("enable-instances", false, "Serve the tenant-instance endpoints (PUT/DELETE /v1/instances/{name}); a token with a scope may use only these")
+	v.instanceProfiles = flags.String("instance-profiles", "base,service", "Incus profiles a tenant instance spec may use")
+	v.instanceImports = flags.String("instance-route-imports", "", "Caddy snippets a tenant route may import, e.g. strip-forged-identity")
+	v.enableImageBuild = flags.Bool("enable-image-build", false, "Serve POST /v1/images/build; a token with a scope may build only the images it allows")
+	v.enableBackup = flags.Bool("enable-backup", false, "Serve POST /v1/backups (deployer) and POST /v1/backups/restore (admin): back up and restore volumes as the uploaded fleet.yml's backup section says, only to the destination pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT/_BUCKET). The keys and pins come from the secret store (synced from the git server), else the environment")
+	v.enableDNSSync = flags.Bool("enable-dns-sync", false, "Retired: fleet.yml's dns_records are part of the plan and change with a deploy tag. Accepted so an old unit still starts")
+	v.imageKeep = flags.Int("image-keep", envInt("NATIVE_OPS_IMAGE_KEEP", 5), "Image retention: tagged images kept per app (<prefix><app>:<ref>; :latest and any image an instance runs are always kept); 0 keeps every tag. Env: NATIVE_OPS_IMAGE_KEEP")
+	v.imageOrphanAge = flags.Duration("image-orphan-age", 24*time.Hour, "Image retention: how old an image with no alias that no instance runs must be before POST /v1/images/prune deletes it (an image a build displaces goes at once); 0 keeps them")
+	v.imagePruneEvery = flags.Duration("image-prune-interval", envDuration("NATIVE_OPS_IMAGE_PRUNE_INTERVAL", 12*time.Hour), "Image retention: how often the daemon applies it by itself, as a recorded job (the same rule as POST /v1/images/prune: nothing an instance runs is deleted), because a build leaves the image it displaced while an instance still runs it and nothing else would ever delete it; 0 turns it off. Needs --enable-image-build. Env: NATIVE_OPS_IMAGE_PRUNE_INTERVAL")
+	v.imagePrefix = flags.String("image-prefix", envOr("NATIVE_OPS_IMAGE_PREFIX", "app-"), "What the config repo's build recipe puts before <app>:<ref> in an image name; a scoped token's image globs are checked against <prefix><app>:<ref>. Env: NATIVE_OPS_IMAGE_PREFIX")
+	v.gitURL = flags.String("git-url", envOr("NATIVE_OPS_GIT_URL", ""), "The git server holding the configuration repository, e.g. https://git.example.com (Gitea) or https://github.com; with --deploy-repo and --enable-apply it enables POST /v1/deploy. Env: NATIVE_OPS_GIT_URL")
+	v.gitProvider = flags.String("git-provider", envOr("NATIVE_OPS_GIT_PROVIDER", ""), "The API --git-url speaks: gitea, or github (GitHub, or GitHub Enterprise Server at --git-url). Default: github for https://github.com, else gitea. Env: NATIVE_OPS_GIT_PROVIDER")
+	v.deployRepo = flags.String("deploy-repo", envOr("NATIVE_OPS_DEPLOY_REPO", ""), "The configuration repository on --git-url, as owner/name: a protected deploy tag there deploys its commit. Env: NATIVE_OPS_DEPLOY_REPO")
+	v.deployTags = flags.String("deploy-tags", envOr("NATIVE_OPS_DEPLOY_TAGS", "deploy-*"), "Glob of the tags that deploy; the repository must protect them. Env: NATIVE_OPS_DEPLOY_TAGS")
+	v.enableEdgeApply = flags.Bool("enable-edge-apply", false, "Retired: edge/Caddyfile is part of the plan and changes with a deploy tag. Accepted so an old unit still starts")
 	// Auth flags default from the environment, so the OIDC client secret and the rest can live in the
 	// root-only /etc/native-ops/serve.env (like NATIVE_OPS_BOOTSTRAP_TOKEN) rather than a unit file an
 	// unprivileged user on the host could read.
-	enableAuth := flags.Bool("enable-auth", envBool("NATIVE_OPS_ENABLE_AUTH"), "Serve local sign-in and session cookies for the UI (users.json in the state dir; manage people with /v1/users or 'native-ops user'). Env: NATIVE_OPS_ENABLE_AUTH=1")
-	oidcIssuer := flags.String("oidc-issuer", os.Getenv("NATIVE_OPS_OIDC_ISSUER"), "OpenID Connect issuer URL (e.g. https://accounts.google.com); enables OIDC sign-in. Env: NATIVE_OPS_OIDC_ISSUER")
-	oidcClientID := flags.String("oidc-client-id", os.Getenv("NATIVE_OPS_OIDC_CLIENT_ID"), "OIDC client id. Env: NATIVE_OPS_OIDC_CLIENT_ID")
-	oidcClientSecret := flags.String("oidc-client-secret", os.Getenv("NATIVE_OPS_OIDC_CLIENT_SECRET"), "OIDC client secret; better synced to the secret store as NATIVE_OPS_OIDC_CLIENT_SECRET (read at each sign-in). Env: NATIVE_OPS_OIDC_CLIENT_SECRET")
-	oidcRedirectURL := flags.String("oidc-redirect-url", os.Getenv("NATIVE_OPS_OIDC_REDIRECT_URL"), "OIDC redirect URL (e.g. https://native-ops.example/auth/oidc/callback). Env: NATIVE_OPS_OIDC_REDIRECT_URL")
-	oidcAllowedDomain := flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. example.com). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
-	oidcRole := flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin; none creates nobody, so only users that already exist (PUT /v1/users/by-email) may sign in. Env: NATIVE_OPS_OIDC_ROLE")
-	oidcLabel := flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
-	mcpOAuth := flags.Bool("mcp-oauth", envOr("NATIVE_OPS_MCP_OAUTH", "true") != "false", "With sign-in on (--enable-auth or --oidc-issuer), let MCP clients connect by signing their person in (OAuth), acting with that person's role, instead of with a pasted API token; --mcp-oauth=false turns it off. Env: NATIVE_OPS_MCP_OAUTH=false")
-	publicURL := flags.String("public-url", os.Getenv("NATIVE_OPS_PUBLIC_URL"), "The daemon's public origin (e.g. https://native-ops.example.com), named in the OAuth metadata; default: the origin of --oidc-redirect-url, else each request's. Env: NATIVE_OPS_PUBLIC_URL")
-	edgeContainer := flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
-	dnsProviderFlag := flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from for the status page, e.g. digitalocean (DO_API_TOKEN from the secret store, else the environment). Env: NATIVE_OPS_DNS_PROVIDER")
-	dnsDomains := flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for on the status page, e.g. 'example.com,example.net'. When set (or the synced secret NATIVE_OPS_DNS_ZONES is), a plan whose dns_records name another zone is blocked. Env: NATIVE_OPS_DNS_DOMAINS")
-	stateDir := stateDirFlag(flags)
+	v.enableAuth = flags.Bool("enable-auth", envBool("NATIVE_OPS_ENABLE_AUTH"), "Serve local sign-in and session cookies for the UI (users.json in the state dir; manage people with /v1/users or 'native-ops user'). Env: NATIVE_OPS_ENABLE_AUTH=1")
+	v.oidcIssuer = flags.String("oidc-issuer", os.Getenv("NATIVE_OPS_OIDC_ISSUER"), "OpenID Connect issuer URL (e.g. https://accounts.google.com); enables OIDC sign-in. Env: NATIVE_OPS_OIDC_ISSUER")
+	v.oidcClientID = flags.String("oidc-client-id", os.Getenv("NATIVE_OPS_OIDC_CLIENT_ID"), "OIDC client id. Env: NATIVE_OPS_OIDC_CLIENT_ID")
+	v.oidcClientSecret = flags.String("oidc-client-secret", os.Getenv("NATIVE_OPS_OIDC_CLIENT_SECRET"), "OIDC client secret; better synced to the secret store as NATIVE_OPS_OIDC_CLIENT_SECRET (read at each sign-in). Env: NATIVE_OPS_OIDC_CLIENT_SECRET")
+	v.oidcRedirectURL = flags.String("oidc-redirect-url", os.Getenv("NATIVE_OPS_OIDC_REDIRECT_URL"), "OIDC redirect URL (e.g. https://native-ops.example/auth/oidc/callback). Env: NATIVE_OPS_OIDC_REDIRECT_URL")
+	v.oidcAllowedDomain = flags.String("oidc-allowed-domain", os.Getenv("NATIVE_OPS_OIDC_ALLOWED_DOMAIN"), "Only allow sign-in from emails at this domain (e.g. example.com). Env: NATIVE_OPS_OIDC_ALLOWED_DOMAIN")
+	v.oidcRole = flags.String("oidc-role", envOr("NATIVE_OPS_OIDC_ROLE", "viewer"), "Role a newly seen OIDC user gets: viewer, planner, deployer or admin; none creates nobody, so only users that already exist (PUT /v1/users/by-email) may sign in. Env: NATIVE_OPS_OIDC_ROLE")
+	v.oidcLabel = flags.String("oidc-label", envOr("NATIVE_OPS_OIDC_LABEL", "single sign-on"), "Text on the sign-in button. Env: NATIVE_OPS_OIDC_LABEL")
+	v.mcpOAuth = flags.Bool("mcp-oauth", envOr("NATIVE_OPS_MCP_OAUTH", "true") != "false", "With sign-in on (--enable-auth or --oidc-issuer), let MCP clients connect by signing their person in (OAuth), acting with that person's role, instead of with a pasted API token; --mcp-oauth=false turns it off. Env: NATIVE_OPS_MCP_OAUTH=false")
+	v.publicURL = flags.String("public-url", os.Getenv("NATIVE_OPS_PUBLIC_URL"), "The daemon's public origin (e.g. https://native-ops.example.com), named in the OAuth metadata; default: the origin of --oidc-redirect-url, else each request's. Env: NATIVE_OPS_PUBLIC_URL")
+	v.edgeContainer = flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
+	v.dnsProviderFlag = flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from for the status page, e.g. digitalocean (DO_API_TOKEN from the secret store, else the environment). Env: NATIVE_OPS_DNS_PROVIDER")
+	v.dnsDomains = flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for on the status page, e.g. 'example.com,example.net'. When set (or the synced secret NATIVE_OPS_DNS_ZONES is), a plan whose dns_records name another zone is blocked. Env: NATIVE_OPS_DNS_DOMAINS")
+	v.stateDir = stateDirFlag(flags)
+	return v
+}
+
+// validateServeFlags checks a flag set from fleet.yml's daemon.flags against exactly the flags serve
+// parses, before a deploy restarts the daemon into it.
+func validateServeFlags(set string) error {
+	args := strings.Fields(set)
+	if _, ok := serveflags.Value(args, "state-dir"); ok {
+		return errors.New("--state-dir cannot come from fleet.yml: it says where the daemon keeps its state, flags included")
+	}
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	defineServeFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%q is not a flag", fs.Arg(0))
+	}
+	return nil
+}
+
+func handleServeCommand(ctx context.Context, args []string) {
+	// The flags the last deploy applied from fleet.yml's daemon.flags replace the unit's, all but
+	// --state-dir and, when the set has none, --addr (pkg/serveflags): a flag changes through git.
+	unitStateDir := "/var/lib/native-ops"
+	if v, ok := serveflags.Value(args, "state-dir"); ok {
+		unitStateDir = v
+	}
+	managed, ferr := serveflags.Load(unitStateDir)
+	if ferr != nil {
+		log.Printf("daemon flags kept in %s: %v; starting with the unit's", unitStateDir, ferr)
+		managed = serveflags.Loaded{}
+	}
+	if managed.Note != "" {
+		log.Print(managed.Note)
+	}
+	if managed.Managed {
+		log.Printf("flags from fleet.yml (applied by a deploy) replace the unit's: %s", managed.Text)
+		args = serveflags.Merge(args, managed.Args, unitStateDir)
+	}
+
+	flags := flag.NewFlagSet("serve", flag.ExitOnError)
+	v := defineServeFlags(flags)
+	addr, pool, enableApply, approvalTTL, enableInstances, instanceProfiles, instanceImports, enableImageBuild, enableBackup, enableDNSSync, imageKeep, imageOrphanAge, imagePruneEvery, imagePrefix, gitURL, gitProvider, deployRepo, deployTags, enableEdgeApply, enableAuth, oidcIssuer, oidcClientID, oidcClientSecret, oidcRedirectURL, oidcAllowedDomain, oidcRole, oidcLabel, mcpOAuth, publicURL, edgeContainer, dnsProviderFlag, dnsDomains, stateDir := v.addr, v.pool, v.enableApply, v.approvalTTL, v.enableInstances, v.instanceProfiles, v.instanceImports, v.enableImageBuild, v.enableBackup, v.enableDNSSync, v.imageKeep, v.imageOrphanAge, v.imagePruneEvery, v.imagePrefix, v.gitURL, v.gitProvider, v.deployRepo, v.deployTags, v.enableEdgeApply, v.enableAuth, v.oidcIssuer, v.oidcClientID, v.oidcClientSecret, v.oidcRedirectURL, v.oidcAllowedDomain, v.oidcRole, v.oidcLabel, v.mcpOAuth, v.publicURL, v.edgeContainer, v.dnsProviderFlag, v.dnsDomains, v.stateDir
 	_ = flags.Parse(args)
 
 	for name, on := range map[string]bool{"--enable-dns-sync": *enableDNSSync, "--enable-edge-apply": *enableEdgeApply} {
@@ -167,7 +254,9 @@ func handleServeCommand(ctx context.Context, args []string) {
 	srv, closeFn, err := newDaemon(daemonConfig{
 		SelfUpgradeDir: managedBinDir(binDir),
 		Restart:        func() { restarting.Store(true); restartNow() },
-		Addr:           *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
+		Flags: &server.DaemonFlags{Running: managed.Text, Managed: managed.Managed, Validate: validateServeFlags,
+			Stage: func(set string) error { return serveflags.Stage(*stateDir, set) }},
+		Addr: *addr, Pool: *pool, StateDir: openStateDir(*stateDir), EnableApply: *enableApply, ApprovalTTL: *approvalTTL, EnableInstances: *enableInstances,
 		InstancePolicy:   engine.InstancePolicy{Profiles: splitList(*instanceProfiles), RouteImports: splitList(*instanceImports)},
 		EnableImageBuild: *enableImageBuild,
 		ImagePrefix:      *imagePrefix,
@@ -199,15 +288,21 @@ func handleServeCommand(ctx context.Context, args []string) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { <-restartCtx.Done(); cancel() }()
-	if managedBinDir(binDir) != "" {
-		go func() {
-			// A deploy that upgraded the daemon to fleet.yml's pin resumes once the upgrade has committed.
-			selfupdate.Commit(ctx, binDir, log.Printf)
-			if ctx.Err() == nil {
-				srv.ResumeDeploy()
-			}
-		}()
-	}
+	go func() {
+		// A deploy that restarted the daemon (onto fleet.yml's pin, or with its flags) resumes once the
+		// new binary and flags have served long enough to be committed.
+		var wg sync.WaitGroup
+		if dir := managedBinDir(binDir); dir != "" {
+			wg.Add(1)
+			go func() { defer wg.Done(); selfupdate.Commit(ctx, dir, log.Printf) }()
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); serveflags.Commit(ctx, *stateDir, log.Printf) }()
+		wg.Wait()
+		if ctx.Err() == nil {
+			srv.ResumeDeploy()
+		}
+	}()
 	go srv.RunImageRetention(ctx, *imagePruneEvery)
 	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v, self-upgrade: %v)", Version, *addr, *stateDir, *enableApply, managedBinDir(binDir) != "")
 	if err := srv.ListenAndServe(ctx); err != nil {
@@ -255,6 +350,8 @@ type daemonConfig struct {
 	// POST /v1/daemon/upgrade; Restart ends the process so systemd starts the upgraded binary.
 	SelfUpgradeDir string
 	Restart        func()
+	// Flags lets a deploy apply fleet.yml's daemon.flags (with Restart).
+	Flags *server.DaemonFlags
 	// ReleaseBase overrides where upgrades are downloaded from (tests).
 	ReleaseBase          string
 	ApprovalTTL          time.Duration
@@ -356,8 +453,13 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		}
 		if cfg.SelfUpgradeDir != "" {
 			up := &selfupdate.Updater{Dir: cfg.SelfUpgradeDir, ReleaseBase: cfg.ReleaseBase}
-			opts.Upgrade, opts.Restart = up.Install, cfg.Restart
+			opts.Upgrade = up.Install
+		}
+		// A deploy restarts the daemon for fleet.yml's pin (with Upgrade) or its flags, and resumes after.
+		if cfg.Restart != nil {
+			opts.Restart = cfg.Restart
 			opts.ResumeFile = filepath.Join(cfg.StateDir, "deploy-resume.json")
+			opts.Flags = cfg.Flags
 		}
 		if cfg.EnableBackup {
 			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup), restoreSource(cfg.Exec, cfg.Pool, lookup)

@@ -480,7 +480,8 @@ paths:
            without fetching anything);
         2. downloads that commit's tree from the git server;
         3. if fleet.yml pins another daemon release, upgrades to it, restarts, and resumes the deploy as
-           a new job on the new binary (this job ends with result `daemon_upgraded`);
+           a new job on the new binary (this job ends with result `daemon_upgraded`); likewise, if
+           fleet.yml's daemon.flags differ from the daemon's, restarts it with them (`daemon_reconfigured`);
         4. plans it; a blocked plan fails the job and nothing changes; nothing to change ends it with
            result `no_changes`;
         5. applies the plan (result `applied`).
@@ -1285,13 +1286,13 @@ components:
         position: { type: integer, description: "A queued job's place in line (1 runs next)." }
         error: { type: string }
         result: { $ref: "#/components/schemas/DeployResult" }
-        next: { type: string, description: "A deploy that upgraded the daemon (result daemon_upgraded) continues as this job; follow it." }
+        next: { type: string, description: "A deploy that restarted the daemon (result daemon_upgraded or daemon_reconfigured) continues as this job; follow it." }
         log: { type: string, description: "For deployers and admins; not in lists." }
         log_truncated: { type: boolean }
     DeployResult:
       type: string
-      enum: [applied, no_changes, daemon_upgraded]
-      description: How a deploy that succeeded ended. daemon_upgraded means it moved the daemon to fleet.yml's pin and resumed as a new deploy job.
+      enum: [applied, no_changes, daemon_upgraded, daemon_reconfigured]
+      description: How a deploy that succeeded ended. daemon_upgraded means it moved the daemon to fleet.yml's pin, daemon_reconfigured that it restarted the daemon with fleet.yml's daemon.flags; either way it resumed as a new deploy job (next).
     Deploy:
       type: object
       required: [job, tag, status, actor, started]

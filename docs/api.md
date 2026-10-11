@@ -187,7 +187,9 @@ over, health gate, automatic rollback on failure.
 3. **Follows the daemon pin.** If `fleet.yml`'s `daemon: {version, sha256}` names another release, the
    job installs it (checksum-verified), ends with `result: daemon_upgraded`, and the daemon restarts.
    The new binary resumes the deploy as a **new** `deploy` job for the same tag. Look for it in
-   `GET /v1/deploys`.
+   `GET /v1/deploys`. Likewise, if `fleet.yml`'s `daemon.flags` differ from the flags the daemon runs, the job
+   stores them, ends with `result: daemon_reconfigured` and restarts the daemon with them; the deploy resumes
+   as a new job ([docs/daemon.md](daemon.md#the-daemons-flags-from-git)).
 4. **Plans** the commit and records the plan as approved by the tag (`plan_hash` on the job).
    A **blocked** plan fails the job and nothing changes. **Nothing to change** ends it with
    `result: no_changes`.
@@ -199,6 +201,7 @@ over, health gate, automatic rollback on failure.
 | `succeeded` | `applied` | the host now matches the tag |
 | `succeeded` | `no_changes` | the host already matched the tag |
 | `succeeded` | `daemon_upgraded` | the daemon moved to the pin; the deploy continues as a new job |
+| `succeeded` | `daemon_reconfigured` | the daemon restarted with `fleet.yml`'s `daemon.flags`; the deploy continues as a new job |
 | `failed` | | see `error` (and the log); what was applied before the failure stays applied |
 | `interrupted` | | the daemon stopped mid-job; deploy the same tag again (applies converge) |
 
@@ -214,6 +217,7 @@ over, health gate, automatic rollback on failure.
 | job failed: `the plan is blocked` | apply would fail (e.g. an image that does not exist yet) | `deploy-plan` shows which service and why; fix the configuration or build the image, tag again |
 | `422 tag_unresolved` | the git server has no such tag, or it does not match the deploy tag pattern | check the tag was pushed, and its name |
 | `502 git_unavailable` | the daemon could not read the commit | check the git server, and the daemon's `NATIVE_OPS_GIT_TOKEN` |
+| `daemon_reconfigured`, then a failed deploy saying the flags "did not start" | the new flags kept the daemon from starting; it went back to its previous ones | see `journalctl -u native-ops-serve`; fix `daemon.flags`, tag again |
 | `daemon_upgraded`, then a failed deploy saying the new binary "did not stay up" | the pinned release did not start and the old one was put back | see `journalctl -u native-ops-serve` on the host; fix or lower the pin, tag again |
 | `interrupted` | the daemon restarted mid-job | deploy the same tag again |
 

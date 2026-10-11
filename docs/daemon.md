@@ -749,6 +749,40 @@ records the deploy as failed instead of running it. So a daemon upgrade is a rev
   with `remote daemon-upgrade` once.
 - Without a `daemon:` section, deploys never change the daemon.
 
+### The daemon's flags (from git)
+
+The daemon's flags come from `fleet.yml` too, so turning a feature on or retiring a flag is a reviewed change,
+not an edit to the systemd unit on the host:
+
+```yaml
+daemon:
+  version: v1.73.0
+  sha256: <...>
+  flags: "--enable-apply --enable-image-build --git-url https://git.example.com --deploy-repo acme/native-ops-conf"
+```
+
+cloud-init has always written these into a new host's unit. On a running daemon, a deploy whose `daemon.flags`
+differ from the flags the daemon runs with now applies them, the way it applies the version:
+
+1. It checks the set against exactly the flags `serve` parses (an unknown flag or a bad value fails the
+   deploy, and nothing changes), refuses `--state-dir`, and refuses to move `--addr` (the edge reaches the
+   daemon there: a deploy that moved it would cut its own way back off).
+2. It stores the set in the state directory (`serve.flags`, pending), records the deploy to resume, ends
+   with `result: daemon_reconfigured`, and restarts.
+3. At startup, a kept set **replaces the unit's flags**, all but `--state-dir` and, when the set has none,
+   `--addr`. So the unit needs nothing more than those two, and a host whose unit carries old flags (a
+   retired one, say) is brought in line by its next deploy, without anyone logging in.
+4. Once the daemon has served on the new set for 30 seconds the set is committed, and the deploy resumes
+   as a new job (`remote deploy` follows it). A set that keeps the daemon from starting is dropped after
+   3 starts and the daemon goes back to its previous flags; the resumed deploy is then recorded as failed,
+   never retried in a loop.
+
+- `remote deploy-plan` and `POST /v1/deploy/plan` say when a deploy would restart the daemon for its flags
+  (`daemon.flags.change`).
+- Removing `daemon.flags` from `fleet.yml` goes back to the unit's flags, with one restart.
+- A deploy that upgrades the daemon and changes its flags restarts twice: the new release first, then its
+  flags, checked by the new release.
+
 For a one-off upgrade outside a deploy, an admin can call the endpoint directly:
 
 ```bash

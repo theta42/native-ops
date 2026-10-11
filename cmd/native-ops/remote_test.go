@@ -335,7 +335,7 @@ func TestEveryServeFlagIsInTheConfigurationReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := strings.Index(string(src), "func handleServeCommand")
+	start := strings.Index(string(src), "func defineServeFlags")
 	end := strings.Index(string(src)[start:], "\n}\n")
 	body := string(src)[start : start+end]
 	re := regexp.MustCompile(`flags\.(?:String|Bool|Int|Duration)\("([a-z-]+)"`)
@@ -449,6 +449,25 @@ func TestDeployPlanExitsByWhatTheTagWouldDo(t *testing.T) {
 		answer = body
 		if got := c.deployPlan(context.Background(), "deploy-1"); got != want {
 			t.Errorf("%s: exit %d, want %d", body, got, want)
+		}
+	}
+}
+
+// A deploy checks fleet.yml's daemon.flags against exactly the flags serve parses, before it restarts.
+func TestServeFlagsFromFleetYmlAreChecked(t *testing.T) {
+	for _, ok := range []string{"", "--enable-apply --image-prefix opsavor- --git-url https://git.example.com", "--enable-edge-apply", "--addr=10.0.100.1:8686"} {
+		if err := validateServeFlags(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for bad, want := range map[string]string{
+		"--enable-apply --no-such-flag": "not defined",
+		"--state-dir /tmp/elsewhere":    "--state-dir",
+		"--enable-apply stray":          "not a flag",
+		"--image-keep many":             "invalid value",
+	} {
+		if err := validateServeFlags(bad); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: %v", bad, err)
 		}
 	}
 }

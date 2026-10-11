@@ -162,7 +162,7 @@ var mcpTools = []mcpTool{
 	},
 	{
 		name: "list_deploys", title: "List deploys",
-		description: "Deploys, newest first: current is the newest deploy that left the host matching its tag (what it runs now), running is the deploy in progress. Each names the tag, commit, outcome (result: applied, no_changes, daemon_upgraded), who ran it and the plan's counts.",
+		description: "Deploys, newest first: current is the newest deploy that left the host matching its tag (what it runs now), running is the deploy in progress. Each names the tag, commit, outcome (result: applied, no_changes, daemon_upgraded, daemon_reconfigured), who ran it and the plan's counts.",
 		schema:      obj(map[string]any{"limit": intProp("How many deploys to list (default 50).", 1, keepJobs)}),
 		min:         RoleViewer, readOnly: true, enabled: func(o *Options) bool { return o.Deploy != nil && o.Apply != nil },
 		call: get(func(a map[string]any) (string, error) { q, err := query(a, "limit"); return "/v1/deploys" + q, err }),
@@ -183,7 +183,7 @@ var mcpTools = []mcpTool{
 	},
 	{
 		name: "deploy", title: "Deploy a tag",
-		description: "Deploy the commit a protected deploy tag points at, as a job: plan it, refuse a blocked plan, apply it. The tag must already be pushed in git (the push is the approval). Changes the host: show the person plan_deploy's plan first. Returns the job (queued if another change runs first); with wait_seconds, the job once it ends (or still queued or running when the wait is over; follow it with get_job). A deploy that upgrades the daemon first ends with result daemon_upgraded; the deploy continues as the job named in next.",
+		description: "Deploy the commit a protected deploy tag points at, as a job: plan it, refuse a blocked plan, apply it. The tag must already be pushed in git (the push is the approval). Changes the host: show the person plan_deploy's plan first. Returns the job (queued if another change runs first); with wait_seconds, the job once it ends (or still queued or running when the wait is over; follow it with get_job). A deploy that restarts the daemon first (onto fleet.yml's pin, or with its daemon.flags) ends with result daemon_upgraded or daemon_reconfigured; the deploy continues as the job named in next.",
 		schema: obj(map[string]any{
 			"tag":          strProp("The deploy tag, e.g. deploy-2026.10.03."),
 			"wait_seconds": waitProp,

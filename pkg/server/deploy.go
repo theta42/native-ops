@@ -43,7 +43,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor, _ := s.actorScope(r)
-	job, err := s.startDeploy(body.Tag, actor, false)
+	job, err := s.startDeploy(body.Tag, actor, nil)
 	if err != nil {
 		s.answerNotStarted(w, r, "deploy "+body.Tag, err)
 		return
@@ -56,9 +56,10 @@ type errBusy string
 
 func (e errBusy) Error() string { return string(e) }
 
-// startDeploy queues the deploy job for a tag: it runs when the host is free. resumed is a deploy that an
-// upgrade to fleet.yml's daemon pin interrupted, now running on the new binary: it never upgrades again.
-func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
+// startDeploy queues the deploy job for a tag: it runs when the host is free. resume is the record of the
+// daemon restart a deploy is resuming from (an upgrade to fleet.yml's pin, or its flags), else nil.
+func (s *Server) startDeploy(tag, actor string, resume *deployResume) (Job, error) {
+	resumed := resume != nil
 	var tmp string
 	cleanup := func() {
 		if tmp != "" {
@@ -89,11 +90,11 @@ func (s *Server) startDeploy(tag, actor string, resumed bool) (Job, error) {
 			// The protected tag is also the approval of the image recipe in this commit.
 			s.approveRecipeFromTag(root, tag, sha, logf)
 
-			// fleet.yml's daemon pin is the version the commit was written for: move to it first, so the
-			// plan and the apply run on that binary.
-			if upgraded, err := s.followPin(ctx, root, tag, actor, id, resumed, logf); err != nil || upgraded {
-				if upgraded && err == nil {
-					result(ResultDaemonUpgraded)
+			// fleet.yml's daemon section is the release and flags the commit was written for: move to them
+			// first, so the plan and the apply run on that daemon.
+			if restarted, err := s.followPin(ctx, root, tag, actor, id, resume, logf); err != nil || restarted != "" {
+				if err == nil {
+					result(restarted)
 				}
 				return err
 			}
@@ -159,6 +160,8 @@ const (
 	ResultApplied        = "applied"         // the plan's changes were applied: the host now matches the tag
 	ResultNoChanges      = "no_changes"      // the host already matched the tag
 	ResultDaemonUpgraded = "daemon_upgraded" // the daemon moved to fleet.yml's pin; the deploy resumes as a new job
+	// the daemon restarted with fleet.yml's daemon.flags; the deploy resumes as a new job
+	ResultDaemonReconfigured = "daemon_reconfigured"
 )
 
 // resolveTag resolves a deploy tag to its commit on the git server and names the protection rule that

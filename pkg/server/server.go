@@ -71,6 +71,8 @@ type Options struct {
 	// ResumeFile, with Upgrade and Deploy, lets a deploy move the daemon to fleet.yml's `daemon` pin:
 	// the deploy upgrades, records itself here, restarts, and the new binary resumes it (see pin.go).
 	ResumeFile string
+	// Flags, with ResumeFile and Restart, lets a deploy apply fleet.yml's daemon.flags (see pin.go).
+	Flags *DaemonFlags
 	// Deploy, with Apply, enables POST /v1/deploy: apply the commit a protected deploy tag points at,
 	// read from the git server, with the tag as the approval (see deploy.go). DeployTags is the tag
 	// pattern, for the UI.

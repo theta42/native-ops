@@ -323,6 +323,10 @@ func (c *remoteClient) deployPlan(ctx context.Context, tag string) int {
 			Running string `json:"running"`
 			Pinned  string `json:"pinned"`
 			Upgrade bool   `json:"upgrade"`
+			Flags   *struct {
+				Set    string `json:"set"`
+				Change bool   `json:"change"`
+			} `json:"flags"`
 		} `json:"daemon"`
 	}
 	if code, raw := c.json(ctx, "POST", "/v1/deploy/plan", map[string]string{"tag": tag}, &out); code != http.StatusOK {
@@ -331,6 +335,13 @@ func (c *remoteClient) deployPlan(ctx context.Context, tag string) int {
 	fmt.Printf("%s is commit %s\n", tag, out.Sha[:12])
 	if out.Daemon.Upgrade {
 		fmt.Printf("the deploy would first upgrade the daemon from %s to %s, as fleet.yml pins; this plan was made by %s\n", out.Daemon.Running, out.Daemon.Pinned, out.Daemon.Running)
+	}
+	if f := out.Daemon.Flags; f != nil && f.Change {
+		set := f.Set
+		if set == "" {
+			set = "the unit's own"
+		}
+		fmt.Printf("the deploy would first restart the daemon with fleet.yml's daemon flags (%s)\n", set)
 	}
 	printLog(out.Text)
 	fmt.Printf("plan %s\n", out.Hash)
@@ -510,16 +521,16 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 			fatalf("reading job %s: the daemon answered %d: %s", id, code, raw)
 		}
 		switch {
-		case job.Status == "succeeded" && job.Result == server.ResultDaemonUpgraded && job.Next != "":
+		case job.Status == "succeeded" && restartedDaemon(job.Result) && job.Next != "":
 			printLog(job.Log)
-			fmt.Printf("job %s upgraded the daemon; the deploy continues as job %s\n", id, job.Next)
+			fmt.Printf("job %s restarted the daemon; the deploy continues as job %s\n", id, job.Next)
 			id, lastPosition, followUntil = job.Next, -1, time.Time{}
 			continue
-		case job.Status == "succeeded" && job.Result == server.ResultDaemonUpgraded:
-			// The daemon is restarting; the new binary links the resumed deploy once it is up.
+		case job.Status == "succeeded" && restartedDaemon(job.Result):
+			// The daemon is restarting; once it is up it links the resumed deploy.
 			if followUntil.IsZero() {
 				printLog(job.Log)
-				fmt.Printf("job %s upgraded the daemon; waiting for it to resume the deploy\n", id)
+				fmt.Printf("job %s restarted the daemon (%s); waiting for it to resume the deploy\n", id, job.Result)
 				followUntil = time.Now().Add(resumeWindow)
 			} else if next := c.resumedDeploy(ctx, id, job.Service, job.Created); next != "" {
 				// A daemon older than v1.71.0 wrote the resume record, so nothing links the two jobs: the
@@ -553,6 +564,12 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 		case <-time.After(waitPoll):
 		}
 	}
+}
+
+// restartedDaemon reports whether a deploy ended by restarting the daemon (onto fleet.yml's pin, or with
+// its flags), so the deploy itself continues as another job.
+func restartedDaemon(result string) bool {
+	return result == server.ResultDaemonUpgraded || result == server.ResultDaemonReconfigured
 }
 
 // resumedDeploy finds the deploy of tag that started after the job `after` (created at since), oldest

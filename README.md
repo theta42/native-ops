@@ -513,7 +513,8 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
 - **The daemon upgrades itself on a deploy.** Bump `daemon: {version, sha256}` in `fleet.yml` and push a
   deploy tag: the daemon installs the checksum-pinned release, restarts on it and resumes the deploy, with
   the previous binary kept and put back by the unit if the new one cannot stay up. No CI job holds an
-  admin token for it (`native-ops remote daemon-upgrade` remains for one-off upgrades).
+  admin token for it (`native-ops remote daemon-upgrade` remains for one-off upgrades). Its flags come from
+  `fleet.yml` (`daemon.flags`) the same way: a deploy restarts it with them, so no unit is edited by hand.
 - **Credentials are entered in git, kept on the host.** The daemon's own credentials (DNS token, backup
   keys, OIDC secret) go into the git server's secret store; CI pushes them to the daemon
   (`native-ops remote secret-sync`), which keeps them on the host. Nobody logs in to put them there.
