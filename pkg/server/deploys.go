@@ -11,6 +11,7 @@ import (
 
 	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/engine"
+	"github.com/theta42/native-ops/pkg/serveflags"
 )
 
 // A deploy is a job of kind "deploy" (see deploy.go). These endpoints answer the questions asked about
@@ -156,9 +157,20 @@ func (s *Server) handleDeployPlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	daemon := map[string]any{"running": s.opts.Version}
-	if fleet, err := config.LoadFleetConfig(root); err == nil && fleet.Daemon != nil && fleet.Daemon.Version != "" {
-		daemon["pinned"] = fleet.Daemon.Version
-		daemon["upgrade"] = fleet.Daemon.Version != s.opts.Version && releaseRe.MatchString(s.opts.Version)
+	if fleet, err := config.LoadFleetConfig(root); err == nil {
+		if fleet.Daemon != nil && fleet.Daemon.Version != "" {
+			daemon["pinned"] = fleet.Daemon.Version
+			daemon["upgrade"] = fleet.Daemon.Version != s.opts.Version && releaseRe.MatchString(s.opts.Version)
+		}
+		// fleet.yml's daemon.flags against the ones the daemon runs: a difference restarts it first.
+		if f := s.opts.Flags; f != nil {
+			want := ""
+			if fleet.Daemon != nil {
+				want = serveflags.Normalize(fleet.Daemon.Flags)
+			}
+			daemon["flags"] = map[string]any{"set": want, "running": f.Running, "managed": f.Managed,
+				"change": !(want == "" && !f.Managed) && !(want != "" && f.Managed && want == f.Running)}
+		}
 	}
 
 	pctx, pcancel := context.WithTimeout(ctx, 60*time.Second)
