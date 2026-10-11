@@ -1,10 +1,17 @@
 // Vanilla, dependency-free, and never builds markup from data: every value from
 // the API goes in with textContent, so a container named "<script>" is just text.
 // (The markup below is built with createElement for the same reason.)
+//
+// Live, not polled: GET /v1/events (a WebSocket) says when something a page shows has changed, and the
+// page reads it again. A redraw patches the page in place (morph), so what someone is typing, a
+// scrolled log or a text selection survive it.
 const KEY = "native-ops-token";
-const REFRESH_MS = 10000;
+const FALLBACK_MS = 30000; // reload this often only while the event stream is down
 const view = document.getElementById("view");
 let timer = null;
+let events = null;     // the WebSocket
+let live = false;      // the event stream is connected
+let retryMs = 1000;    // reconnect backoff
 let snapshot = null;
 let loadError = "";
 let role = "";      // the signed-in token's role (viewer, planner, deployer, admin)
@@ -13,10 +20,13 @@ let notice = null;  // {kind, text} shown above the page after an action
 let methods = { local_signin: false, oidc: false, oidc_label: "" }; // how this daemon lets people sign in
 let authUser = null; // {username, role} when signed in with a session cookie
 
-// h("div", {class: "card"}, child, "text", ...) -> element. Strings become text nodes.
+// h("div", {class: "card", on: {click: fn}}, child, "text", ...) -> element. Strings become text nodes.
+// Handlers go in `on`, never addEventListener: a redraw keeps the element on the page and hands it the
+// new handlers (see morph), so a button always acts on the data it is drawn from.
 function h(tag, attrs, ...children) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "on") { listen(e, v); continue; }
     if (v === false || v === null || v === undefined) continue;
     e.setAttribute(k, v === true ? "" : String(v));
   }
@@ -25,6 +35,44 @@ function h(tag, attrs, ...children) {
     e.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
   return e;
+}
+
+// listen gives an element its handlers, through one dispatcher per event type, so morph can swap them.
+function listen(e, handlers) {
+  e._on = handlers || {};
+  e._types = e._types || new Set();
+  for (const type of Object.keys(e._on)) {
+    if (e._types.has(type)) continue;
+    e._types.add(type);
+    e.addEventListener(type, (ev) => e._on && e._on[type] && e._on[type](ev));
+  }
+}
+
+// morph makes `from` (on the page) look like `to` (just drawn) while keeping every node that can stay:
+// an input keeps what is typed in it, a <pre> its scroll, the page its selection and focus.
+function morph(from, to) {
+  if (from.nodeType !== to.nodeType || from.nodeName !== to.nodeName) {
+    from.replaceWith(to);
+    return;
+  }
+  if (from.nodeType === Node.TEXT_NODE) {
+    if (from.nodeValue !== to.nodeValue) from.nodeValue = to.nodeValue;
+    return;
+  }
+  if (from.nodeType !== Node.ELEMENT_NODE) return;
+  for (const a of [...from.attributes]) if (!to.hasAttribute(a.name)) from.removeAttribute(a.name);
+  for (const a of [...to.attributes]) if (from.getAttribute(a.name) !== a.value) from.setAttribute(a.name, a.value);
+  if (to._on || from._on) listen(from, to._on);
+  const a = [...from.childNodes];
+  const b = [...to.childNodes];
+  b.forEach((child, i) => (i < a.length ? morph(a[i], child) : from.appendChild(child)));
+  for (let i = b.length; i < a.length; i++) a[i].remove();
+}
+
+// paint puts a freshly drawn tree on the page, patching what is there.
+function paint(tree) {
+  if (view.firstChild && view.childNodes.length === 1) morph(view.firstChild, tree);
+  else view.replaceChildren(tree);
 }
 
 const icon = (name, extra) => h("i", { class: `fa-solid fa-${name}${extra ? " " + extra : ""}` });
@@ -96,24 +144,26 @@ function loginView(message) {
   const staff = methods.local_signin || methods.oidc;
 
   if (methods.local_signin) {
-    const username = h("input", { type: "text", class: "form-control", placeholder: "username", autocomplete: "username", "aria-label": "Username", required: true });
-    const password = h("input", { type: "password", class: "form-control", placeholder: "password", autocomplete: "current-password", "aria-label": "Password", required: true });
-    const form = h("form", { autocomplete: "on" },
-      h("div", { class: "mb-2" }, h("div", { class: "input-group" }, h("span", { class: "input-group-text" }, icon("user")), username)),
-      h("div", { class: "mb-2" }, h("div", { class: "input-group" }, h("span", { class: "input-group-text" }, icon("key")), password)),
-      h("button", { type: "submit", class: "btn btn-info w-100" }, "Sign in"));
-    form.addEventListener("submit", async (e) => {
+    const username = h("input", { type: "text", name: "username", class: "form-control", placeholder: "username", autocomplete: "username", "aria-label": "Username", required: true });
+    const password = h("input", { type: "password", name: "password", class: "form-control", placeholder: "password", autocomplete: "current-password", "aria-label": "Password", required: true });
+    // The handlers read the form on the page (e.currentTarget), not these elements: a redraw keeps the
+    // page's inputs and drops these.
+    const form = h("form", { autocomplete: "on", on: { submit: async (e) => {
       e.preventDefault();
+      const f = e.currentTarget.elements;
       try {
-        const out = await api("/api/login", "POST", { username: username.value.trim(), password: password.value });
-        authUser = out.user || { username: username.value.trim() };
-        password.value = "";
+        const out = await api("/api/login", "POST", { username: f.username.value.trim(), password: f.password.value });
+        authUser = out.user || { username: f.username.value.trim() };
+        f.password.value = "";
         start();
       } catch (err) {
         loadError = err.message;
         render();
       }
-    });
+    } } },
+      h("div", { class: "mb-2" }, h("div", { class: "input-group" }, h("span", { class: "input-group-text" }, icon("user")), username)),
+      h("div", { class: "mb-2" }, h("div", { class: "input-group" }, h("span", { class: "input-group-text" }, icon("key")), password)),
+      h("button", { type: "submit", class: "btn btn-info w-100" }, "Sign in"));
     blocks.push(form);
   }
 
@@ -123,17 +173,17 @@ function loginView(message) {
   }
 
   // A pasted API token still works: a machine-style credential, or an older daemon with no sign-in.
-  const token = h("input", { type: "password", class: "form-control form-control-sm", placeholder: "nops_…", autocomplete: "off", spellcheck: "false", "aria-label": "API token" });
-  const tokenForm = h("form", { autocomplete: "off" },
+  const token = h("input", { type: "password", name: "token", class: "form-control form-control-sm", placeholder: "nops_…", autocomplete: "off", spellcheck: "false", "aria-label": "API token" });
+  const tokenForm = h("form", { autocomplete: "off", on: { submit: (e) => {
+    e.preventDefault();
+    const field = e.currentTarget.elements.token;
+    if (!field.value.trim()) return;
+    sessionStorage.setItem(KEY, field.value.trim());
+    field.value = "";
+    start();
+  } } },
     h("div", { class: "input-group input-group-sm" }, h("span", { class: "input-group-text" }, icon("key")), token,
       h("button", { type: "submit", class: "btn btn-outline-secondary" }, "Use token")));
-  tokenForm.addEventListener("submit", (e) => {
-    e.preventDefault();
-    if (!token.value.trim()) return;
-    sessionStorage.setItem(KEY, token.value.trim());
-    token.value = "";
-    start();
-  });
   blocks.push(h("div", { class: "mt-3 pt-3 border-top" },
     h("p", { class: "text-muted small mb-2" }, "Or paste an API token (kept for this browser tab only)."),
     tokenForm));
@@ -278,15 +328,14 @@ function planView(p) {
   const canApprove = applyEnabled && role === "admin" && ["pending", "expired", "approved"].includes(p.state);
   const buttons = [];
   if (canApprove) {
-    buttons.push(h("button", { type: "button", class: "btn btn-sm btn-success me-1", "data-act": "approve" }, icon("check", "me-1"), p.state === "approved" ? "Renew approval" : "Approve"));
+    buttons.push(h("button", { type: "button", class: "btn btn-sm btn-success me-1",
+      on: { click: () => act("POST", `/v1/plans/${p.hash}/approve`, "Approved. One apply of exactly this plan may now run.") } },
+      icon("check", "me-1"), p.state === "approved" ? "Renew approval" : "Approve"));
   }
   if (role === "admin" && p.state === "approved") {
-    buttons.push(h("button", { type: "button", class: "btn btn-sm btn-outline-danger", "data-act": "withdraw" }, icon("ban", "me-1"), "Withdraw"));
-  }
-  for (const b of buttons) {
-    b.addEventListener("click", () => act(b.getAttribute("data-act") === "approve" ? "POST" : "DELETE",
-      `/v1/plans/${p.hash}/${b.getAttribute("data-act") === "approve" ? "approve" : "approval"}`,
-      b.getAttribute("data-act") === "approve" ? "Approved. One apply of exactly this plan may now run." : "Approval withdrawn."));
+    buttons.push(h("button", { type: "button", class: "btn btn-sm btn-outline-danger",
+      on: { click: () => act("DELETE", `/v1/plans/${p.hash}/approval`, "Approval withdrawn.") } },
+      icon("ban", "me-1"), "Withdraw"));
   }
   const approval = p.approval ? `${p.approval.by}, until ${when(p.approval.expires)}` : "";
   const used = p.used ? h("a", { href: "#/jobs/" + p.used.job }, p.used.job) : "";
@@ -321,12 +370,11 @@ let created = null; // {name, secret}
 
 function tokensView(d) {
   const rows = (d.tokens || []).map((t) => {
-    const revoke = h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("trash", "me-1"), "Revoke");
-    revoke.addEventListener("click", () => {
+    const revoke = h("button", { type: "button", class: "btn btn-sm btn-outline-danger", on: { click: () => {
       if (confirm(`Revoke the token "${t.name}"? Anything using it stops working at once.`)) {
         act("DELETE", `/v1/tokens/${encodeURIComponent(t.id)}`, `Token "${t.name}" revoked.`);
       }
-    });
+    } } }, icon("trash", "me-1"), "Revoke");
     const scope = t.scope ? [
       (t.scope.names || []).length ? `names ${t.scope.names.join(",")}` : "",
       (t.scope.images || []).length ? `images ${t.scope.images.join(",")}` : "",
@@ -335,14 +383,29 @@ function tokensView(d) {
     return [t.name, badge(t.role, t.role === "admin" ? "danger" : t.role === "deployer" ? "warning" : "secondary"), scope, when(t.created), h("code", {}, t.id), revoke];
   });
 
-  const name = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "name, e.g. ci-plan", required: true, maxlength: "60", "aria-label": "Token name" });
-  const roleSel = h("select", { class: "form-select form-select-sm", "aria-label": "Role" },
-    ["planner", "deployer", "viewer", "admin"].map((r) => h("option", { value: r }, r)));
-  const names = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "instance globs, e.g. demo-*", "aria-label": "Instance name globs" });
-  const images = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "image globs, e.g. app-web:*", "aria-label": "Image globs" });
-  const domains = h("input", { type: "text", class: "form-control form-control-sm", placeholder: "domain globs, e.g. *.example.com", "aria-label": "Domain globs" });
+  const name = h("input", { type: "text", name: "name", class: "form-control form-control-sm", placeholder: "name, e.g. ci", required: true, maxlength: "60", "aria-label": "Token name" });
+  const roleSel = h("select", { name: "role", class: "form-select form-select-sm", "aria-label": "Role" },
+    ["deployer", "viewer", "planner", "admin"].map((r) => h("option", { value: r }, r)));
+  const names = h("input", { type: "text", name: "names", class: "form-control form-control-sm", placeholder: "instance globs, e.g. demo-*", "aria-label": "Instance name globs" });
+  const images = h("input", { type: "text", name: "images", class: "form-control form-control-sm", placeholder: "image globs, e.g. app-web:*", "aria-label": "Image globs" });
+  const domains = h("input", { type: "text", name: "domains", class: "form-control form-control-sm", placeholder: "domain globs, e.g. *.example.com", "aria-label": "Domain globs" });
   const list = (el) => el.value.split(",").map((x) => x.trim()).filter(Boolean);
-  const form = h("form", { class: "card-body border-top" },
+  const form = h("form", { class: "card-body border-top", on: { submit: async (e) => {
+    e.preventDefault();
+    const f = e.currentTarget.elements; // the form on the page, which a redraw keeps
+    const body = { name: f.name.value.trim(), role: f.role.value };
+    if (f.names.value || f.images.value || f.domains.value) body.scope = { names: list(f.names), images: list(f.images), domains: list(f.domains) };
+    try {
+      const out = await api("/v1/tokens", "POST", body);
+      created = { name: out.token.name, secret: out.secret };
+      notice = null;
+      for (const el of [f.name, f.names, f.images, f.domains]) el.value = "";
+    } catch (err) {
+      if (err.auth) return signOut("Your sign-in is no longer valid.");
+      notice = { kind: "danger", text: err.message };
+    }
+    await refresh();
+  } } },
     h("div", { class: "row g-2 align-items-end" },
       h("div", { class: "col-md-3" }, name),
       h("div", { class: "col-md-2" }, roleSel),
@@ -351,22 +414,9 @@ function tokensView(d) {
       h("div", { class: "col-md-2" }, domains),
       h("div", { class: "col-md-1" }, h("button", { type: "submit", class: "btn btn-sm btn-success w-100" }, icon("plus"), " Create"))),
     h("p", { class: "text-muted small mt-2 mb-0" },
-      "A planner token can plan and nothing else: give it to pull-request pipelines. A deployer token applies only plans an admin approved. " +
-      "Fill in instance and image globs to make a scoped deployer token that can manage only those tenant instances."));
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const body = { name: name.value.trim(), role: roleSel.value };
-    if (names.value || images.value || domains.value) body.scope = { names: list(names), images: list(images), domains: list(domains) };
-    try {
-      const out = await api("/v1/tokens", "POST", body);
-      created = { name: out.token.name, secret: out.secret };
-      notice = null;
-    } catch (err) {
-      if (err.auth) return signOut("Your sign-in is no longer valid.");
-      notice = { kind: "danger", text: err.message };
-    }
-    await refresh();
-  });
+      "A configuration repository's CI needs one deployer token (NATIVE_OPS_TOKEN): it deploys only protected tags, builds only approved recipes, " +
+      "applies only plans an admin approved and sets only service secrets. Fill in instance and image globs to make a scoped deployer token " +
+      "that can manage only those tenant instances (a fleet manager's)."));
 
   const shown = created ? h("div", { class: "alert alert-success" },
     h("div", { class: "mb-2" }, icon("key", "me-1"), `Token "${created.name}" created. Copy the secret now: it is not shown again.`),
@@ -384,12 +434,11 @@ function tokensView(d) {
 // at /mcp only; revoking one ends its access at once.
 function grantsCard(list) {
   const rows = list.map((g) => {
-    const revoke = h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("trash", "me-1"), "Revoke");
-    revoke.addEventListener("click", () => {
+    const revoke = h("button", { type: "button", class: "btn btn-sm btn-outline-danger", on: { click: () => {
       if (confirm(`Revoke "${g.client_name}" for ${g.username}? It stops working at once; they can sign it in again.`)) {
         act("DELETE", `/v1/oauth/grants/${encodeURIComponent(g.id)}`, `Access for "${g.client_name}" (${g.username}) revoked.`);
       }
-    });
+    } } }, icon("trash", "me-1"), "Revoke");
     return [g.client_name, g.username, when(g.created), when(g.last_used), revoke];
   });
   return card("robot", "Agent sign-ins",
@@ -404,12 +453,11 @@ function grantsCard(list) {
 // is never sent back.
 function secretsCard(list) {
   const rows = list.map((s) => {
-    const del = h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("trash", "me-1"), "Delete");
-    del.addEventListener("click", () => {
+    const del = h("button", { type: "button", class: "btn btn-sm btn-outline-danger", on: { click: () => {
       if (confirm(`Delete the secret ${s.name} from this daemon? Whatever needs it stops working until it is synced again.`)) {
         act("DELETE", `/v1/secrets/${encodeURIComponent(s.name)}`, `Secret ${s.name} deleted.`);
       }
-    });
+    } } }, icon("trash", "me-1"), "Delete");
     return [h("code", {}, s.name), s.set_by, when(s.set_at), del];
   });
   return card("lock", "Daemon secrets",
@@ -429,13 +477,13 @@ function recipesView(d) {
     const approved = !!r.approved_at;
     const buttons = [];
     if (role === "admin") {
-      const b = approved
-        ? h("button", { type: "button", class: "btn btn-sm btn-outline-danger" }, icon("ban", "me-1"), "Withdraw")
-        : h("button", { type: "button", class: "btn btn-sm btn-success" }, icon("check", "me-1"), "Approve");
-      b.addEventListener("click", () => approved
-        ? act("DELETE", `/v1/images/recipes/${r.digest}/approval`, "Approval withdrawn: builds from this recipe are refused again.")
-        : act("POST", `/v1/images/recipes/${r.digest}/approve`, "Approved: builds from this recipe may run, for any ref."));
-      buttons.push(b);
+      buttons.push(approved
+        ? h("button", { type: "button", class: "btn btn-sm btn-outline-danger",
+            on: { click: () => act("DELETE", `/v1/images/recipes/${r.digest}/approval`, "Approval withdrawn: builds from this recipe are refused again.") } },
+            icon("ban", "me-1"), "Withdraw")
+        : h("button", { type: "button", class: "btn btn-sm btn-success",
+            on: { click: () => act("POST", `/v1/images/recipes/${r.digest}/approve`, "Approved: builds from this recipe may run, for any ref.") } },
+            icon("check", "me-1"), "Approve"));
     }
     return [
       when(r.last_seen),
@@ -494,14 +542,15 @@ function jobView(j) {
       h("a", { href: "#/jobs", class: "btn btn-sm btn-outline-secondary" }, icon("arrow-left", "me-1"), "All jobs")));
 }
 
-// Pages that load their own data. `nav` is the top-nav item that is highlighted for it.
+// Pages that load their own data. `nav` is the top-nav item that is highlighted for it; `topic` is the
+// event (GET /v1/events) that says its data changed.
 const pages = [
-  { re: /^\/plans$/, nav: "/plans", load: () => api("/v1/plans"), render: plansView },
-  { re: /^\/plans\/([0-9a-f]{64})$/, nav: "/plans", load: (m) => api("/v1/plans/" + m[1]), render: planView },
-  { re: /^\/jobs$/, nav: "/jobs", load: () => api("/v1/jobs").catch((e) => { if (e.status === 404) return { disabled: true }; throw e; }), render: jobsView },
-  { re: /^\/jobs\/(j-[0-9]+-[0-9a-f]{8})$/, nav: "/jobs", load: (m) => api("/v1/jobs/" + m[1]), render: jobView },
-  { re: /^\/recipes$/, nav: "/recipes", load: () => api("/v1/images/recipes"), render: recipesView },
-  { re: /^\/tokens$/, nav: "/tokens", load: () => Promise.all([api("/v1/tokens"), api("/v1/secrets").catch(() => null), api("/v1/oauth/grants").catch(() => null)])
+  { re: /^\/plans$/, nav: "/plans", topic: () => "plans", load: () => api("/v1/plans"), render: plansView },
+  { re: /^\/plans\/([0-9a-f]{64})$/, nav: "/plans", topic: () => "plans", load: (m) => api("/v1/plans/" + m[1]), render: planView },
+  { re: /^\/jobs$/, nav: "/jobs", topic: () => "jobs", load: () => api("/v1/jobs").catch((e) => { if (e.status === 404) return { disabled: true }; throw e; }), render: jobsView },
+  { re: /^\/jobs\/(j-[0-9]+-[0-9a-f]{8})$/, nav: "/jobs", topic: (m) => "job:" + m[1], load: (m) => api("/v1/jobs/" + m[1]), render: jobView },
+  { re: /^\/recipes$/, nav: "/recipes", topic: () => "recipes", load: () => api("/v1/images/recipes"), render: recipesView },
+  { re: /^\/tokens$/, nav: "/tokens", topic: () => "tokens", load: () => Promise.all([api("/v1/tokens"), api("/v1/secrets").catch(() => null), api("/v1/oauth/grants").catch(() => null)])
       .then(([t, s, g]) => ({ ...t, secrets: s ? s.secrets : null, grants: g ? g.grants : null })), render: tokensView },
 ];
 
@@ -537,7 +586,7 @@ function render() {
   for (const a of document.querySelectorAll(".top-nav a")) {
     a.classList.toggle("active", a.getAttribute("href") === "#" + route.nav);
   }
-  if (!signedInNow) return view.replaceChildren(h("div", { class: "mt-4" }, loginView(loadError)));
+  if (!signedInNow) return paint(h("div", { class: "mt-4" }, loginView(loadError)));
 
   const parts = [];
   if (loadError) parts.push(h("div", { class: "alert alert-warning", role: "alert" }, loadError));
@@ -551,22 +600,100 @@ function render() {
   } else if (!loadError) {
     parts.push(h("div", { class: "text-muted mt-4 text-center" }, "Loading…"));
   }
-  view.replaceChildren(h("div", { class: "mt-4" }, parts));
+  paint(h("div", { class: "mt-4" }, parts));
 }
 
 // ---- session ---------------------------------------------------------------
 
+// refresh reads the current page's data again and redraws it. Reads for one page never overlap: a
+// change that arrives during one is read once it is done.
+let refreshing = null;
+let again = false;
 async function refresh() {
-  const route = currentRoute();
-  try {
-    if (route.page) extra = { path: route.path, data: await route.page.load(route.match) };
-    else snapshot = await api("/v1/status");
-    loadError = "";
-  } catch (e) {
-    if (e.auth) return signOut("Your sign-in is no longer valid.");
-    loadError = `Could not refresh: ${e.message}`;
-  }
-  render();
+  if (refreshing) { again = true; return refreshing; }
+  refreshing = (async () => {
+    do {
+      again = false;
+      const route = currentRoute();
+      try {
+        if (route.page) extra = { path: route.path, data: await route.page.load(route.match) };
+        else snapshot = await api("/v1/status");
+        loadError = "";
+      } catch (e) {
+        if (e.auth) { refreshing = null; return signOut("Your sign-in is no longer valid."); }
+        loadError = `Could not refresh: ${e.message}`;
+      }
+      render();
+    } while (again);
+    refreshing = null;
+  })();
+  return refreshing;
+}
+
+// ---- live updates -----------------------------------------------------------
+
+function showLive() {
+  const el = document.getElementById("live");
+  if (!el) return;
+  el.hidden = !signedIn();
+  el.textContent = live ? "● live" : "○ reconnecting";
+  el.className = `me-2 small ${live ? "text-success" : "text-warning"}`;
+  el.title = live ? "Changes appear as they happen" : `Not connected: reloading every ${FALLBACK_MS / 1000}s until it is`;
+}
+
+// While the event stream is down the page reloads now and then, so it is never stale for long.
+function fallback(on) {
+  clearInterval(timer);
+  timer = on ? setInterval(refresh, FALLBACK_MS) : null;
+}
+
+function connectEvents() {
+  if (events || !signedIn() || !("WebSocket" in window)) return;
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/v1/events`);
+  events = ws;
+  ws.onopen = () => {
+    // A session cookie went with the handshake; a pasted token cannot, so it is the first message.
+    const token = sessionStorage.getItem(KEY);
+    if (token && !authUser) ws.send(JSON.stringify({ token }));
+  };
+  ws.onmessage = (m) => {
+    let msg;
+    try { msg = JSON.parse(m.data); } catch { return; }
+    if (msg.type === "hello") {
+      live = true;
+      retryMs = 1000;
+      fallback(false);
+      showLive();
+      refresh(); // whatever changed while it was not connected
+      return;
+    }
+    if (msg.type !== "change") return;
+    const route = currentRoute();
+    if (msg.status) {
+      snapshot = msg.status;
+      if (!route.page) render();
+    }
+    if (route.page && (msg.topics || []).includes(route.page.topic(route.match))) refresh();
+  };
+  ws.onclose = () => {
+    if (events !== ws) return; // signed out: closed on purpose
+    events = null;
+    live = false;
+    showLive();
+    if (!signedIn()) return;
+    fallback(true);
+    setTimeout(connectEvents, retryMs);
+    retryMs = Math.min(retryMs * 2, 30000);
+  };
+}
+
+function disconnectEvents() {
+  const ws = events;
+  events = null;
+  live = false;
+  if (ws) ws.close();
+  fallback(false);
+  showLive();
 }
 
 async function start() {
@@ -605,15 +732,16 @@ async function start() {
   }).catch(() => {});
   api("/v1/jobs").then(() => { document.getElementById("nav-jobs").hidden = false; }).catch(() => {});
   refresh();
-  clearInterval(timer);
-  timer = setInterval(refresh, REFRESH_MS);
+  fallback(true); // until the event stream says hello
+  connectEvents();
+  showLive();
 }
 
 function signOut(message) {
   sessionStorage.removeItem(KEY);
   authUser = null;
   if (methods.local_signin || methods.oidc) api("/api/logout", "POST").catch(() => {});
-  clearInterval(timer);
+  disconnectEvents();
   snapshot = null;
   extra = null;
   notice = null;

@@ -231,7 +231,12 @@ ending in a colon:
 | `edge:apply`, `backup`, `restore`, `dns:sync` | maintenance endpoints |
 | `daemon:upgrade` | `POST /v1/daemon/upgrade` |
 
-`status` is `running`, `succeeded`, `failed` or `interrupted`. The newest 200 jobs are kept.
+`status` is `queued` (with its `position` in line), `running`, `succeeded`, `failed` or `interrupted`. The
+newest 200 jobs are kept.
+
+A dashboard that shows jobs need not poll: `GET /v1/events` is a WebSocket that says when jobs (or one
+job, as `job:<id>`), plans, recipes or tokens change, and pushes the host status when it changes. Read
+what changed from its endpoint. See [docs/daemon.md, Live updates](daemon.md#live-updates).
 
 ## MCP
 

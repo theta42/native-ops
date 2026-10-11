@@ -50,10 +50,11 @@ type secretEntry struct {
 
 // SecretStore keeps secrets in one 0600 JSON file in the state directory.
 type SecretStore struct {
-	mu   sync.Mutex
-	path string
-	vals map[string]secretEntry
-	now  func() time.Time
+	changeHook // tells the UI it changed (events.go)
+	mu         sync.Mutex
+	path       string
+	vals       map[string]secretEntry
+	now        func() time.Time
 }
 
 // OpenSecretStore loads (or starts) the store at path.
@@ -213,7 +214,11 @@ func (s *SecretStore) saveLocked(vals map[string]secretEntry) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path)
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
+		return err
+	}
+	s.changed("")
+	return nil
 }
 
 func (s *Server) handleSecretList(w http.ResponseWriter, r *http.Request) {

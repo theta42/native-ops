@@ -449,6 +449,25 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "502": { $ref: "#/components/responses/HostUnavailable" }
 
+  /v1/events:
+    get:
+      operationId: events
+      tags: [host]
+      summary: Live change notes for the UI (WebSocket)
+      description: |
+        A WebSocket (send `Upgrade: websocket`). The daemon sends `{"type":"hello","name","role"}`, then
+        `{"type":"change","topics":[...]}` whenever something changed: `jobs`, `job:<id>`, `plans`,
+        `recipes`, `tokens` and `status` (which carries the new host snapshot as `status`). Read a topic's
+        data from its ordinary endpoint. Authenticate with the session cookie (from this origin only), an
+        `Authorization` header, or a first message `{"token":"nops_..."}`. Scoped tokens are refused. Close
+        codes: 4001 signed out or no token, 4003 token refused, 1001 the daemon is stopping.
+      x-native-ops-role: viewer
+      responses:
+        "101": { description: "Switching to the WebSocket protocol." }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { description: "Too many connections (busy)." }
+
   /v1/deploy:
     post:
       operationId: deploy

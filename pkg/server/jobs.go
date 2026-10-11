@@ -63,9 +63,10 @@ const (
 
 // Jobs is the store of apply jobs: in memory, and one JSON file per job in a 0700 directory.
 type Jobs struct {
-	mu   sync.Mutex
-	dir  string
-	jobs map[JobID]*Job
+	changeHook // tells the UI it changed (events.go)
+	mu         sync.Mutex
+	dir        string
+	jobs       map[JobID]*Job
 }
 
 // OpenJobs loads the jobs in dir (creating it). A job that was still running when the previous
@@ -124,7 +125,11 @@ func (j *Jobs) persist(job *Job) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(j.dir, string(job.ID)+".json"))
+	if err := os.Rename(tmp, filepath.Join(j.dir, string(job.ID)+".json")); err != nil {
+		return err
+	}
+	j.changed(string(job.ID))
+	return nil
 }
 
 // notStarted is the error of a queued job the daemon stopped before it ran.
