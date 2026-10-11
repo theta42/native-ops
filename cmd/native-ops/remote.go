@@ -475,12 +475,14 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 	transient, lastPosition, followUntil := 0, -1, time.Time{}
 	for {
 		var job struct {
-			Status   string `json:"status"`
-			Error    string `json:"error"`
-			Log      string `json:"log"`
-			Result   string `json:"result"`
-			Next     string `json:"next"`
-			Position int    `json:"position"`
+			Status   string    `json:"status"`
+			Error    string    `json:"error"`
+			Log      string    `json:"log"`
+			Result   string    `json:"result"`
+			Next     string    `json:"next"`
+			Position int       `json:"position"`
+			Service  string    `json:"service"` // a deploy's tag
+			Created  time.Time `json:"created"`
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/jobs/"+url.PathEscape(id)+"?wait=30", nil)
 		if err != nil {
@@ -519,6 +521,12 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 				printLog(job.Log)
 				fmt.Printf("job %s upgraded the daemon; waiting for it to resume the deploy\n", id)
 				followUntil = time.Now().Add(resumeWindow)
+			} else if next := c.resumedDeploy(ctx, id, job.Service, job.Created); next != "" {
+				// A daemon older than v1.71.0 wrote the resume record, so nothing links the two jobs: the
+				// resumed deploy is the next deploy of the same tag.
+				fmt.Printf("the deploy continues as job %s on the upgraded daemon\n", next)
+				id, lastPosition, followUntil = next, -1, time.Time{}
+				continue
 			} else if time.Now().After(followUntil) {
 				fmt.Fprintf(os.Stderr, "the daemon was upgraded but did not resume the deploy within %s (see its Jobs page); push the tag again\n", resumeWindow)
 				return 1
@@ -545,6 +553,31 @@ func (c *remoteClient) wait(ctx context.Context, id string) int {
 		case <-time.After(waitPoll):
 		}
 	}
+}
+
+// resumedDeploy finds the deploy of tag that started after the job `after` (created at since), oldest
+// first: the job the upgraded daemon resumed it as. "" while there is none (or the deploys cannot be read).
+func (c *remoteClient) resumedDeploy(ctx context.Context, after, tag string, since time.Time) string {
+	if tag == "" {
+		return ""
+	}
+	var out struct {
+		Deploys []struct {
+			Job     string    `json:"job"`
+			Tag     string    `json:"tag"`
+			Started time.Time `json:"started"`
+		} `json:"deploys"`
+	}
+	if code, err := c.tryGet(ctx, "/v1/deploys?limit=20", &out); err != nil || code != http.StatusOK {
+		return ""
+	}
+	found := ""
+	for _, d := range out.Deploys { // newest first: the last match is the oldest
+		if d.Tag == tag && d.Job != after && d.Started.After(since) {
+			found = d.Job
+		}
+	}
+	return found
 }
 
 // How wait polls, and how long it waits for an upgraded daemon to resume a deploy (variables so tests

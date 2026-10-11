@@ -126,6 +126,30 @@ func TestWaitFollowsADeployThroughTheDaemonUpgrade(t *testing.T) {
 		t.Fatalf("the resumed deploy failed, so the wait must exit 1, got %d", code)
 	}
 
+	// An upgrade from a daemon older than v1.71.0 names no next: the resumed deploy is found by its tag.
+	var dpolls atomic.Int32
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/jobs/j-1-aaaaaaaa":
+			_, _ = w.Write([]byte(`{"status":"succeeded","result":"daemon_upgraded","service":"deploy-7","created":"2026-10-11T16:12:52Z"}`))
+		case "/v1/deploys":
+			if dpolls.Add(1) < 3 { // the new binary resumes it a little later
+				_, _ = w.Write([]byte(`{"deploys":[{"job":"j-1-aaaaaaaa","tag":"deploy-7","started":"2026-10-11T16:12:52Z"},{"job":"j-0-cccccccc","tag":"deploy-7","started":"2026-10-11T15:00:00Z"}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"deploys":[{"job":"j-3-dddddddd","tag":"deploy-8","started":"2026-10-11T16:14:00Z"},{"job":"j-2-bbbbbbbb","tag":"deploy-7","started":"2026-10-11T16:13:27Z"},{"job":"j-1-aaaaaaaa","tag":"deploy-7","started":"2026-10-11T16:12:52Z"}]}`))
+		case "/v1/jobs/j-2-bbbbbbbb":
+			_, _ = w.Write([]byte(`{"status":"succeeded","result":"no_changes"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer old.Close()
+	c = &remoteClient{base: old.URL, token: "tok", http: old.Client()}
+	if code := c.wait(context.Background(), "j-1-aaaaaaaa"); code != 0 {
+		t.Fatalf("the resumed deploy (found by its tag) succeeded, so the wait must exit 0, got %d", code)
+	}
+
 	// An upgraded daemon that never names a resumed deploy is a failure, not a success.
 	never := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"succeeded","result":"daemon_upgraded"}`))
