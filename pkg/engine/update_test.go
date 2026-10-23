@@ -385,3 +385,56 @@ func TestUpdateSetsEnvOnTheNewContainerAndARollbackRestoresIt(t *testing.T) {
 		t.Fatalf("a rollback must restore the file as it was:\n%s", pushes[1])
 	}
 }
+
+// ociRules is baseRules with an OCI instance state and, optionally, a recorded image reference.
+func ociRules(baseImage, recordedRef string) []rule {
+	r := baseRules(baseImage)
+	for i := range r {
+		if r[i].match == "incus config show" {
+			state := strings.Replace(configYAML(baseImage), "  limits.memory: 1GB\n", "  limits.memory: 1GB\n  volatile.container.oci: \"true\"\n", 1)
+			if recordedRef != "" {
+				state = strings.Replace(state, "architecture: x86_64\nconfig:\n", "architecture: x86_64\nconfig:\n  user.native-ops.image: "+recordedRef+"\n", 1)
+			}
+			r[i].out = state
+		}
+	}
+	return r
+}
+
+func TestUpdateOCISkipsSystemctl(t *testing.T) {
+	ex := &scriptExec{rules: ociRules(oldFP, "docker:app:1")}
+	if err := newMgr(ex, nil).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{Service: "outline"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := ex.count("systemctl"); n != 0 {
+		t.Fatalf("an OCI container has no systemd unit; got %d systemctl calls: %v", n, ex.cmds)
+	}
+}
+
+func TestUpdateOCIRollsBackToRecordedReferenceWhenFingerprintIsGone(t *testing.T) {
+	rules := ociRules(oldFP, "docker:app:1")
+	rules = append([]rule{{match: "incus launch '" + oldFP + "'", err: errors.New("Image \"old\" not found")}}, rules...)
+	ex := &scriptExec{rules: rules}
+	calls := 0
+	gate := func(context.Context, string, config.HealthCheckConfig) error {
+		calls++
+		if calls == 1 {
+			return errors.New("healthcheck failed")
+		}
+		return nil
+	}
+	hc := config.HealthCheckConfig{Path: "/health", Port: 8787}
+	err := newMgr(ex, gate).Update(context.Background(), "rest-x", "app:v2", UpdateOptions{Service: "outline", HealthCheck: hc})
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("expected a rolled-back error, got %v", err)
+	}
+	if ex.count("incus launch") != 3 {
+		t.Fatalf("want new image, missing old fingerprint, then recorded reference: %v", ex.cmds)
+	}
+	if ex.index("incus launch 'docker:app:1'") < 0 {
+		t.Fatalf("rollback did not fall back to the recorded reference: %v", ex.cmds)
+	}
+	if ex.count("systemctl") != 0 {
+		t.Fatalf("an OCI rollback must not call systemctl: %v", ex.cmds)
+	}
+}
