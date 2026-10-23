@@ -368,8 +368,12 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 				return err
 			}
 		}
-		if err := m.incus.RestartService(ctx, name, service); err != nil {
-			return err
+		// An OCI container's entrypoint starts the app; there is no systemd unit to restart. A
+		// systemd container still needs its service restarted after the environment file is restored.
+		if !st.OCI {
+			if err := m.incus.RestartService(ctx, name, service); err != nil {
+				return err
+			}
 		}
 		if opts.HealthCheck.Path == "" {
 			return nil
@@ -395,11 +399,26 @@ func (m *InstanceManager) Update(ctx context.Context, name string, newImageRef s
 		m.log("==> [Instance] Updated %s to %s\n", name, newImageRef)
 		return nil
 	}
-	if st.BaseImage == "" {
+	rollbackImage := st.BaseImage
+	rollbackRef := ""
+	if st.OCI {
+		// An OCI image's fingerprint can be pruned or expire while its container keeps running. The
+		// recorded reference is the only way to pull the previous image back for a rollback.
+		rollbackRef = st.Config[incus.ImageKey]
+		if rollbackImage == "" {
+			rollbackImage = rollbackRef
+		}
+	}
+	if rollbackImage == "" {
 		return fmt.Errorf("update failed and the previous image is unknown, so no automatic rollback was possible (volume snapshots are named pre-update-*): %w", updateErr)
 	}
-	m.log("    Update failed (%v); rolling back to the previous image %s...\n", updateErr, st.BaseImage)
-	if rbErr := replace(st.BaseImage, st.Config, env, hadEnv); rbErr != nil {
+	m.log("    Update failed (%v); rolling back to the previous image %s...\n", updateErr, rollbackImage)
+	rbErr := replace(rollbackImage, st.Config, env, hadEnv)
+	if rbErr != nil && rollbackRef != "" && rollbackRef != rollbackImage {
+		m.log("    Rollback image %s is unavailable (%v); pulling the recorded reference %s...\n", rollbackImage, rbErr, rollbackRef)
+		rbErr = replace(rollbackRef, st.Config, env, hadEnv)
+	}
+	if rbErr != nil {
 		return fmt.Errorf("update failed: %v; rollback ALSO failed (volume snapshots are named pre-update-*): %w", updateErr, rbErr)
 	}
 	if err := m.repointRoute(ctx, name); err != nil {

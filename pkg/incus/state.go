@@ -41,6 +41,7 @@ type InstanceState struct {
 	Config    map[string]string            // local config, minus volatile.* and image.*
 	Devices   map[string]map[string]string // local devices, each including its "type"
 	BaseImage string                       // fingerprint of the image the container was launched from
+	OCI       bool                         // an OCI container: its entrypoint runs the app, so there is no systemd unit to restart
 }
 
 type configShow struct {
@@ -61,6 +62,7 @@ func ParseInstanceState(name, yamlText string) (*InstanceState, error) {
 		Config:    map[string]string{},
 		Devices:   cs.Devices,
 		BaseImage: cs.Config["volatile.base_image"],
+		OCI:       cs.Config["volatile.container.oci"] == "true",
 	}
 	if st.Devices == nil {
 		st.Devices = map[string]map[string]string{}
