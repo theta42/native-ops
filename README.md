@@ -315,6 +315,23 @@ dns_records:
     name: inbound          # inbound.example.com
     value: inbound.example.com.   # the mail host
     priority: 10
+
+# Local snapshots, kept by Incus itself (no host timer): the default for every volume a service declares.
+# A volume's own `snapshots:` replaces it; `snapshots: {}` on a volume turns them off for it. Absent here
+# and on the volume, a volume's snapshot config is left as it is. See "Scheduled snapshots and backups".
+snapshots:
+  schedule: "@daily"       # snapshots.schedule: a cron expression or @hourly/@daily/@weekly/...
+  expiry: 2w               # snapshots.expiry: M(inutes) H d w m(onths) y, e.g. "7d", "1d 12H"
+  pattern: "auto-%d"       # snapshots.pattern (optional)
+
+# Off-host backups (see "Backup & Restore"); `schedule` makes the daemon run them itself.
+backup:
+  endpoint: https://s3.example.com
+  region: us-east-1
+  bucket: example-backups
+  prefix: native-ops/
+  schedule: "03:30"        # daily, UTC; several: "03:30,15:30"
+  retain_daily: 14
 ```
 
 A host's bridge subnet is set when the host is bootstrapped (`reconcile`), while it has no
@@ -336,6 +353,9 @@ volumes:
     path: /var/lib/gitea
     pool: default
     shifted: true        # the default: the volume is created with security.shifted=true
+    snapshots:           # optional: this volume's own schedule, instead of fleet.yml's `snapshots:`
+      schedule: "0 */6 * * *"
+      expiry: 3d
 limits:
   limits.cpu: 2
   limits.memory: 2GB
@@ -526,8 +546,10 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
   approved; a scoped token can touch only its own instances.
 - **One change at a time, in order.** A change asked for while another runs waits in line (job status
   `queued`) instead of failing, so pipelines that fire together all succeed.
-- **Maintenance is CI-scheduled.** Backups and retention are daemon jobs a scheduled pipeline starts
-  (`native-ops remote backup --prune`).
+- **Schedules are configuration.** Local snapshot schedules are the volumes' own Incus config, shown in
+  the plan and applied by a deploy tag (`snapshots:`); off-host backups run on `backup.schedule` as daemon
+  jobs, with retention. No timer is installed on the host. A scheduled pipeline that calls
+  `native-ops remote backup --prune` still works too.
 - **The network is in the plan.** `fleet.yml`'s `dns_records`, the repo's `edge/Caddyfile` and each
   service's `forwards:` are diffed against the provider and the host, shown in the plan, bound into its
   hash and applied by the deploy tag; once applied, a plan shows nothing to do. There is no separate
@@ -553,6 +575,16 @@ exports it to a compressed artifact, uploads it with a SHA-256 manifest, and
 records a `latest.json` pointer for easy restores. Credentials live only in the
 environment — never in git.
 
+Objects are keyed by host: `<prefix>/<host>/<volume>/<time>.tar.gz`, with
+`<prefix>/<host>/<volume>/latest.json`, so several hosts can share one bucket and
+two volumes of the same name on different hosts never overwrite each other. The
+host is `NATIVE_OPS_HOST_NAME` when set, else the machine's host name; set it to
+something stable if the host name may change. Backups written before keys carried
+the host (`<prefix><volume>/...`) are still listed and restored (`latest` falls back
+to their `latest.json`, and an explicit `--from <key>` is checked against it); new
+backups are only written to the host's own prefix, and retention never deletes
+anything outside it.
+
 ### `fleet.yml`
 ```yaml
 backup:
@@ -564,9 +596,11 @@ backup:
   path_style: true                     # default; required for Spaces/MinIO
   access_key_env: BACKUP_S3_ACCESS_KEY # default
   secret_key_env: BACKUP_S3_SECRET_KEY # default
-  volumes: [gitea-data, rest-sicily-data]  # optional allowlist for `backup all`
+  volumes: [gitea-data, app-data]      # optional allowlist for `backup all`
   retain_daily: 30                     # keep newest N objects
   retain_monthly: 12                   # + newest object in each of the last N months
+  retain_days: 14                      # + every object younger than N days (the newest is always kept)
+  schedule: "03:30"                    # optional: the daemon backs up daily at these UTC times
 ```
 
 ### Commands
@@ -588,6 +622,47 @@ delete it), and it refuses to touch a volume that is mounted by a running contai
 unless `--force` is given (which stops those containers and always starts them again,
 whether or not the restore succeeds). Use `--as <name>` to import under a new
 volume name without touching anything live.
+
+### Scheduled snapshots and backups
+
+Both schedules live in the configuration repository, so every host gets them from the
+same deploy tag, and a new host gets them the day it joins.
+
+- **Local snapshots** are Incus' own: `fleet.yml`'s `snapshots:` (or a volume's own
+  `snapshots:`) becomes the volume's `snapshots.schedule`, `snapshots.expiry` and
+  `snapshots.pattern`, and Incus takes and expires the snapshots. The plan lists a
+  difference as `set-snapshots` (`gitea-data: snapshots.schedule: (unset) -> @daily`), apply
+  sets only what differs, and once applied the plan has nothing to do. Note that Incus applies
+  `snapshots.expiry` to every snapshot of the volume taken without an explicit expiry,
+  including the `pre-update-*` snapshots an update takes.
+- **Off-host backups** run on `backup.schedule` (daily `HH:MM` UTC times). A deploy tag
+  records the commit's `backup:` section on the daemon (its log says `backup schedule set`,
+  `unchanged` or `removed`), and the daemon then backs up every allowed volume at those times
+  and applies retention, as a `backup` job started by `native-ops (scheduled)`: in the job
+  list and the audit log like any other change, waiting its turn for the host. If the
+  previous scheduled backup is still queued or running when the next comes due, the next is
+  skipped and the skip is logged and audited; two never run at once. A daemon that starts
+  after a scheduled time runs that day's backup at the next one, not late. It needs
+  `--enable-backup` and the destination pinned on the daemon, exactly as `POST /v1/backups`
+  does; without `--enable-backup` a deploy notes that the schedule is not followed.
+
+With neither section set, nothing changes: volume snapshot config is left alone and the
+daemon runs no backups of its own.
+
+### Moving off hand-installed timers
+
+If a host has systemd timers or cron jobs that run `incus storage volume snapshot` or
+`native-ops backup`:
+
+1. Put the equivalent `snapshots:` and `backup.schedule` in `fleet.yml`, push a deploy tag,
+   and check the plan (`set-snapshots` items) and the deploy log (`backup schedule set`).
+2. Watch for the first scheduled `backup` job in the job list, and `incus storage volume
+   show <pool> <volume>` for the snapshot keys.
+3. Disable and remove the hand-installed timers (`systemctl disable --now <name>.timer`,
+   the unit files, the crontab line), so nothing runs twice.
+4. Older backups stay restorable: they are found under the layout without the host.
+   Retention does not delete them; remove them by hand once the host-keyed backups cover
+   the period you need.
 
 ---
 

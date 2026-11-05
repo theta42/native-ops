@@ -207,6 +207,9 @@ func (d *Deployer) planFresh(ctx context.Context, p *ServicePlan, svc *config.Se
 			p.add(ChangeAttachVolume, "the existing volume %s at %s (its data is kept)", vol.Name, vol.Path)
 		}
 	}
+	if err := d.planVolumeSnapshots(ctx, p, svc.Volumes, configDir); err != nil {
+		return err
+	}
 	declared, err := d.declaredEnv(svc, configDir)
 	if err != nil {
 		p.block("%v", err)
@@ -308,6 +311,11 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 				p.add(ChangeAttachVolume, "%s at %s", vol.Name, vol.Path)
 			}
 		}
+	}
+	// A volume's snapshot schedule is its own config, converged whether or not the image is replaced (a
+	// replacement keeps the same volumes).
+	if err := d.planVolumeSnapshots(ctx, p, svc.Volumes, configDir); err != nil {
+		return err
 	}
 
 	if len(declared) > 0 && envErr == nil {

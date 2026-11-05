@@ -25,6 +25,7 @@ type hostSim struct {
 	t       *testing.T
 	ctrs    map[string]*simCtr
 	volumes map[string]bool
+	volCfg  map[string]map[string]string // a volume's config keys (snapshots.*), by volume name
 	aliases map[string]string
 	cmds    []string
 	hooks   []string // host hook scripts executed, in order
@@ -53,7 +54,7 @@ type simCtr struct {
 var _ remote.Executor = (*hostSim)(nil)
 
 func newHostSim(t *testing.T) *hostSim {
-	s := &hostSim{t: t, ctrs: map[string]*simCtr{}, volumes: map[string]bool{}, aliases: map[string]string{}, nextIP: 30}
+	s := &hostSim{t: t, ctrs: map[string]*simCtr{}, volumes: map[string]bool{}, volCfg: map[string]map[string]string{}, aliases: map[string]string{}, nextIP: 30}
 	s.ctrs["edge"] = &simCtr{status: "Running", config: map[string]string{}, devices: map[string]map[string]string{}, profiles: []string{"default"},
 		files: map[string]string{"/etc/caddy/Caddyfile": "import /etc/caddy/sites/*.caddy\n"}, ip: "10.0.100.10"}
 	return s
@@ -74,7 +75,7 @@ var (
 	// then -- only when it differs -- a chown to the one asked for.
 	simStatRe    = regexp.MustCompile(`^stat -c %U '([^']*)'$`)
 	simChownRe   = regexp.MustCompile(`^chown '([^']*)' '([^']*)'$`)
-	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|unset|device add|device override|device remove) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
+	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|unset|device add|device override|device remove) |^incus storage volume (create|snapshot create|set|unset) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
 )
 
 func (s *hostSim) get(name string) (*simCtr, bool) { c, ok := s.ctrs[name]; return c, ok }
@@ -122,9 +123,36 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		}}}})
 		return string(b), nil
 	case strings.HasPrefix(cmd, "incus storage volume show "):
-		if !s.volumes[q[len(q)-1][1]] {
+		name := q[len(q)-1][1]
+		if !s.volumes[name] {
 			return "", errors.New("Error: Storage volume not found")
 		}
+		var sb strings.Builder
+		sb.WriteString("config:\n")
+		keys := sortedKeys(s.volCfg[name])
+		for _, k := range keys {
+			fmt.Fprintf(&sb, "  %s: %q\n", k, s.volCfg[name][k])
+		}
+		if len(keys) == 0 {
+			sb.Reset()
+			sb.WriteString("config: {}\n")
+		}
+		fmt.Fprintf(&sb, "name: %s\ntype: custom\n", name)
+		return sb.String(), nil
+	case strings.HasPrefix(cmd, "incus storage volume set "):
+		if !s.volumes[arg(1)] {
+			return "", errors.New("Error: Storage volume not found")
+		}
+		if s.volCfg[arg(1)] == nil {
+			s.volCfg[arg(1)] = map[string]string{}
+		}
+		k, v, _ := strings.Cut(arg(2), "=")
+		s.volCfg[arg(1)][k] = v
+	case strings.HasPrefix(cmd, "incus storage volume unset "):
+		if !s.volumes[arg(1)] {
+			return "", errors.New("Error: Storage volume not found")
+		}
+		delete(s.volCfg[arg(1)], arg(2))
 	case strings.HasPrefix(cmd, "incus storage volume create "):
 		s.volumes[q[len(q)-1][1]] = true
 	case strings.HasPrefix(cmd, "incus storage volume delete "):

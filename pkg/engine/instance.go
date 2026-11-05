@@ -126,6 +126,10 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		if err := m.incus.EnsureVolume(ctx, vol.Pool, actualVolName, vol.Shifted); err != nil {
 			return "", fmt.Errorf("ensure volume %s: %w", actualVolName, err)
 		}
+		// A template volume's own snapshot schedule, if it declares one (Incus keeps it).
+		if _, err := ensureSnapshotPolicy(ctx, m.incus, vol.Pool, actualVolName, vol.Snapshots, m.log); err != nil {
+			return "", err
+		}
 		pool := vol.Pool
 		if pool == "" {
 			pool = "default"
@@ -199,34 +203,45 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		domain = strings.ReplaceAll(p.Template.RoutingPattern, "{slug}", p.Slug)
 	}
 	if domain != "" {
-		port := p.Template.HealthCheck.Port
-		if port <= 0 {
-			port = 8787
-		}
-		routing := config.RoutingConfig{
-			Domain:          domain,
-			UpstreamPort:    port,
-			ExtraDirectives: p.Template.RoutingDirectives,
-			Cache:           p.Template.RoutingCache,
-			RateLimit:       p.Template.RoutingRateLimit,
-		}
-		ips, err := m.incus.GlobalIPv4s(ctx, p.Name)
-		if err != nil {
+		if err := m.publishRoute(ctx, p.Name, ip, domain, p.Template); err != nil {
 			return "", err
-		}
-		candidates := []string{ip}
-		for _, other := range ips {
-			if other != ip {
-				candidates = append(candidates, other)
-			}
-		}
-		if err := m.caddy.PublishSiteFor(ctx, p.Name, routing, candidates); err != nil {
-			return "", fmt.Errorf("publish caddy site: %w", err)
 		}
 	}
 
 	m.log("==> [Instance] Instance %s is up at %s\n", p.Name, ip)
 	return ip, nil
+}
+
+// publishRoute publishes the instance's route at domain to its health port (8787 when the template names
+// none), with the template's directives, cache and rate limit. ip is the address to prefer; the
+// instance's other global addresses are candidates too, and an upstream already published that is still
+// one of them is kept. It is a no-op when the published route is already right.
+func (m *InstanceManager) publishRoute(ctx context.Context, name, ip, domain string, tpl *config.TemplateConfig) error {
+	port := tpl.HealthCheck.Port
+	if port <= 0 {
+		port = 8787
+	}
+	routing := config.RoutingConfig{
+		Domain:          domain,
+		UpstreamPort:    port,
+		ExtraDirectives: tpl.RoutingDirectives,
+		Cache:           tpl.RoutingCache,
+		RateLimit:       tpl.RoutingRateLimit,
+	}
+	ips, err := m.incus.GlobalIPv4s(ctx, name)
+	if err != nil {
+		return err
+	}
+	candidates := []string{ip}
+	for _, other := range ips {
+		if other != ip {
+			candidates = append(candidates, other)
+		}
+	}
+	if err := m.caddy.PublishSiteFor(ctx, name, routing, candidates); err != nil {
+		return fmt.Errorf("publish caddy site: %w", err)
+	}
+	return nil
 }
 
 // UpdateOptions controls an immutable instance update.

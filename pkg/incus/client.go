@@ -124,6 +124,31 @@ func (c *Client) InstanceExists(ctx context.Context, name string) (bool, error) 
 	return false, nil
 }
 
+// InstanceStatus returns an instance's status on the default remote ("Running", "Stopped", ...).
+// exists is false when there is no such instance; a failing incus is an error, never "absent".
+func (c *Client) InstanceStatus(ctx context.Context, name string) (status string, exists bool, err error) {
+	if !ValidName(name) {
+		return "", false, fmt.Errorf("invalid instance name %q", name)
+	}
+	out, err := c.exec.Run(ctx, "incus list "+ShQuote(name)+" --format json")
+	if err != nil {
+		return "", false, fmt.Errorf("list instances: %w", err)
+	}
+	var instances []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(out), &instances); err != nil {
+		return "", false, fmt.Errorf("parse instance list: %w", err)
+	}
+	for _, inst := range instances {
+		if inst.Name == name {
+			return inst.Status, true, nil
+		}
+	}
+	return "", false, nil
+}
+
 // ContainerExists checks if an instance exists (false on any error; prefer InstanceExists).
 func (c *Client) ContainerExists(ctx context.Context, name string) bool {
 	ok, err := c.InstanceExists(ctx, name)

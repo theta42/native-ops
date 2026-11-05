@@ -22,11 +22,19 @@ type MigrationManager struct {
 	// healthProbe is a field so tests can stub the wait. The default probes
 	// from inside the container, so it works whatever host the container is on.
 	healthProbe func(ctx context.Context, remote, name string, hc config.HealthCheckConfig) error
+	// logf receives the progress lines (log.Printf by default; a daemon job's log when run as a job).
+	logf func(format string, a ...any)
 }
 
 func NewMigrationManager(exec remote.Executor) *MigrationManager {
 	ic := incus.NewClient(exec)
-	return &MigrationManager{exec: exec, incus: ic, healthProbe: ic.WaitHTTPInContainer}
+	return &MigrationManager{exec: exec, incus: ic, healthProbe: ic.WaitHTTPInContainer, logf: log.Printf}
+}
+
+func (m *MigrationManager) log(format string, a ...any) {
+	if m.logf != nil {
+		m.logf(format, a...)
+	}
 }
 
 type MigrationParams struct {
@@ -119,7 +127,7 @@ func (m *MigrationManager) Migrate(ctx context.Context, p MigrationParams) error
 	if err := validateMigrationArgs(src, dst, name, p.VolumeName, p.HealthCheck); err != nil {
 		return err
 	}
-	log.Printf("==> [Migration] Moving %s from %s to %s...\n", name, src, dst)
+	m.log("==> [Migration] Moving %s from %s to %s...\n", name, src, dst)
 
 	// 1. Preflight. Nothing is changed.
 	srcInst, err := m.incus.InstanceStatuses(ctx, src)
@@ -200,7 +208,7 @@ func (m *MigrationManager) Migrate(ctx context.Context, p MigrationParams) error
 	if !p.SkipSnapshot {
 		snap := fmt.Sprintf("pre-migrate-%s", time.Now().UTC().Format("20060102-150405"))
 		for _, v := range vols {
-			log.Printf("    Snapshotting %s:%s/%s (%s)...\n", src, v.Pool, v.Name, snap)
+			m.log("    Snapshotting %s:%s/%s (%s)...\n", src, v.Pool, v.Name, snap)
 			if err := m.incus.SnapshotVolumeAt(ctx, src, v.Pool, v.Name, snap); err != nil {
 				return fmt.Errorf("pre-migrate snapshot failed, nothing was changed: %w", err)
 			}
@@ -225,7 +233,7 @@ func (m *MigrationManager) Migrate(ctx context.Context, p MigrationParams) error
 	// 3. Warm copy while the source is still serving. A failure here changes nothing on the source.
 	wasRunning := srcStatus == "Running"
 	if wasRunning {
-		log.Printf("    Warm copy to %s while %s keeps serving...\n", dst, name)
+		m.log("    Warm copy to %s while %s keeps serving...\n", dst, name)
 		if err := copyAll(); err != nil {
 			return fmt.Errorf("warm copy failed, the source was not touched (rerun with --resume to continue): %w", err)
 		}
@@ -233,7 +241,7 @@ func (m *MigrationManager) Migrate(ctx context.Context, p MigrationParams) error
 
 	// 4. Quiesce the source and verify it, so no live database is ever copied.
 	if wasRunning {
-		log.Printf("    Stopping %s on %s...\n", name, src)
+		m.log("    Stopping %s on %s...\n", name, src)
 		stopErr := m.incus.StopInstance(ctx, src, name, p.StopTimeout)
 		after, verr := m.incus.InstanceStatuses(ctx, src)
 		if verr != nil || after[name] != "Stopped" {
@@ -246,7 +254,7 @@ func (m *MigrationManager) Migrate(ctx context.Context, p MigrationParams) error
 		base := fmt.Errorf("%s failed: %w", stage, cause)
 		if targetStarted {
 			if err := m.incus.StopInstance(ctx, dst, name, p.StopTimeout); err != nil {
-				log.Printf("    WARNING: could not stop the target copy on %s: %v\n", dst, err)
+				m.log("    WARNING: could not stop the target copy on %s: %v\n", dst, err)
 			}
 		}
 		if !wasRunning {
@@ -259,25 +267,23 @@ func (m *MigrationManager) Migrate(ctx context.Context, p MigrationParams) error
 	}
 
 	// 5. Final incremental copy, start, verify.
-	log.Printf("    Final sync to %s...\n", dst)
+	m.log("    Final sync to %s...\n", dst)
 	if err := copyAll(); err != nil {
 		return rollback("final sync", err)
 	}
-	log.Printf("    Starting %s on %s...\n", name, dst)
+	m.log("    Starting %s on %s...\n", name, dst)
 	if err := m.incus.StartInstance(ctx, dst, name); err != nil {
 		return rollback("start on target", err)
 	}
 	targetStarted = true
 	if p.HealthCheck.Path != "" {
-		log.Printf("    Health check %s on %s...\n", p.HealthCheck.Path, dst)
+		m.log("    Health check %s on %s...\n", p.HealthCheck.Path, dst)
 		if err := m.healthProbe(ctx, dst, name, p.HealthCheck); err != nil {
 			return rollback("health check on target", err)
 		}
 	}
 
-	log.Printf("==> [Migration] %s is running on %s. %s on %s is stopped and intact.\n", name, dst, name, src)
-	log.Printf("    Next: point DNS / edge routing at %s and watch it. Then run `instance migrate --finalize` to delete the source.\n", dst)
-	log.Printf("    To roll back instead: `instance migrate --source %s --target %s --name %s --resume` (copies changes back).\n", dst, src, name)
+	m.log("==> [Migration] %s is running on %s. %s on %s is stopped and intact.\n", name, dst, name, src)
 	return nil
 }
 
@@ -303,7 +309,7 @@ func (m *MigrationManager) Finalize(ctx context.Context, p FinalizeParams) error
 	if err := validateMigrationArgs(src, dst, name, "", p.HealthCheck); err != nil {
 		return err
 	}
-	log.Printf("==> [Migration] Finalizing: removing %s from %s (running on %s)...\n", name, src, dst)
+	m.log("==> [Migration] Finalizing: removing %s from %s (running on %s)...\n", name, src, dst)
 
 	srcInst, err := m.incus.InstanceStatuses(ctx, src)
 	if err != nil {
@@ -317,7 +323,7 @@ func (m *MigrationManager) Finalize(ctx context.Context, p FinalizeParams) error
 	if !ok {
 		// Already gone from the source: a repeated finalize (e.g. a CI retry) succeeds.
 		if dstInst[name] == "Running" {
-			log.Printf("==> [Migration] %s is already gone from %s and running on %s; nothing to finalize.\n", name, src, dst)
+			m.log("==> [Migration] %s is already gone from %s and running on %s; nothing to finalize.\n", name, src, dst)
 			return nil
 		}
 		return fmt.Errorf("instance %s is not on %s and is %q (not Running) on %s; there is nothing safe to finalize", name, src, dstInst[name], dst)
@@ -362,10 +368,10 @@ func (m *MigrationManager) Finalize(ctx context.Context, p FinalizeParams) error
 				return err
 			}
 		}
-		log.Printf("==> [Migration] Finalized: %s and its volumes were removed from %s.\n", name, src)
+		m.log("==> [Migration] Finalized: %s and its volumes were removed from %s.\n", name, src)
 		return nil
 	}
-	log.Printf("==> [Migration] Finalized: %s was removed from %s. Its data volumes were kept: %s (delete them when you no longer need the rollback copy).\n", name, src, volumeNames(vols))
+	m.log("==> [Migration] Finalized: %s was removed from %s. Its data volumes were kept: %s (delete them when you no longer need the rollback copy).\n", name, src, volumeNames(vols))
 	return nil
 }
 

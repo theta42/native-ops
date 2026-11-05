@@ -82,6 +82,9 @@ type Options struct {
 	// POST /v1/backups and POST /v1/backups/restore.
 	Backup  BackupFunc
 	Restore RestoreFunc
+	// BackupScheduleDir, with Backup and Jobs, is where the daemon keeps the backup schedule a deploy
+	// tag's fleet.yml declared (backup.schedule); RunBackupSchedule runs it (see backup_schedule.go).
+	BackupScheduleDir string
 	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
 	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
 	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.
@@ -114,6 +117,7 @@ type Server struct {
 	// eventPending bounds the event connections still waiting for a token.
 	eventPending chan struct{}
 	jobsWG       sync.WaitGroup
+	sched        backupSched // the scheduled off-host backup (backup_schedule.go)
 }
 
 func New(opts Options) (*Server, error) {
@@ -525,6 +529,10 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("POST /v1/instances/{name}/suspend", s.authScoped(RoleDeployer, s.handleInstanceSuspend))
 		mux.Handle("DELETE /v1/instances/{name}", s.authScoped(RoleDeployer, s.handleInstanceDelete))
 		mux.Handle("PATCH /v1/instances/{name}/labels", s.authScoped(RoleDeployer, s.handleInstanceLabels))
+		mux.Handle("POST /v1/instances/{name}/migrate", s.authMigrate(s.handleInstanceMigrate))
+		mux.Handle("GET /v1/instances/{name}/export-spec", s.authScoped(RoleViewer, s.handleInstanceExportSpec))
+		mux.Handle("POST /v1/instances/{name}/adopt", s.authMigrate(s.handleInstanceAdopt))
+		mux.Handle("POST /v1/instances/{name}/finalize-migration", s.authMigrate(s.handleInstanceFinalizeMigration))
 	}
 	if s.opts.Jobs != nil {
 		mux.Handle("GET /v1/jobs", s.authScoped(RoleViewer, s.handleJobs))

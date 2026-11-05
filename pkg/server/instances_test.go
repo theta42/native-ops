@@ -33,13 +33,56 @@ type fakeOps struct {
 	err       error
 	block     chan struct{}
 	started   chan struct{}
+
+	// The migration side: what each instance records (spec, migrated mark, labels, host paths), and what
+	// was asked of it.
+	specs     map[string]*engine.InstanceSpec
+	migrated  map[string]string
+	labels    map[string]map[string]string
+	hostPaths map[string][]string
+	migrates  []engine.MigrateRequest
+	adopted   []engine.InstanceSpec
+	finalized []engine.FinalizeMigrationRequest
 }
 
-func (f *fakeOps) Template(_ context.Context, name string) (string, bool, error) {
+func (f *fakeOps) Record(_ context.Context, name string) (engine.InstanceRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	t, ok := f.existing[name]
-	return t, ok, nil
+	if !ok {
+		return engine.InstanceRecord{}, nil
+	}
+	return engine.InstanceRecord{Exists: true, Status: "Running", Template: t, Spec: f.specs[name], MigratedTo: f.migrated[name], Labels: f.labels[name], HostPaths: f.hostPaths[name]}, nil
+}
+
+func (f *fakeOps) Migrate(_ context.Context, name string, req engine.MigrateRequest, logf func(string, ...any)) (string, error) {
+	f.mu.Lock()
+	f.migrates = append(f.migrates, req)
+	f.mu.Unlock()
+	logf("==> migrating %s to %s", name, req.TargetRemote)
+	f.wait()
+	if f.err != nil {
+		return "", f.err
+	}
+	return name + " runs on " + req.TargetRemote + ". Volume snapshots were not moved.", nil
+}
+
+func (f *fakeOps) Adopt(_ context.Context, name string, spec engine.InstanceSpec, logf func(string, ...any)) error {
+	f.mu.Lock()
+	f.adopted = append(f.adopted, spec)
+	f.mu.Unlock()
+	logf("==> adopting %s", name)
+	f.wait()
+	return f.err
+}
+
+func (f *fakeOps) FinalizeMigration(_ context.Context, name string, req engine.FinalizeMigrationRequest, logf func(string, ...any)) error {
+	f.mu.Lock()
+	f.finalized = append(f.finalized, req)
+	f.mu.Unlock()
+	logf("==> finalizing %s", name)
+	f.wait()
+	return f.err
 }
 
 func (f *fakeOps) wait() {

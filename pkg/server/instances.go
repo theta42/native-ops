@@ -19,13 +19,18 @@ import (
 // InstanceOps is what the instance endpoints do on the host (engine.Instances). Every change is one
 // idempotent call that reports progress to logf.
 type InstanceOps interface {
-	Template(ctx context.Context, name string) (template string, exists bool, err error)
+	// Record is what the host records about an instance (Exists false when there is none).
+	Record(ctx context.Context, name string) (engine.InstanceRecord, error)
 	Launch(ctx context.Context, name string, spec engine.InstanceSpec, logf func(string, ...any)) (string, error)
 	Update(ctx context.Context, name string, req engine.UpdateRequest, logf func(string, ...any)) error
 	Resize(ctx context.Context, name string, req engine.ResizeRequest, logf func(string, ...any)) error
 	Suspend(ctx context.Context, name string, req engine.SuspendRequest, logf func(string, ...any)) error
 	Destroy(ctx context.Context, name string, purge bool, logf func(string, ...any)) error
 	SetLabels(ctx context.Context, name string, set map[string]string, remove []string, logf func(string, ...any)) error
+	// Migrate, Adopt and FinalizeMigration move an instance between hosts (see instance_migrate.go).
+	Migrate(ctx context.Context, name string, req engine.MigrateRequest, logf func(string, ...any)) (summary string, err error)
+	Adopt(ctx context.Context, name string, spec engine.InstanceSpec, logf func(string, ...any)) error
+	FinalizeMigration(ctx context.Context, name string, req engine.FinalizeMigrationRequest, logf func(string, ...any)) error
 }
 
 const maxInstanceBody = 64 << 10
@@ -202,10 +207,14 @@ func (s *Server) handleInstancePut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, "out_of_scope", msg)
 		return
 	}
-	tpl, exists, err := s.opts.Instances.Template(r.Context(), name)
+	rec, err := s.opts.Instances.Record(r.Context(), name)
 	if err != nil {
 		log.Printf("instance put %s: %v", name, err)
 		writeError(w, http.StatusBadGateway, "host_unavailable", "could not read the host's state")
+		return
+	}
+	exists, tpl := rec.Exists, rec.Template
+	if refuseMigrated(w, r, rec, name, "put") {
 		return
 	}
 	if exists && tpl != spec.Template {
@@ -249,7 +258,7 @@ func (s *Server) handleInstanceUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
 		return
 	}
-	if !s.requireManaged(w, r, name, "update") {
+	if !s.requireManaged(w, r, name, "update", false) {
 		return
 	}
 	s.startInstanceJob(w, r, "update", name, func(ctx context.Context, logf func(string, ...any)) error {
@@ -283,7 +292,7 @@ func (s *Server) handleInstanceResize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
 		return
 	}
-	if !s.requireManaged(w, r, name, "resize") {
+	if !s.requireManaged(w, r, name, "resize", false) {
 		return
 	}
 	s.startInstanceJob(w, r, "resize", name, func(ctx context.Context, logf func(string, ...any)) error {
@@ -319,7 +328,7 @@ func (s *Server) handleInstanceSuspend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_spec", err.Error())
 		return
 	}
-	if !s.requireManaged(w, r, name, "suspend") {
+	if !s.requireManaged(w, r, name, "suspend", false) {
 		return
 	}
 	s.startInstanceJob(w, r, "suspend", name, func(ctx context.Context, logf func(string, ...any)) error {
@@ -346,7 +355,7 @@ func (s *Server) handleInstanceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	purge := r.URL.Query().Get("purge_volumes") == "true"
-	if !s.requireManaged(w, r, name, "delete") {
+	if !s.requireManaged(w, r, name, "delete", true) {
 		return
 	}
 	s.startInstanceJob(w, r, "delete", name, func(ctx context.Context, logf func(string, ...any)) error {
@@ -354,22 +363,41 @@ func (s *Server) handleInstanceDelete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// requireManaged answers the request unless name is an instance launched from a template.
-func (s *Server) requireManaged(w http.ResponseWriter, r *http.Request, name, op string) bool {
-	tpl, exists, err := s.opts.Instances.Template(r.Context(), name)
+// requireManaged answers the request unless name is an instance launched from a template that this host
+// has not migrated away. A delete may remove a migrated copy (allowMigrated); nothing else may touch it.
+func (s *Server) requireManaged(w http.ResponseWriter, r *http.Request, name, op string, allowMigrated bool) bool {
+	_, ok := s.managedRecord(w, r, name, op, allowMigrated)
+	return ok
+}
+
+// managedRecord is requireManaged that also returns the instance's record.
+func (s *Server) managedRecord(w http.ResponseWriter, r *http.Request, name, op string, allowMigrated bool) (engine.InstanceRecord, bool) {
+	rec, err := s.opts.Instances.Record(r.Context(), name)
 	switch {
 	case err != nil:
 		log.Printf("instance %s %s: %v", op, name, err)
 		writeError(w, http.StatusBadGateway, "host_unavailable", "could not read the host's state")
-	case !exists:
+	case !rec.Exists:
 		writeError(w, http.StatusNotFound, "not_found", "no such instance")
-	case tpl == "":
+	case rec.Template == "":
 		auditDetail(r, "instance %s %s refused: not a tenant instance", op, name)
 		writeError(w, http.StatusForbidden, "not_managed", "that is not a tenant instance: it was not launched from a template, so it cannot be managed here")
+	case !allowMigrated && refuseMigrated(w, r, rec, name, op):
 	default:
-		return true
+		return rec, true
 	}
-	return false
+	return rec, false
+}
+
+// refuseMigrated answers the request when this host migrated the instance away: it runs on another host
+// now, and starting or changing the stopped copy here would serve it twice.
+func refuseMigrated(w http.ResponseWriter, r *http.Request, rec engine.InstanceRecord, name, op string) bool {
+	if rec.MigratedTo == "" {
+		return false
+	}
+	auditDetail(r, "instance %s %s refused: migrated to %s", op, name, rec.MigratedTo)
+	writeError(w, http.StatusConflict, "migrated", "this instance was migrated to "+rec.MigratedTo+"; manage it on that host (this host keeps only its stopped copy, until finalize-migration)")
+	return true
 }
 
 // tenantView is a tenant instance as the API shows it.
@@ -381,10 +409,12 @@ type tenantView struct {
 	IPv4     []string          `json:"ipv4,omitempty"`
 	Created  string            `json:"created_at,omitempty"`
 	Labels   map[string]string `json:"labels,omitempty"`
+	// MigratedTo is set on the stopped copy this host keeps of an instance it migrated away.
+	MigratedTo string `json:"migrated_to,omitempty"`
 }
 
 func viewOfInstance(i status.Instance) tenantView {
-	return tenantView{Name: i.Name, Status: i.Status, Template: i.Recorded["template"], Image: i.Recorded["image"], IPv4: i.IPv4, Created: i.CreatedAt, Labels: i.Labels}
+	return tenantView{Name: i.Name, Status: i.Status, Template: i.Recorded["template"], Image: i.Recorded["image"], IPv4: i.IPv4, Created: i.CreatedAt, Labels: i.Labels, MigratedTo: i.Recorded["migrated-to"]}
 }
 
 // handleInstanceList is GET /v1/instances: the tenant instances the caller may see.
@@ -497,17 +527,7 @@ func (s *Server) handleInstanceLabels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	tpl, exists, err := s.opts.Instances.Template(r.Context(), name)
-	switch {
-	case err != nil:
-		log.Printf("instance labels %s: %v", name, err)
-		writeError(w, http.StatusBadGateway, "host_unavailable", "could not read the host's state")
-		return
-	case !exists:
-		writeError(w, http.StatusNotFound, "not_found", "no such instance")
-		return
-	case tpl == "":
-		writeError(w, http.StatusForbidden, "not_managed", "that is not a tenant instance: it was not launched from a template, so it cannot be managed here")
+	if !s.requireManaged(w, r, name, "labels", false) {
 		return
 	}
 	auditDetail(r, "instance labels %s set=%s remove=%s", name, engine.FormatLabels(req.Set), strings.Join(req.Remove, ","))
