@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -254,5 +255,88 @@ func TestAOneServicePlanHasNoNetworkPart(t *testing.T) {
 	}
 	if fp.Network != nil {
 		t.Fatalf("a one-service plan should not plan the network: %+v", fp.Network)
+	}
+}
+
+// With one host and no override, the plan reads exactly as it did before hosts could have their own
+// bridge: the same text, the same JSON and the same hash, whether the bridge matches or not.
+func TestASingleHostPlanIsUnchangedByPerHostBridges(t *testing.T) {
+	sim := newHostSim(t)
+	cases := []struct{ extra, render, json, hash string }{{
+		extra:  "hosts:\n  node-1:\n    provider: static\n    address: 192.0.2.10\n",
+		render: "\nPlan: 0 to create, 0 to update, 0 unchanged, 0 blocked.\n",
+		json:   `{"services":[],"network":{}}`,
+		hash:   "9c9d33c96fa391ddb390f54b4cffac3c01a689f35690ac323a3eb67c9105dd1d",
+	}, {
+		extra:  "network:\n  ipv4_cidr: 10.0.200.0/24\nhosts:\n  node-1:\n    provider: static\n",
+		render: "! network (blocked)\n    BLOCKED: the bridge incusbr0 has ipv4.address 10.0.100.1/24, but fleet.yml says 10.0.200.0/24; the daemon does not re-address a live bridge\n\nPlan: 0 to create, 0 to update, 0 unchanged, 0 blocked; the network is blocked.\n",
+		json:   `{"services":[],"network":{"blockers":["the bridge incusbr0 has ipv4.address 10.0.100.1/24, but fleet.yml says 10.0.200.0/24; the daemon does not re-address a live bridge"]}}`,
+		hash:   "fc54022290942517dbe957bfe8a1b48742998138844852de49e9f372d37d4f79",
+	}}
+	for _, c := range cases {
+		fp := planNet(t, sim, networkTree(t, c.extra, nil))
+		j, _ := json.Marshal(fp)
+		if fp.Render() != c.render || string(j) != c.json || fp.Hash() != c.hash {
+			t.Errorf("%s: the plan changed:\n%s\n%s\n%s", c.extra, fp.Render(), j, fp.Hash())
+		}
+	}
+}
+
+// A host's own subnet is what its bridge is checked against; a live bridge that differs is reported and
+// left alone, never renumbered.
+func TestTheBridgeIsCheckedAgainstTheHostsOwnSubnet(t *testing.T) {
+	sim := newHostSim(t)
+	sim.bridges = map[string]string{"incusbr0": "10.0.101.1/24", "br-inst": "10.0.102.1/24"}
+	own := "hosts:\n  node-2:\n    provider: static\n    network:\n      ipv4_cidr: 10.0.101.0/24\n"
+	if fp := planNet(t, sim, networkTree(t, own, nil)); fp.Blocked() || fp.Pending() {
+		t.Fatalf("the host's bridge matches its own subnet:\n%s", fp.Render())
+	}
+	named := "hosts:\n  node-3:\n    provider: static\n    network:\n      bridge_name: br-inst\n      ipv4_cidr: 10.0.102.0/24\n"
+	if fp := planNet(t, sim, networkTree(t, named, nil)); fp.Blocked() || fp.Pending() {
+		t.Fatalf("the host's own bridge name is the one checked:\n%s", fp.Render())
+	}
+	// The fleet's default subnet does not fit this host's live bridge: reported, and nothing to apply.
+	fp := planNet(t, sim, networkTree(t, "hosts:\n  node-2:\n    provider: static\n", nil))
+	if !fp.Blocked() || !strings.Contains(fp.Render(), "the bridge incusbr0 has ipv4.address 10.0.101.1/24, but fleet.yml says 10.0.100.0/24; the daemon does not re-address a live bridge") {
+		t.Fatalf("a live bridge that differs is reported:\n%s", fp.Render())
+	}
+	if fp.Network != nil && len(fp.Network.Changes) > 0 {
+		t.Fatalf("a differing bridge is never a change to apply: %v", fp.Network.Changes)
+	}
+	for _, c := range sim.cmds {
+		if strings.Contains(c, "network set") {
+			t.Fatalf("a plan never sets the bridge: %s", c)
+		}
+	}
+}
+
+// With several hosts the daemon cannot tell which one it is on, so it says it did not check the bridge
+// rather than checking it against another host's subnet.
+func TestAMultiHostFleetDoesNotCheckTheBridgeAgainstTheWrongHost(t *testing.T) {
+	sim := newHostSim(t)
+	two := "hosts:\n  node-1:\n    provider: static\n  node-2:\n    provider: static\n    network:\n      ipv4_cidr: 10.0.101.0/24\n"
+	fp := planNet(t, sim, networkTree(t, two, nil))
+	if fp.Blocked() || fp.Pending() || !strings.Contains(fp.Render(), "does not know which one it runs on") {
+		t.Fatalf("got:\n%s", fp.Render())
+	}
+}
+
+// An apply launches with the host's own bridge: a host on 10.0.101.0/24 never hears of 10.0.100.1/24.
+func TestApplyLaunchesWithTheHostsOwnBridge(t *testing.T) {
+	sim := newHostSim(t)
+	sim.bridges = map[string]string{"incusbr0": "10.0.101.1/24"}
+	sim.aliases["web:latest"] = fpA
+	dir := networkTree(t, "hosts:\n  node-2:\n    provider: static\n    network:\n      ipv4_cidr: 10.0.101.0/24\n",
+		map[string]string{"services/web/service.yml": "name: web\nimage: web:latest\nprofiles: [default, service]\n"})
+	fp := planNet(t, sim, dir)
+	if fp.Blocked() || !fp.Pending() {
+		t.Fatalf("got:\n%s", fp.Render())
+	}
+	if err := applyNet(t, sim, dir, fp, nil); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(sim.cmds, "\n")
+	if !strings.Contains(joined, "'ipv4.address=10.0.101.1/24'") || strings.Contains(joined, "10.0.100.1/24") {
+		t.Fatalf("the launch must make sure of this host's bridge only:\n%s", joined)
 	}
 }

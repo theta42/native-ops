@@ -25,6 +25,9 @@ type ContainerState struct {
 // Client wraps Incus CLI operations on a local or remote target.
 type Client struct {
 	exec remote.Executor
+	// bridge and bridgeAddr are the instance bridge EnsureProfile makes sure of (see SetBridge). Empty,
+	// EnsureProfile leaves the host's network alone.
+	bridge, bridgeAddr string
 }
 
 func NewClient(exec remote.Executor) *Client {
@@ -133,6 +136,28 @@ func NetworkSetIfChanged(network, key, want string) string {
 		ShQuote(network), ShQuote(key), ShQuote(want), ShQuote(network), ShQuote(key+"="+want))
 }
 
+// BridgeAddressIfUnused returns a shell command that sets a bridge's ipv4.address only when it differs
+// AND the host has no instances yet. A fresh host (whose bridge `incus admin init --auto` numbered at
+// random) gets the configured subnet; a live host keeps the one its instances and routes use, whatever
+// fleet.yml says (the plan reports the difference instead). If the instances cannot be listed, nothing
+// is set.
+func BridgeAddressIfUnused(network, want string) string {
+	return fmt.Sprintf(`[ "$(incus network get %s %s 2>/dev/null)" = %s ] || { n="$(incus list --format csv --columns n 2>/dev/null)" && [ -z "$n" ] && incus network set %s %s; } || true`,
+		ShQuote(network), ShQuote("ipv4.address"), ShQuote(want), ShQuote(network), ShQuote("ipv4.address="+want))
+}
+
+// SetBridge makes EnsureProfile make sure of this instance bridge (fleet.yml's `network:` for the host the
+// client works on): that it exists, is the default profile's NIC, and, on a host with no instances yet,
+// has the configured subnet. A client without one leaves the host's network to its bootstrap.
+func (c *Client) SetBridge(n config.NetworkConfig) error {
+	name, addr, err := n.Bridge()
+	if err != nil {
+		return err
+	}
+	c.bridge, c.bridgeAddr = name, addr
+	return nil
+}
+
 // EnsureProfile ensures a named profile exists, creating and configuring standard profiles if needed.
 func (c *Client) EnsureProfile(ctx context.Context, name string) error {
 	if !ValidName(name) {
@@ -141,11 +166,13 @@ func (c *Client) EnsureProfile(ctx context.Context, name string) error {
 	// Ensure default storage and root disk device are active
 	_, _ = c.exec.Run(ctx, "incus storage list | grep -q default || incus storage create default dir || true")
 	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true")
-	_, _ = c.exec.Run(ctx, "incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 || true")
-	_, _ = c.exec.Run(ctx, NetworkSetIfChanged("incusbr0", "ipv4.address", "10.0.100.1/24"))
-	_, _ = c.exec.Run(ctx, NetworkSetIfChanged("incusbr0", "ipv4.nat", "true"))
-	_, _ = c.exec.Run(ctx, NetworkSetIfChanged("incusbr0", "ipv6.address", "none"))
-	_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true")
+	if br := c.bridge; br != "" {
+		_, _ = c.exec.Run(ctx, "incus network show "+br+" >/dev/null 2>&1 || incus network create "+br+" || true")
+		_, _ = c.exec.Run(ctx, BridgeAddressIfUnused(br, c.bridgeAddr))
+		_, _ = c.exec.Run(ctx, NetworkSetIfChanged(br, "ipv4.nat", "true"))
+		_, _ = c.exec.Run(ctx, NetworkSetIfChanged(br, "ipv6.address", "none"))
+		_, _ = c.exec.Run(ctx, "incus profile device show default | grep -q 'network: "+br+"' || incus profile device add default eth0 nic network="+br+" name=eth0 || true")
+	}
 
 	if _, err := c.exec.Run(ctx, "incus profile show "+ShQuote(name)); err == nil {
 		return nil

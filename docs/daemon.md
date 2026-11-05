@@ -311,7 +311,7 @@ planned. Once applied, the same commit plans to nothing. That includes the netwo
 | DNS records | `fleet.yml` `dns_records` (each names its zone) | `dns-create` / `dns-update`, diffed against the provider (read only) | through the built-in provider; the zone is read again first, and if it moved since the plan the apply refuses ("plan again") |
 | The edge's main Caddyfile | `edge/Caddyfile` | `edge-caddyfile`, with the lines added and removed; its content is in the hash | validated, reloaded, and rolled back if Caddy rejects it |
 | Host ports | a service's `forwards:` | `publish-port` / `remove-port` on that service | an Incus proxy device per forward |
-| The instance bridge | `fleet.yml` `network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan |
+| The instance bridge | `fleet.yml` `network:`, or the host's own `hosts.<name>.network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan. With more than one host in `fleet.yml` the daemon cannot tell which it runs on, and the plan notes that the bridge was not checked |
 
 Rules that keep it safe to run again and again:
 
