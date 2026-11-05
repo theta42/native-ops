@@ -235,10 +235,12 @@ func (s *Server) launch(t *ticket, spec jobSpec) (Job, error) {
 		if spec.cleanup != nil {
 			spec.cleanup()
 		}
+		// Finished is recorded before the host is handed on: release starts the next job in line at
+		// once, and its Started must never come before this job's Finished (#94).
+		s.opts.Jobs.Finish(job.ID, err)
 		if release {
 			s.queue.release()
 		}
-		s.opts.Jobs.Finish(job.ID, err)
 		s.events.publish("plans") // a plan made before this job is stale now
 		outcome, code := "succeeded", http.StatusOK
 		if err != nil {
