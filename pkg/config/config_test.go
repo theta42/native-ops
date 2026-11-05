@@ -267,6 +267,16 @@ func TestVolumeShiftedDefaultsToTrue(t *testing.T) {
 	}
 }
 
+func TestARouteCanBeLeftToTheHandMaintainedCaddyfile(t *testing.T) {
+	var svc ServiceConfig
+	if err := yaml.Unmarshal([]byte("name: web\nrouting:\n  domain: '*.example.com'\n  upstream_port: 80\n  external: true\n"), &svc); err != nil {
+		t.Fatal(err)
+	}
+	if svc.Routing == nil || !svc.Routing.External || svc.Routing.Domain != "*.example.com" || svc.Routing.UpstreamPort != 80 {
+		t.Fatalf("routing: %+v", svc.Routing)
+	}
+}
+
 func TestARouteReadsItsCacheAndRateLimitFromYAML(t *testing.T) {
 	var svc ServiceConfig
 	doc := "name: web\nrouting:\n  domain: www.example.com\n  upstream_port: 3000\n  cache:\n    ttl: 5m\n    paths: [\"/static/*\"]\n  rate_limit:\n    requests: 120\n    window: 1m\n    paths: [\"/api/*\"]\n"
