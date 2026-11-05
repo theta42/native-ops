@@ -220,6 +220,10 @@ type RoutingConfig struct {
 	UpstreamPort    int      `yaml:"upstream_port"` // e.g. 3000
 	TLS             string   `yaml:"tls,omitempty"` // e.g. "dns digitalocean" or "internal"
 	ExtraDirectives []string `yaml:"extra_directives,omitempty"`
+	// External means the domain is already served by the hand-maintained Caddyfile (a wildcard block
+	// with a host matcher). plan and apply leave it alone: publishing sites/<name>.caddy would ask for
+	// a second certificate and shadow that block.
+	External bool `yaml:"external,omitempty"`
 	// Cache and RateLimit are HTTP response caching and per-client request limits at the edge, for
 	// this route only (see RouteCache, RouteRateLimit). They need the edge's Caddy to carry the
 	// cache-handler and caddy-ratelimit plugins (images/edge does).

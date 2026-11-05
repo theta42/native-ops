@@ -53,6 +53,34 @@ func TestRenderEnvIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestSetEnvironmentGoesOverStdinAndRestartsTheInstance(t *testing.T) {
+	ex := &stubExec{}
+	c := NewClient(ex)
+	secret := "s3cret-value"
+	if err := c.SetEnvironment(context.Background(), "db", map[string]string{"POSTGRES_PASSWORD": secret, "POSTGRES_DB": "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.cmds) != 1 || ex.cmds[0] != "bash -s" {
+		t.Fatalf("the command itself must not carry the assignment: %v", ex.cmds)
+	}
+	if strings.Contains(ex.cmds[0], secret) || strings.Contains(strings.Join(ex.cmds, "\n"), "environment.") {
+		t.Fatalf("a value or key must not be on the command line: %v", ex.cmds)
+	}
+	want := "incus config set 'db' 'environment.POSTGRES_DB=app'\nincus config set 'db' 'environment.POSTGRES_PASSWORD=" + secret + "'\n"
+	if len(ex.stdins) != 1 || ex.stdins[0] != want {
+		t.Fatalf("stdin = %q", ex.stdins)
+	}
+	if err := c.SetEnvironment(context.Background(), "db", map[string]string{"bad-key": "x"}); err == nil {
+		t.Fatal("a key outside A-Z, 0-9 and _ must be refused")
+	}
+	if err := c.SetEnvironment(context.Background(), "db", map[string]string{"POSTGRES_DB": "a\nb"}); err == nil {
+		t.Fatal("a newline in a value must be refused")
+	}
+	if err := c.RestartInstance(context.Background(), "db"); err != nil || ex.cmds[len(ex.cmds)-1] != "incus restart 'db'" {
+		t.Fatalf("restart: %v %v", err, ex.cmds)
+	}
+}
+
 func TestWriteEnvironmentFileUsesFilePushWithOwnershipAndSortedContent(t *testing.T) {
 	ex := &stubExec{}
 	c := NewClient(ex)

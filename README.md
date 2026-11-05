@@ -339,9 +339,10 @@ volumes:
 limits:
   limits.cpu: 2
   limits.memory: 2GB
-# Written to /etc/default/<service>. env values are in git; env_from values come from the daemon's
-# secret store (synced from the git server's secret store; names must start with SERVICE_), and plans
-# show only which secret fills a key. See docs/daemon.md, "Service secrets".
+# A systemd service reads /etc/default/<service>. An OCI image (docker: or quay:) reads environment.*
+# instance config; apply writes the keys that differ and restarts the instance. env values are in git;
+# env_from values come from the daemon's secret store (synced from the git server's secret store; names
+# must start with SERVICE_), and plans show only which secret fills a key. See docs/daemon.md, "Service secrets".
 env:
   GITEA__server__ROOT_URL: https://git.example.com
 env_from:
@@ -359,6 +360,7 @@ healthcheck:
 routing:
   domain: git.example.com
   upstream_port: 3000
+  # external: true   # this name is already served by the hand-maintained Caddyfile; no site file is published
   # Optional, per route, at the edge (both off unless set):
   cache:                 # cache responses for these paths; upstream Cache-Control is honoured
     ttl: 5m              # for responses that do not say (default 2m)
@@ -481,10 +483,13 @@ What it reports: a new instance and its volumes; an image that moved (replaced t
 update path); a running instance that has no recorded image (adopted, no restart); limits that
 differ (old -> new); volumes to create or attach; environment **key names** to add or change
 (values are never printed, so the output is safe to keep in CI logs) and how many live keys the
-manifest does not declare (kept); a route that is missing or points elsewhere. It also lists
-things `apply` will not act on but you should know: profiles that differ, an image that cannot be
-identified, and an OCI container that takes its environment from `environment.*` config (which
-`apply` does not write).
+manifest does not declare (kept). A systemd service's environment is `/etc/default/<service>`. An
+OCI container's (a `docker:` or `quay:` image, or one that already has `environment.*` config) is
+`environment.*`, which is what its entrypoint reads; apply writes the keys that differ and restarts
+the instance. A route that is missing or points elsewhere is reported too, unless
+`routing.external: true`, which leaves that name to the hand-maintained Caddyfile. It also lists
+things `apply` will not act on but you should know: profiles that differ, and an image that cannot
+be identified.
 
 Blocked means `apply` would refuse: a device already using the name a volume needs, an edge
 Caddyfile that does not import the sites directory, no edge instance to publish a route to, or a
@@ -495,8 +500,8 @@ before adopting a running host: a plan against production is how you find out wh
 your manifests would actually change.
 
 `plan` and `apply` share their decisions (which image is current, which limits drifted, what
-the environment file needs, whether a volume is attached, which upstream a route uses), so they
-cannot disagree; the tests run both against the same states and compare.
+the environment needs, whether a volume is attached, which upstream a route uses, and whether a
+route is external), so they cannot disagree; the tests run both against the same states and compare.
 
 ---
 

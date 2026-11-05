@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -465,6 +466,52 @@ func (c *Client) WaitSystemd(ctx context.Context, container string) error {
 		}
 	}
 }
+
+// RestartInstance restarts the whole instance. An OCI container has no systemd unit; its entrypoint
+// reads environment.* only at start, so a changed environment is picked up by restarting the instance.
+func (c *Client) RestartInstance(ctx context.Context, name string) error {
+	if !ValidName(name) {
+		return fmt.Errorf("invalid instance name %q", name)
+	}
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("incus restart %s", ShQuote(name))); err != nil {
+		return fmt.Errorf("restart %s: %w", name, err)
+	}
+	return nil
+}
+
+// SetEnvironment sets environment.<KEY> on an OCI instance. Undeclared keys are not touched; the caller
+// passes only the keys whose value changed. The script goes over stdin so a value never appears in the
+// command line or in an error (those end up in job records).
+func (c *Client) SetEnvironment(ctx context.Context, name string, env map[string]string) error {
+	if !ValidName(name) {
+		return fmt.Errorf("invalid instance name %q", name)
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if !envKeyRe.MatchString(k) {
+			return fmt.Errorf("environment key %q is not A-Z, 0-9 and _", k)
+		}
+		if strings.ContainsAny(env[k], "\n\r") {
+			return fmt.Errorf("environment key %s contains a newline", k)
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var script strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&script, "incus config set %s %s\n", ShQuote(name), ShQuote("environment."+k+"="+env[k]))
+	}
+	if _, err := c.exec.RunWithInput(ctx, "bash -s", strings.NewReader(script.String())); err != nil {
+		return fmt.Errorf("set environment on %s: %w", name, err)
+	}
+	return nil
+}
+
+// envKeyRe is the shape of an environment key written to an OCI instance. Same alphabet as a service env key.
+var envKeyRe = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
 
 // RestartService triggers a systemd service restart inside the container,
 // first waiting for systemd itself to be up (see WaitSystemd).
