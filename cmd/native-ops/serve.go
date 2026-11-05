@@ -146,6 +146,7 @@ type serveFlags struct {
 	edgeContainer     *string
 	dnsProviderFlag   *string
 	dnsDomains        *string
+	hostName          *string
 	stateDir          *string
 }
 
@@ -188,6 +189,7 @@ func defineServeFlags(fs *flag.FlagSet) *serveFlags {
 	v.edgeContainer = flags.String("edge-container", envOr("NATIVE_OPS_EDGE_CONTAINER", "edge"), "Incus container running the edge (Caddy): its routes and certificates are reported. Empty to skip. Env: NATIVE_OPS_EDGE_CONTAINER")
 	v.dnsProviderFlag = flags.String("dns-provider", envOr("NATIVE_OPS_DNS_PROVIDER", ""), "DNS provider to list records from for the status page, e.g. digitalocean (DO_API_TOKEN from the secret store, else the environment). Env: NATIVE_OPS_DNS_PROVIDER")
 	v.dnsDomains = flags.String("dns-domains", envOr("NATIVE_OPS_DNS_DOMAINS", ""), "Comma-separated zones to list DNS records for on the status page, e.g. 'example.com,example.net'. When set (or the synced secret NATIVE_OPS_DNS_ZONES is), a plan whose dns_records name another zone is blocked. Env: NATIVE_OPS_DNS_DOMAINS")
+	v.hostName = flags.String("host-name", envOr("NATIVE_OPS_HOST_NAME", ""), "Which of fleet.yml's hosts this daemon runs on. With two or more hosts it is required: the daemon plans and applies only the services of its host (a service's host:, else default_host) and refuses to plan without it. With one host it may be left out. Kept from the unit when fleet.yml's daemon.flags replace the unit's flags. Env: NATIVE_OPS_HOST_NAME")
 	v.stateDir = stateDirFlag(flags)
 	return v
 }
@@ -213,7 +215,8 @@ func validateServeFlags(set string) error {
 
 func handleServeCommand(ctx context.Context, args []string) {
 	// The flags the last deploy applied from fleet.yml's daemon.flags replace the unit's, all but
-	// --state-dir and, when the set has none, --addr (pkg/serveflags): a flag changes through git.
+	// --state-dir, the unit's --host-name and, when the set has none, --addr (pkg/serveflags): a flag
+	// changes through git.
 	unitStateDir := "/var/lib/native-ops"
 	if v, ok := serveflags.Value(args, "state-dir"); ok {
 		unitStateDir = v
@@ -233,7 +236,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	v := defineServeFlags(flags)
-	addr, pool, enableApply, approvalTTL, enableInstances, instanceProfiles, instanceImports, enableImageBuild, enableBackup, enableDNSSync, imageKeep, imageOrphanAge, imagePruneEvery, imagePrefix, gitURL, gitProvider, deployRepo, deployTags, enableEdgeApply, enableAuth, oidcIssuer, oidcClientID, oidcClientSecret, oidcRedirectURL, oidcAllowedDomain, oidcRole, oidcLabel, mcpOAuth, publicURL, edgeContainer, dnsProviderFlag, dnsDomains, stateDir := v.addr, v.pool, v.enableApply, v.approvalTTL, v.enableInstances, v.instanceProfiles, v.instanceImports, v.enableImageBuild, v.enableBackup, v.enableDNSSync, v.imageKeep, v.imageOrphanAge, v.imagePruneEvery, v.imagePrefix, v.gitURL, v.gitProvider, v.deployRepo, v.deployTags, v.enableEdgeApply, v.enableAuth, v.oidcIssuer, v.oidcClientID, v.oidcClientSecret, v.oidcRedirectURL, v.oidcAllowedDomain, v.oidcRole, v.oidcLabel, v.mcpOAuth, v.publicURL, v.edgeContainer, v.dnsProviderFlag, v.dnsDomains, v.stateDir
+	addr, pool, enableApply, approvalTTL, enableInstances, instanceProfiles, instanceImports, enableImageBuild, enableBackup, enableDNSSync, imageKeep, imageOrphanAge, imagePruneEvery, imagePrefix, gitURL, gitProvider, deployRepo, deployTags, enableEdgeApply, enableAuth, oidcIssuer, oidcClientID, oidcClientSecret, oidcRedirectURL, oidcAllowedDomain, oidcRole, oidcLabel, mcpOAuth, publicURL, edgeContainer, dnsProviderFlag, dnsDomains, hostName, stateDir := v.addr, v.pool, v.enableApply, v.approvalTTL, v.enableInstances, v.instanceProfiles, v.instanceImports, v.enableImageBuild, v.enableBackup, v.enableDNSSync, v.imageKeep, v.imageOrphanAge, v.imagePruneEvery, v.imagePrefix, v.gitURL, v.gitProvider, v.deployRepo, v.deployTags, v.enableEdgeApply, v.enableAuth, v.oidcIssuer, v.oidcClientID, v.oidcClientSecret, v.oidcRedirectURL, v.oidcAllowedDomain, v.oidcRole, v.oidcLabel, v.mcpOAuth, v.publicURL, v.edgeContainer, v.dnsProviderFlag, v.dnsDomains, v.hostName, v.stateDir
 	_ = flags.Parse(args)
 
 	for name, on := range map[string]bool{"--enable-dns-sync": *enableDNSSync, "--enable-edge-apply": *enableEdgeApply} {
@@ -266,7 +269,6 @@ func handleServeCommand(ctx context.Context, args []string) {
 		DeployRepo:       *deployRepo,
 		DeployTags:       *deployTags,
 		EnableBackup:     *enableBackup,
-		HostName:         backupHostName(),
 		EnableAuth:       *enableAuth,
 		MCPOAuth:         *mcpOAuth,
 		PublicURL:        *publicURL,
@@ -275,6 +277,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		EdgeContainer:        *edgeContainer,
 		DNSProviderName:      *dnsProviderFlag,
 		DNSDomains:           splitList(*dnsDomains),
+		HostName:             *hostName,
 		Exec:                 remote.NewLocalExecutor(),
 		BootstrapToken:       os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN"),
 		BootstrapTokenSHA256: os.Getenv("NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256"),
@@ -306,7 +309,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 	}()
 	go srv.RunImageRetention(ctx, *imagePruneEvery)
 	go srv.RunBackupSchedule(ctx)
-	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v, self-upgrade: %v)", Version, *addr, *stateDir, *enableApply, managedBinDir(binDir) != "")
+	log.Printf("native-ops %s serving on http://%s (state: %s, host: %s, apply: %v, self-upgrade: %v)", Version, *addr, *stateDir, hostLabel(*hostName), *enableApply, managedBinDir(binDir) != "")
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
@@ -316,6 +319,14 @@ func handleServeCommand(ctx context.Context, args []string) {
 		os.Exit(exitRestart)
 	}
 	log.Printf("stopped")
+}
+
+// hostLabel is --host-name for the log, or "-" when it was not given.
+func hostLabel(name string) string {
+	if name == "" {
+		return "-"
+	}
+	return name
 }
 
 // exitRestart is the exit status after a self-upgrade: not 0, so that the unit's Restart=on-failure
@@ -345,9 +356,6 @@ type daemonConfig struct {
 	DeployRepo   string
 	DeployTags   string
 	EnableBackup bool
-	// HostName is this host's name in backup object keys (<prefix>/<host>/<volume>/...); empty falls back
-	// to the OS host name. serve fills it from NATIVE_OPS_HOST_NAME.
-	HostName string
 	// DNSProviderName ("digitalocean") lists DNS records for the status page with the provider's token
 	// read through the secret store at each listing; DNS, when set, is used instead (tests).
 	DNSProviderName string
@@ -376,6 +384,11 @@ type daemonConfig struct {
 	EdgeContainer string
 	DNS           provider.DNSProvider
 	DNSDomains    []string
+	// HostName is which of fleet.yml's hosts this daemon runs on (--host-name, env NATIVE_OPS_HOST_NAME):
+	// its plans are that host's share of a fleet of several hosts, and it is the <host> in its backup
+	// object keys (<prefix>/<host>/<volume>/...). Empty for a single-host fleet: plans are the whole
+	// fleet, and backups fall back to the OS host name.
+	HostName string
 }
 
 // newDaemon builds the server. Without EnableApply the daemon can read the host and plan an
@@ -425,7 +438,7 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 		Status: func(ctx context.Context) (*status.Snapshot, error) {
 			return status.CollectFull(ctx, cfg.Exec, status.Options{Pool: cfg.Pool, EdgeContainer: cfg.EdgeContainer, DNS: cfg.DNS, DNSDomains: cfg.DNSDomains})
 		},
-		Plan:    planSource(cfg.Exec, key, secrets.Get, lookup, cfg.DNSDomains),
+		Plan:    planSource(cfg.Exec, key, secrets.Get, lookup, cfg.DNSDomains, cfg.HostName),
 		Secrets: secrets,
 	}
 	if cfg.EnableApply || cfg.EnableInstances || cfg.EnableImageBuild || cfg.EnableBackup || cfg.SelfUpgradeDir != "" {
@@ -594,10 +607,10 @@ func splitList(s string) []string {
 // makes the plan's hash cover the environment values and hook bodies the plan itself does not print. A
 // service's env_from reads secrets (the store only: never the daemon's own environment). fleet.yml's
 // dns_records are planned against the provider (read only), with the token from lookup.
-func planSource(exec remote.Executor, key []byte, secrets engine.SecretLookup, lookup func(string) string, flagZones []string) server.PlanFunc {
+func planSource(exec remote.Executor, key []byte, secrets engine.SecretLookup, lookup func(string) string, flagZones []string, hostName string) server.PlanFunc {
 	return func(ctx context.Context, dir, service string) (*engine.FleetPlan, error) {
 		return engine.PlanFleet(ctx, exec, dir, service, engine.WithBindKey(key), engine.WithSecrets(secrets),
-			engine.WithDNS(dnsProviderFor(lookup), dnsZoneLimit(lookup, flagZones)))
+			engine.WithDNS(dnsProviderFor(lookup), dnsZoneLimit(lookup, flagZones)), engine.WithHostName(hostName))
 	}
 }
 

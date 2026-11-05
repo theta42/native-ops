@@ -7,14 +7,7 @@ import (
 	"testing"
 )
 
-func writeFleet(t *testing.T, body string) string {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return dir
-}
+// writeFleet is in config_test.go.
 
 func TestBackupScheduleTimes(t *testing.T) {
 	b := &BackupConfig{Schedule: " 15:30, 03:05,03:05 "}

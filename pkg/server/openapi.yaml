@@ -1429,13 +1429,17 @@ components:
       type: object
       description: One entry per service, with its action and the changes it would make.
       properties:
+        host:
+          type: string
+          description: "With two or more hosts in fleet.yml: the host (serve --host-name) this plan is the share of. Absent for a single-host fleet."
         services:
           type: array
           items:
             type: object
             properties:
               service: { type: string }
-              action: { type: string, enum: [none, create, update, blocked] }
+              action: { type: string, enum: [none, create, update, blocked, skipped] }
+              host: { type: string, description: "skipped only: the host the service belongs to (another daemon applies it)." }
               changes:
                 type: array
                 items:

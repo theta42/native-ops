@@ -1,0 +1,42 @@
+name: Deploy (several hosts)
+# A fleet of several hosts runs one daemon per host, and each applies only its own host's services
+# (docs/daemon.md, "Several hosts"). One protected deploy tag goes to every daemon: one matrix job per
+# host, each with that host's daemon URL and its own deployer token. Each daemon checks the tag, fetches
+# the commit, and plans and applies its own share; nothing here holds an SSH key or a cloud credential.
+on:
+  push:
+    tags: ['deploy-*']
+
+env:
+  NATIVE_OPS_VERSION: vX.Y.Z
+  NATIVE_OPS_SHA256: "<sha256 of the linux_amd64 tarball>"
+
+jobs:
+  deploy:
+    strategy:
+      fail-fast: false   # a host that fails does not cancel the others; each reports its own result
+      matrix:
+        include:
+          # host: the entry of fleet.yml's hosts: (the daemon there runs with --host-name <host>)
+          # token: the name of the repository secret holding that daemon's deployer token
+          - {host: host-a, url: https://native-ops.host-a.example.com, token: NATIVE_OPS_TOKEN_HOST_A}
+          - {host: host-b, url: https://native-ops.host-b.example.com, token: NATIVE_OPS_TOKEN_HOST_B}
+    name: deploy (${{ matrix.host }})
+    runs-on: ubuntu-latest
+    env:
+      NATIVE_OPS_URL: ${{ matrix.url }}
+    steps:
+      - name: Install native-ops (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"   # outside the checkout: the tree a plan or build uploads must not carry the tool
+          curl -fsSL --proto '=https' --tlsv1.2 -o native-ops.tgz \
+            "https://github.com/theta42/native-ops/releases/download/${NATIVE_OPS_VERSION}/native-ops_${NATIVE_OPS_VERSION}_linux_amd64.tar.gz"
+          echo "${NATIVE_OPS_SHA256}  native-ops.tgz" | sha256sum -c -
+          tar -xzf native-ops.tgz
+          install -D -m 0755 "native-ops_${NATIVE_OPS_VERSION}_linux_amd64" "$HOME/.local/bin/native-ops"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Deploy the tag to this host's daemon
+        env:
+          NATIVE_OPS_TOKEN: ${{ secrets[matrix.token] }}
+        run: native-ops remote deploy --tag "${GITHUB_REF_NAME}"

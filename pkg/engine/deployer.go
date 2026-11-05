@@ -38,6 +38,10 @@ type Deployer struct {
 	// secrets resolves a service's env_from names. The daemon gives it its secret store (and nothing
 	// else); on a host run without a daemon it is the process environment.
 	secrets SecretLookup
+	// hostName is the host this daemon is (`serve --host-name`, see WithHostName); empty when it was not told.
+	hostName string
+	// share, set while a plan is a share of a fleet of several hosts, says what belongs to other hosts.
+	share *hostShare
 }
 
 // SecretLookup reads a secret by name; ok is false when it is not set.

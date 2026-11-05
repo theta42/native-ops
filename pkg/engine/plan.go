@@ -39,6 +39,7 @@ const (
 	ActionCreate  = "create"  // there is no such instance yet
 	ActionUpdate  = "update"  // it exists and apply would change something
 	ActionBlocked = "blocked" // apply would fail
+	ActionSkipped = "skipped" // it belongs to another host, whose daemon plans and applies it
 )
 
 // Change is one thing `apply` would do. Detail never contains a secret: environment
@@ -57,6 +58,8 @@ type ServicePlan struct {
 	Notes []string `json:"notes,omitempty"`
 	// Blockers are reasons apply would fail on this service.
 	Blockers []string `json:"blockers,omitempty"`
+	// Host is the host a skipped service belongs to (ActionSkipped only).
+	Host string `json:"host,omitempty"`
 
 	// bind is a keyed digest of everything the manifest says that the plan does not print (see
 	// WithBindKey). It is never serialized; it only goes into FleetPlan.Hash.
@@ -439,6 +442,10 @@ func joinKV(m map[string]string) string {
 type FleetPlan struct {
 	Services []*ServicePlan `json:"services"`
 	Network  *NetworkPlan   `json:"network,omitempty"`
+	// Host is the host this plan is the share of, when fleet.yml has several (see config.DaemonHost):
+	// the services of the other hosts are in Services as skipped, and nothing else of theirs is planned.
+	// Empty for a fleet of one host (or none), whose plan is all of it.
+	Host string `json:"host,omitempty"`
 }
 
 // Counts returns how many services fall in each action.
@@ -467,7 +474,14 @@ func (f *FleetPlan) Render() string {
 	sym := map[string]string{ActionNone: " ", ActionCreate: "+", ActionUpdate: "~", ActionBlocked: "!"}
 	svcs := append([]*ServicePlan(nil), f.Services...)
 	sort.SliceStable(svcs, func(i, j int) bool { return svcs[i].Service < svcs[j].Service })
+	if f.Host != "" {
+		fmt.Fprintf(&sb, "Host %s: only its own services are planned; those of other hosts are skipped.\n\n", f.Host)
+	}
 	for _, s := range svcs {
+		if s.Action == ActionSkipped {
+			fmt.Fprintf(&sb, "- %s (skipped: on host %s)\n", s.Service, s.Host)
+			continue
+		}
 		fmt.Fprintf(&sb, "%s %s (%s)\n", sym[s.Action], s.Service, s.Action)
 		for _, c := range s.Changes {
 			fmt.Fprintf(&sb, "    %-22s %s\n", c.Kind, c.Detail)
@@ -500,6 +514,9 @@ func (f *FleetPlan) Render() string {
 	}
 	c := f.Counts()
 	fmt.Fprintf(&sb, "\nPlan: %d to create, %d to update, %d unchanged, %d blocked", c[ActionCreate], c[ActionUpdate], c[ActionNone], c[ActionBlocked])
+	if c[ActionSkipped] > 0 {
+		fmt.Fprintf(&sb, ", %d on other hosts", c[ActionSkipped])
+	}
 	if n := f.Network; n != nil && len(n.Blockers) > 0 {
 		sb.WriteString("; the network is blocked")
 	} else if n != nil && len(n.Changes) > 0 {
@@ -519,11 +536,16 @@ var ErrBadConfig = errors.New("invalid configuration")
 
 // PlanFleet plans every service in a config directory (only one when service is set) against
 // the host behind exec, which it wraps in remote.ReadOnly, so the host cannot change.
+//
+// When fleet.yml names several hosts, the plan is this daemon's share (WithHostName): the services of
+// the other hosts are listed as skipped and never planned against this host, and the fleet-wide work
+// that another host's daemon does (dns_records: the default host's) is left to it. Without a host name
+// such a fleet is refused, rather than every host's services being planned here.
 func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service string, opts ...PlanOption) (*FleetPlan, error) {
-	if _, err := config.LoadFleetConfig(configDir); err != nil {
+	fleet, err := config.LoadFleetConfig(configDir)
+	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
 	}
-	fleet, _ := config.LoadFleetConfig(configDir)
 	services, err := config.LoadServices(configDir, service)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
@@ -532,8 +554,20 @@ func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service str
 	for _, o := range opts {
 		o(d)
 	}
+	mine, share, err := shareOf(fleet, services, d.hostName)
+	if err != nil {
+		return nil, err
+	}
+	d.share = share
 	fp := &FleetPlan{Services: []*ServicePlan{}}
+	if share != nil {
+		fp.Host = share.host
+	}
 	for _, svc := range services {
+		if h, other := share.elsewhere(svc.Name); other {
+			fp.Services = append(fp.Services, &ServicePlan{Service: svc.Name, Action: ActionSkipped, Host: h})
+			continue
+		}
 		p, err := d.PlanService(ctx, svc, configDir)
 		if err != nil {
 			return nil, fmt.Errorf("plan service %s: %w", svc.Name, err)
@@ -542,11 +576,68 @@ func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service str
 	}
 	// The network is the whole fleet's: a plan narrowed to one service leaves it out.
 	if service == "" {
-		if fp.Network, err = d.PlanNetwork(ctx, fleet, configDir, services); err != nil {
+		if fp.Network, err = d.PlanNetwork(ctx, fleet, configDir, mine); err != nil {
 			return nil, fmt.Errorf("plan the network: %w", err)
 		}
 	}
 	return fp, nil
+}
+
+// WithHostName says which of fleet.yml's hosts this daemon is (`serve --host-name`). With several hosts
+// the plan is that host's share; with one it must be that host (or empty).
+func WithHostName(name string) PlanOption {
+	return func(d *Deployer) { d.hostName = name }
+}
+
+// HostServices is the services of the host a run on it is (hostName, as for WithHostName), for the
+// commands that deploy without a plan: the same rule as a plan's, refusal included.
+func HostServices(fleet *config.FleetConfig, services []*config.ServiceConfig, hostName string) ([]*config.ServiceConfig, error) {
+	mine, _, err := shareOf(fleet, services, hostName)
+	return mine, err
+}
+
+// hostShare is what a plan of one host's share knows about the rest of the fleet.
+type hostShare struct {
+	host        string            // the host this daemon is
+	defaultHost string            // fleet.yml's default host: its daemon does the fleet-wide work (dns_records)
+	others      map[string]string // the services of other hosts, by name, with their host
+}
+
+// elsewhere reports whether a service belongs to another host, and which. A nil share (a fleet of one
+// host) has none.
+func (s *hostShare) elsewhere(service string) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	h, ok := s.others[service]
+	return h, ok
+}
+
+// shareOf splits the services into this daemon's and the others' (config.DaemonHost decides whether the
+// plan is a share at all, or a refusal), after checking each `host:` names a host of fleet.yml.
+func shareOf(fleet *config.FleetConfig, services []*config.ServiceConfig, hostName string) ([]*config.ServiceConfig, *hostShare, error) {
+	for _, svc := range services {
+		if err := fleet.ValidateServiceHost(svc); err != nil {
+			return nil, nil, fmt.Errorf("%w: %v", ErrBadConfig, err)
+		}
+	}
+	host, filtered, err := fleet.DaemonHost(hostName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrBadConfig, err)
+	}
+	if !filtered {
+		return services, nil, nil
+	}
+	share := &hostShare{host: host, defaultHost: fleet.DefaultHostName(), others: map[string]string{}}
+	var mine []*config.ServiceConfig
+	for _, svc := range services {
+		if h := fleet.HostOf(svc); h != host {
+			share.others[svc.Name] = h
+			continue
+		}
+		mine = append(mine, svc)
+	}
+	return mine, share, nil
 }
 
 // ExitStatus is the status `native-ops plan` exits with: 1 when apply would fail on some
@@ -565,7 +656,14 @@ func (f *FleetPlan) ExitStatus() int {
 // services were planned in. An apply that is given the hash of a plan somebody reviewed can
 // refuse to run if the host or the manifests have changed since.
 func (f *FleetPlan) Hash() string {
-	svcs := append([]*ServicePlan(nil), f.Services...)
+	// Only what this daemon would apply is hashed: a service of another host (skipped) is left out, so a
+	// change to it does not ask this host for a fresh approval, and each host approves its own share.
+	var svcs []*ServicePlan
+	for _, sp := range f.Services {
+		if sp.Action != ActionSkipped {
+			svcs = append(svcs, sp)
+		}
+	}
 	sort.SliceStable(svcs, func(i, j int) bool { return svcs[i].Service < svcs[j].Service })
 	type hashed struct {
 		Plan *ServicePlan
@@ -576,9 +674,19 @@ func (f *FleetPlan) Hash() string {
 		rows[i] = hashed{sp, sp.bind}
 	}
 	var b []byte
-	if f.Network == nil {
+	switch {
+	case f.Host != "":
+		// A share of a fleet of several hosts names its host, so it is never the same plan as another
+		// host's share that happens to do the same things.
+		b, _ = json.Marshal(struct {
+			Host        string
+			Services    []hashed
+			Network     *NetworkPlan
+			NetworkBind string
+		}{f.Host, rows, f.Network, f.Network.bindOrEmpty()})
+	case f.Network == nil:
 		b, _ = json.Marshal(rows) // the same hash a plan had before it had a network part
-	} else {
+	default:
 		b, _ = json.Marshal(struct {
 			Services    []hashed
 			Network     *NetworkPlan
@@ -597,12 +705,16 @@ func (d *Deployer) ApplyPlan(ctx context.Context, configDir string, plan *FleetP
 	if plan.Blocked() {
 		return errors.New("the plan is blocked; nothing was applied")
 	}
-	// A launch makes sure of this host's bridge, as fleet.yml declares it (when it says which host this is).
+	if err := checkShare(configDir, plan); err != nil {
+		return fmt.Errorf("%w; nothing was applied", err)
+	}
+	// A launch makes sure of this host's bridge, as fleet.yml declares it for the host this daemon is: the
+	// host whose share the plan is (checkShare made sure a fleet of several hosts was planned as one).
 	fleet, err := config.LoadFleetConfig(configDir)
 	if err != nil {
 		return err
 	}
-	if n, ok := fleet.LocalNetwork(); ok {
+	if n, ok := fleet.LocalNetwork(plan.Host); ok {
 		if err := d.SetNetwork(n); err != nil {
 			return fmt.Errorf("network: %w", err)
 		}
@@ -621,6 +733,41 @@ func (d *Deployer) ApplyPlan(ctx context.Context, configDir string, plan *FleetP
 		}
 		if err := d.DeployService(ctx, svcs[0], configDir); err != nil {
 			return fmt.Errorf("apply %s: %w", sp.Service, err)
+		}
+	}
+	return nil
+}
+
+// checkShare is apply's own check of the host rule, so that a plan can never deploy another host's
+// service: a fleet of several hosts must have been planned as one host's share, and every service the plan
+// changes must belong to that host.
+func checkShare(configDir string, plan *FleetPlan) error {
+	if !plan.Pending() {
+		return nil
+	}
+	fleet, err := config.LoadFleetConfig(configDir)
+	if err != nil {
+		return err
+	}
+	if len(fleet.Hosts) < 2 {
+		if plan.Host != "" {
+			return fmt.Errorf("the plan is host %s's share, but fleet.yml has %d hosts", plan.Host, len(fleet.Hosts))
+		}
+		return nil
+	}
+	if plan.Host == "" {
+		return fmt.Errorf("%w: fleet.yml has %d hosts, and the plan is not one host's share", config.ErrHostNameRequired, len(fleet.Hosts))
+	}
+	for _, sp := range plan.Services {
+		if sp.Action != ActionCreate && sp.Action != ActionUpdate {
+			continue
+		}
+		svcs, err := config.LoadServices(configDir, sp.Service)
+		if err != nil || len(svcs) != 1 {
+			return fmt.Errorf("service %s is in the plan but its manifest could not be loaded", sp.Service)
+		}
+		if h := fleet.HostOf(svcs[0]); h != plan.Host {
+			return fmt.Errorf("service %s belongs to host %s, and this plan is host %s's share", sp.Service, h, plan.Host)
 		}
 	}
 	return nil

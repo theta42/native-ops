@@ -22,7 +22,10 @@ type FleetConfig struct {
 	Network     NetworkConfig         `yaml:"network"`
 	Providers   ProvidersConfig       `yaml:"providers"`
 	Hosts       map[string]HostConfig `yaml:"hosts"`
-	Backup      *BackupConfig         `yaml:"backup,omitempty"`
+	// DefaultHost is the host a service without `host:` belongs to. With one entry in hosts: that entry
+	// is the default and this may be left out; with two or more it is required (see ValidateHosts).
+	DefaultHost string        `yaml:"default_host,omitempty"`
+	Backup      *BackupConfig `yaml:"backup,omitempty"`
 	// Snapshots is the default local snapshot policy for every volume a service declares (a volume's own
 	// `snapshots:` replaces it). It is applied as Incus' own storage-volume config by plan and apply, so
 	// the host needs no snapshot timer. Absent, volumes' snapshot config is left as it is.
@@ -533,6 +536,10 @@ type ServiceConfig struct {
 	// the instance carries, and a change is applied live (no restart). Absent (nil), the instance's labels are
 	// left alone.
 	Labels map[string]string `yaml:"labels,omitempty"`
+	// Host is the entry of fleet.yml's hosts: this service runs on; empty means the default host. Only
+	// that host's daemon plans and applies it (see FleetConfig.DaemonHost); the others show it as skipped.
+	// json omitempty: a manifest without host: digests (bindOf) exactly as it did before the field existed.
+	Host string `yaml:"host,omitempty" json:",omitempty"`
 }
 
 // Unit is the systemd unit (and /etc/default/<name>) this service runs: Service when set, else the
@@ -622,6 +629,9 @@ func LoadFleetConfig(dir string) (*FleetConfig, error) {
 		if err := cfg.Snapshots.Validate(); err != nil {
 			return nil, fmt.Errorf("%s: snapshots: %w", path, err)
 		}
+	}
+	if err := cfg.ValidateHosts(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	return &cfg, nil

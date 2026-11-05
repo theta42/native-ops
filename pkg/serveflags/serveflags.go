@@ -3,9 +3,10 @@
 //
 // The flags live in the daemon's state directory, which the daemon may write (as it may its own binary).
 // At startup, when a flag set is kept there, it replaces the flags on the unit's command line, all but
-// --state-dir (which says where to look) and --addr when the kept set has none: the unit needs nothing
-// but those two, and a host whose unit carries more (one made before this, or by hand) is brought in line
-// by its next deploy without anyone logging in.
+// --state-dir (which says where to look), --host-name (which of a fleet's hosts this is: daemon.flags are
+// the same for every host) and --addr when the kept set has none: the unit needs nothing but those, and a
+// host whose unit carries more (one made before this, or by hand) is brought in line by its next deploy
+// without anyone logging in.
 //
 // A new set is staged as pending and the daemon restarts into it. Each start of a pending set is counted;
 // one that has served for CommitAfter is committed. One that did not start MaxAttempts times is dropped,
@@ -149,8 +150,9 @@ func Value(args []string, name string) (string, bool) {
 }
 
 // Merge is the command line a managed set runs with: the unit's --addr (unless the set has its own), the
-// set, and the unit's --state-dir last, so the set can change neither where the state is nor, without
-// saying so, where the daemon listens.
+// set, then the unit's --host-name, if it has one, and its --state-dir, last, so the set can change neither
+// where the state is, nor which host the daemon is, nor, without saying so, where the daemon listens.
+// (fleet.yml's daemon.flags are the same for every host's daemon, so a host's name belongs on its unit.)
 func Merge(unitArgs, set []string, stateDir string) []string {
 	var out []string
 	if addr, ok := Value(unitArgs, "addr"); ok {
@@ -159,5 +161,8 @@ func Merge(unitArgs, set []string, stateDir string) []string {
 		}
 	}
 	out = append(out, set...)
+	if host, ok := Value(unitArgs, "host-name"); ok {
+		out = append(out, "--host-name", host)
+	}
 	return append(out, "--state-dir", stateDir)
 }

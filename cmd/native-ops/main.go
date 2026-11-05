@@ -267,6 +267,7 @@ func handleApplyCommand(ctx context.Context, args []string) {
 	flags := flag.NewFlagSet("apply", flag.ExitOnError)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf directory")
 	targetService := flags.String("service", "", "Optional specific service to apply (e.g. gitea)")
+	hostName := flags.String("host-name", "", "Which of fleet.yml's hosts this is: required when it has two or more (only that host's services are applied)")
 	_ = flags.Parse(args)
 
 	fleet, err := config.LoadFleetConfig(*configDir)
@@ -279,9 +280,13 @@ func handleApplyCommand(ctx context.Context, args []string) {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
+	services, err = engine.HostServices(fleet, services, *hostName)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 	exec := remote.NewLocalExecutor()
 	deployer := engine.NewDeployer(exec)
-	if n, ok := fleet.LocalNetwork(); ok {
+	if n, ok := fleet.LocalNetwork(*hostName); ok {
 		if err := deployer.SetNetwork(n); err != nil {
 			log.Fatalf("fleet.yml network: %v", err)
 		}
@@ -306,6 +311,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	configDir := flags.String("config-dir", ".", "Path to native-ops-conf directory")
 	targetService := flags.String("service", "", "Optional specific service to plan (e.g. gitea)")
+	hostName := flags.String("host-name", "", "Which of fleet.yml's hosts this is: required when it has two or more (only that host's services are planned)")
 	asJSON := flags.Bool("json", false, "Print the plan as JSON")
 	if err := flags.Parse(args); err != nil {
 		return 1
@@ -316,7 +322,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "Failed to load fleet config: %v\n", err)
 		return 1
 	}
-	fp, err := engine.PlanFleet(ctx, remote.NewLocalExecutor(), *configDir, *targetService)
+	fp, err := engine.PlanFleet(ctx, remote.NewLocalExecutor(), *configDir, *targetService, engine.WithHostName(*hostName))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -362,7 +368,7 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 
 		// The bridge a launch makes sure of is fleet.yml's for this host, when the config says which that is.
 		if fleet, err := config.LoadFleetConfig(*configDir); err == nil {
-			if n, ok := fleet.LocalNetwork(); ok {
+			if n, ok := fleet.LocalNetwork(""); ok {
 				if err := mgr.SetNetwork(n); err != nil {
 					log.Fatalf("fleet.yml network: %v", err)
 				}

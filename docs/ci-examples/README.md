@@ -11,6 +11,7 @@ talks to the daemon with `native-ops remote`; none of them holds an SSH key or a
 |---|---|
 | `plan.yml` | every pull request and push to main: validate, plan, comment the plan |
 | `deploy.yml` | a pushed `deploy-*` tag: deploy that commit (the daemon fetches it from the git server) |
+| `deploy-hosts.yml` | the same, for a fleet of several hosts: a matrix sends the tag to each host's daemon, which applies its own share (`docs/daemon.md`, "Several hosts"); each daemon has its own token |
 | `release.yml` | dispatched by an app repository: build its image on the host (it waits in line if the host is busy) |
 | `secrets.yml` | manual: copy service secrets (`SERVICE_*`) from the repository's secret store to the daemon |
 | `maintenance.yml` | nightly: back up volumes with retention, prune images |
