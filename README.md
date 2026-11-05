@@ -295,10 +295,13 @@ hosts:
   # (two hosts without `network:` both have the fleet's, so they overlap too). Either field may be set;
   # the other falls back to the fleet-level `network:`.
   node-02:
-    provider: digitalocean
-    address: auto
+    provider: static
+    address: 192.0.2.11    # DNS records that follow a service on this host point here (needs an IP)
+    incus_remote: node-02  # optional: the Incus remote that reaches this host; a migration's
+                           # target_host: node-02 goes to it (docs/daemon.md, "Moving an instance")
     network:
       ipv4_cidr: 10.0.101.0/24
+# reconcile brings each host up on its own, in name order; one failing does not stop the others.
 # The host a service without `host:` runs on: required with two or more hosts (with one, that host is
 # the default). Each host's daemon runs with `serve --host-name <host>` and applies only its own
 # services: see docs/daemon.md, "Several hosts".
@@ -312,13 +315,19 @@ daemon:
   flags: "--addr 10.0.100.1:8686 --enable-apply"
 
 # Records the plan diffs against the provider and a deploy tag applies (create or update, never delete),
-# beyond the computed apex + wildcard A. Each names its own zone.
+# beyond the computed apex + wildcard A (which point at the default host). Each names its own zone.
+# With several hosts, DNS follows the host: a record with `service:` belongs to that service's host, and
+# only that host's daemon writes it (an A/AAAA one leaves `value:` out and gets the host's address); a
+# service off the default host routed under `domain:` gets an A record at its host; every other record is
+# the default host's. Wildcards tied to a service, and records two hosts would claim, are refused.
+# See docs/daemon.md, "DNS with several hosts".
 dns_records:
   - zone: example.com
     type: MX
     name: inbound          # inbound.example.com
     value: inbound.example.com.   # the mail host
     priority: 10
+  # - {type: A, name: git, service: gitea}  # git.example.com -> gitea's host (its address: must be an IP)
 
 # Local snapshots, kept by Incus itself (no host timer): the default for every volume a service declares.
 # A volume's own `snapshots:` replaces it; `snapshots: {}` on a volume turns them off for it. Absent here

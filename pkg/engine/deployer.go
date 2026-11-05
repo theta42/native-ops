@@ -31,6 +31,9 @@ type Deployer struct {
 	// zones they may name.
 	dns          DNSFunc
 	dnsZoneLimit []string
+	// fleetServices are all the repository's services, when a plan is of the whole fleet: the DNS records
+	// tied to a service follow its host, whichever host's share the plan is.
+	fleetServices []*config.ServiceConfig
 	// bind, when set, is mixed into a plan's hash: a digest of everything the manifest says that the
 	// plan does not print (environment values, hook bodies, health checks), so that the hash of a
 	// plan covers what apply would really do. See WithBindKey.

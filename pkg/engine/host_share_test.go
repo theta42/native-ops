@@ -285,7 +285,7 @@ func TestApplyRefusesAPlanThatIsNotThisHostsShare(t *testing.T) {
 	}
 }
 
-func TestOnlyTheDefaultHostDoesTheFleetsDNSAndTheEdgeHostItsCaddyfile(t *testing.T) {
+func TestTheDefaultHostDoesTheUntiedDNSAndTheEdgeHostItsCaddyfile(t *testing.T) {
 	fleet := twoHostFleet + "dns_provider: fake\ndns_records:\n  - {zone: example.com, type: TXT, name: \"@\", value: hello}\n"
 	dir := shareTree(t, fleet, map[string]string{
 		"edge": "name: edge\nimage: edge:latest\nhost: h1\n",
@@ -298,8 +298,8 @@ func TestOnlyTheDefaultHostDoesTheFleetsDNSAndTheEdgeHostItsCaddyfile(t *testing
 		t.Fatal(err)
 	}
 
-	// h2 has no edge instance: the Caddyfile is h1's to apply, not a blocker on h2; and dns_records are
-	// the default host's.
+	// h2 has no edge instance: the Caddyfile is h1's to apply, not a blocker on h2; and a dns_records entry
+	// tied to no service is the default host's.
 	sim2 := hostSimFor(t, "h2")
 	delete(sim2.ctrs, "edge")
 	p2 := planShare(t, sim2, dir, "h2")
@@ -307,13 +307,13 @@ func TestOnlyTheDefaultHostDoesTheFleetsDNSAndTheEdgeHostItsCaddyfile(t *testing
 		t.Fatalf("h2's plan must not be blocked by h1's edge:\n%s", p2.Render())
 	}
 	notes := strings.Join(p2.Network.Notes, "\n")
-	if !strings.Contains(notes, "applied by host h1's daemon") || !strings.Contains(notes, "default host, h1") {
+	if !strings.Contains(notes, "applied by host h1's daemon") || !strings.Contains(notes, "host h1's daemon plans and applies TXT example.com") {
 		t.Fatalf("h2 should say h1 does these:\n%s", p2.Render())
 	}
 
 	// h1 (the default host) plans the records itself (here: without a provider, the usual note).
 	p1 := planShare(t, newHostSim(t), dir, "h1")
-	if strings.Contains(strings.Join(p1.Network.Notes, "\n"), "default host, h1") {
+	if strings.Contains(strings.Join(p1.Network.Notes, "\n"), "dns: host") {
 		t.Fatalf("h1 is the default host and plans the records:\n%s", p1.Render())
 	}
 }

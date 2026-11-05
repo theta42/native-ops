@@ -49,6 +49,10 @@ type DNSRecordConfig struct {
 	Value    string `yaml:"value"`
 	TTL      int    `yaml:"ttl,omitempty"`
 	Priority int    `yaml:"priority,omitempty"`
+	// Service ties the record to a service: it follows that service's host (its `host:`, else the default
+	// host), and only that host's daemon plans and applies it. An A or AAAA record tied to a service leaves
+	// Value out: it is the host's `address:`. A record tied to no service belongs to the default host.
+	Service string `yaml:"service,omitempty"`
 }
 
 // DNSRecordsByZone groups the declared records by zone (fleet.domain when a record omits it). It errors
@@ -297,11 +301,13 @@ type ProxmoxConfig struct {
 }
 
 type HostConfig struct {
-	Provider    string `yaml:"provider"` // "digitalocean", "proxmox", "static"
-	Address     string `yaml:"address"`
-	SSHUser     string `yaml:"ssh_user"`
-	SSHPort     int    `yaml:"ssh_port"`
-	IncusRemote string `yaml:"incus_remote"` // optional Incus remote name
+	Provider string `yaml:"provider"` // "digitalocean", "proxmox", "static"
+	Address  string `yaml:"address"`
+	SSHUser  string `yaml:"ssh_user"`
+	SSHPort  int    `yaml:"ssh_port"`
+	// IncusRemote is the Incus remote, as the other hosts name it, that reaches this host: a migration to
+	// it (POST /v1/instances/{name}/migrate with target_host) goes to this remote. Optional.
+	IncusRemote string `yaml:"incus_remote,omitempty"`
 	// Network overrides the fleet-level `network:` for this host; a field left empty falls back to it.
 	// Each host needs its own subnet (LoadFleetConfig refuses two that overlap).
 	Network *NetworkConfig `yaml:"network,omitempty"`

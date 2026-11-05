@@ -56,16 +56,37 @@ func (s *Server) instanceInScope(w http.ResponseWriter, r *http.Request, name, o
 	return true
 }
 
-// handleInstanceMigrate is POST /v1/instances/{name}/migrate {"target_remote": "...", "resume": false}.
+// migrateBody is the body of POST /v1/instances/{name}/migrate: where to (an Incus remote configured on
+// this host, or a host of fleet.yml, whose incus_remote is that remote) and whether to resume.
+type migrateBody struct {
+	engine.MigrateRequest
+	TargetHost string `json:"target_host,omitempty"`
+}
+
+// handleInstanceMigrate is POST /v1/instances/{name}/migrate
+// {"target_remote": "...", "resume": false} or {"target_host": "...", ...}.
 func (s *Server) handleInstanceMigrate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if !incus.ValidName(name) {
 		writeError(w, http.StatusBadRequest, "bad_request", "not a valid instance name")
 		return
 	}
-	var req engine.MigrateRequest
-	if !readJSON(w, r, &req) {
+	var body migrateBody
+	if !readJSON(w, r, &body) {
 		return
+	}
+	req := body.MigrateRequest
+	if body.TargetHost != "" {
+		if req.TargetRemote != "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "give target_host or target_remote, not both")
+			return
+		}
+		remote, code, err := s.targetRemoteOf(body.TargetHost)
+		if err != nil {
+			writeError(w, code, "bad_target_host", err.Error())
+			return
+		}
+		req.TargetRemote = remote
 	}
 	if err := req.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())

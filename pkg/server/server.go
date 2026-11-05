@@ -85,6 +85,11 @@ type Options struct {
 	// BackupScheduleDir, with Backup and Jobs, is where the daemon keeps the backup schedule a deploy
 	// tag's fleet.yml declared (backup.schedule); RunBackupSchedule runs it (see backup_schedule.go).
 	BackupScheduleDir string
+	// HostRemotesFile is where a deploy records fleet.yml's hosts and their incus_remote, so a migration can
+	// name its target by host (target_host). Empty: target_host is refused, target_remote still works.
+	HostRemotesFile string
+	// HostName is which of fleet.yml's hosts this daemon is (--host-name); empty when it was not told.
+	HostName string
 	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
 	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
 	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.

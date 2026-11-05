@@ -182,3 +182,79 @@ func TestReconcileASingleHostIsUnchanged(t *testing.T) {
 		})
 	}
 }
+
+const reconcileTwoHosts = "name: f\ndomain: example.com\ndns_provider: fake\ndefault_host: zeta\n" +
+	"hosts:\n" +
+	"  zeta: {provider: static, address: 198.51.100.20}\n" +
+	"  alpha: {provider: static, address: 198.51.100.10, ssh_user: ops, ssh_port: 2222, network: {ipv4_cidr: 10.0.101.0/24}}\n"
+
+// Each host is reconciled on its own, in the order of their names, with its own SSH user, port and
+// bridge; the fleet domain points at the default host whatever order the hosts come in.
+func TestReconcileEachHostOnItsOwn(t *testing.T) {
+	for i := 0; i < 5; i++ { // map order must not matter
+		w := newReconcileWorld(t, shareTree(t, reconcileTwoHosts, nil))
+		out := w.run(t)
+		if !strings.Contains(out, "--- error\n<nil>\n") {
+			t.Fatalf("both hosts reconcile:\n%s", out)
+		}
+		if got := strings.Join(w.dialLog, "|"); got != "dial ops@198.51.100.10:2222|dial root@198.51.100.20:22" {
+			t.Fatalf("each host on its own SSH user and port, in name order: %s", got)
+		}
+		if got := strings.Join(w.dns.syncs, "|"); got != "example.com: A @ 198.51.100.20, A * 198.51.100.20" {
+			t.Fatalf("the domain points at the default host zeta, not the last one reconciled: %s", got)
+		}
+		a, z := strings.Join(w.hosts["198.51.100.10"].cmds, "\n"), strings.Join(w.hosts["198.51.100.20"].cmds, "\n")
+		if !strings.Contains(a, "10.0.101.1/24") || strings.Contains(a, "10.0.100.1/24") || !strings.Contains(z, "10.0.100.1/24") || strings.Contains(z, "10.0.101.1/24") {
+			t.Fatalf("each host is bootstrapped with its own bridge:\nalpha:\n%s\nzeta:\n%s", a, z)
+		}
+		if len(w.local.cmds) != 0 {
+			t.Fatalf("nothing runs on the machine reconcile runs on: %q", w.local.cmds)
+		}
+	}
+}
+
+// A host that fails is reported, and the others are still reconciled.
+func TestReconcileAHostThatFailsDoesNotStopTheOthers(t *testing.T) {
+	w := newReconcileWorld(t, shareTree(t, reconcileTwoHosts, nil))
+	w.refuse["198.51.100.10"] = true // alpha, reconciled first
+	out := w.run(t)
+	if !strings.Contains(out, "1 of 2 hosts failed: host alpha: init SSH executor to 198.51.100.10: connection refused") {
+		t.Fatalf("the run fails naming alpha:\n%s", out)
+	}
+	if !strings.Contains(out, "Host alpha failed: init SSH executor") || !strings.Contains(out, "the other hosts carry on") {
+		t.Fatalf("the log says alpha failed and the others carry on:\n%s", out)
+	}
+	if z := w.hosts["198.51.100.20"]; z == nil || len(z.cmds) == 0 {
+		t.Fatalf("zeta is still bootstrapped:\n%s", out)
+	}
+	if len(w.dns.syncs) != 1 {
+		t.Fatalf("the default host zeta is up, so its DNS is synced: %q", w.dns.syncs)
+	}
+
+	// The default host failing (sorted last): alpha is still bootstrapped, and the run names zeta.
+	w = newReconcileWorld(t, shareTree(t, reconcileTwoHosts, nil))
+	w.refuse["198.51.100.20"] = true
+	out = w.run(t)
+	if !strings.Contains(out, "1 of 2 hosts failed: host zeta: init SSH executor to 198.51.100.20") || len(w.hosts["198.51.100.10"].cmds) == 0 {
+		t.Fatalf("alpha is bootstrapped and zeta named:\n%s", out)
+	}
+
+	// Both failing: both are named.
+	w = newReconcileWorld(t, shareTree(t, reconcileTwoHosts, nil))
+	w.refuse["198.51.100.10"], w.refuse["198.51.100.20"] = true, true
+	out = w.run(t)
+	if !strings.Contains(out, "2 of 2 hosts failed: host alpha: ") || !strings.Contains(out, "host zeta: init SSH executor to 198.51.100.20") {
+		t.Fatalf("both hosts are named:\n%s", out)
+	}
+}
+
+// A DNS provider that cannot be set up fails the run at the end with several hosts, after every host was
+// brought up (with one host it stops the run where it is, as it always did: see the golden files).
+func TestReconcileSeveralHostsDNSFailureIsReportedAtTheEnd(t *testing.T) {
+	w := newReconcileWorld(t, shareTree(t, reconcileTwoHosts, nil))
+	w.r.dnsFor = func(*config.FleetConfig) (provider.DNSProvider, error) { return nil, errors.New("no DNS token") }
+	out := w.run(t)
+	if !strings.Contains(out, "hosts reconciled, but DNS sync failed: no DNS token") || len(w.hosts) != 2 {
+		t.Fatalf("got:\n%s", out)
+	}
+}
