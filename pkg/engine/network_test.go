@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -312,12 +313,52 @@ func TestTheBridgeIsCheckedAgainstTheHostsOwnSubnet(t *testing.T) {
 
 // With several hosts the daemon cannot tell which one it is on, so it says it did not check the bridge
 // rather than checking it against another host's subnet.
-func TestAMultiHostFleetDoesNotCheckTheBridgeAgainstTheWrongHost(t *testing.T) {
+// With several hosts each daemon checks the bridge of the host it is (--host-name), against that host's own
+// subnet: never the fleet's, never another host's.
+func TestEachHostChecksItsOwnBridge(t *testing.T) {
+	two := "default_host: node-1\nhosts:\n  node-1:\n    provider: static\n  node-2:\n    provider: static\n    network:\n      ipv4_cidr: 10.0.101.0/24\n"
+	dir := networkTree(t, two, nil)
+	node1, node2 := newHostSim(t), newHostSim(t)
+	node2.bridges = map[string]string{"incusbr0": "10.0.101.1/24"}
+	for host, sim := range map[string]*hostSim{"node-1": node1, "node-2": node2} {
+		fp := planNet(t, sim, dir, WithHostName(host))
+		if fp.Blocked() || fp.Pending() || strings.Contains(fp.Render(), "does not know which one it runs on") {
+			t.Fatalf("%s on its own bridge: nothing to do, and checked:\n%s", host, fp.Render())
+		}
+	}
+	// Each host's daemon on the other's bridge is blocked, naming the subnet fleet.yml gives its own host.
+	for host, c := range map[string]struct {
+		sim  *hostSim
+		want string
+	}{"node-1": {node2, "fleet.yml says 10.0.100.0/24"}, "node-2": {node1, "fleet.yml says 10.0.101.0/24"}} {
+		fp := planNet(t, c.sim, dir, WithHostName(host))
+		if !fp.Blocked() || !strings.Contains(fp.Render(), c.want) {
+			t.Fatalf("%s on the other host's bridge must be blocked (%q):\n%s", host, c.want, fp.Render())
+		}
+	}
+	// Without a host name the daemon cannot tell, and refuses the plan (it never checks the wrong subnet).
+	if _, err := PlanFleet(context.Background(), node2, dir, ""); !errors.Is(err, config.ErrHostNameRequired) {
+		t.Fatalf("no host name: %v", err)
+	}
+}
+
+// Apply on the second host of two launches with that host's bridge.
+func TestApplyOnOneOfTwoHostsLaunchesWithItsOwnBridge(t *testing.T) {
 	sim := newHostSim(t)
-	two := "hosts:\n  node-1:\n    provider: static\n  node-2:\n    provider: static\n    network:\n      ipv4_cidr: 10.0.101.0/24\n"
-	fp := planNet(t, sim, networkTree(t, two, nil))
-	if fp.Blocked() || fp.Pending() || !strings.Contains(fp.Render(), "does not know which one it runs on") {
+	sim.bridges = map[string]string{"incusbr0": "10.0.101.1/24"}
+	sim.aliases["web:latest"] = fpA
+	dir := networkTree(t, "default_host: node-1\nhosts:\n  node-1:\n    provider: static\n  node-2:\n    provider: static\n    network:\n      ipv4_cidr: 10.0.101.0/24\n",
+		map[string]string{"services/web/service.yml": "name: web\nimage: web:latest\nhost: node-2\nprofiles: [default, service]\n"})
+	fp := planNet(t, sim, dir, WithHostName("node-2"))
+	if fp.Blocked() || !fp.Pending() || fp.Host != "node-2" {
 		t.Fatalf("got:\n%s", fp.Render())
+	}
+	if err := applyNet(t, sim, dir, fp, nil); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(sim.cmds, "\n")
+	if !strings.Contains(joined, "'ipv4.address=10.0.101.1/24'") || strings.Contains(joined, "10.0.100.1/24") {
+		t.Fatalf("the launch must make sure of node-2's bridge only:\n%s", joined)
 	}
 }
 

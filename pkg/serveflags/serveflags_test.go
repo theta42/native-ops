@@ -101,4 +101,16 @@ func TestValueAndMerge(t *testing.T) {
 	if v, _ := Value(got, "state-dir"); v != "/var/lib/native-ops" {
 		t.Fatalf("the unit's state dir wins: %v", got)
 	}
+	// The unit says which host the daemon is: a set (the same for every host) keeps it, and cannot change it.
+	hostUnit := []string{"--host-name", "host-b", "--state-dir", "/var/lib/native-ops"}
+	got = Merge(hostUnit, []string{"--enable-apply"}, "/var/lib/native-ops")
+	if want := []string{"--enable-apply", "--host-name", "host-b", "--state-dir", "/var/lib/native-ops"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("the unit's host name is kept: %v", got)
+	}
+	if v, _ := Value(Merge(hostUnit, []string{"--host-name", "host-a"}, "/var/lib/native-ops"), "host-name"); v != "host-b" {
+		t.Fatalf("the unit's host name wins over the set's: %q", v)
+	}
+	if v, _ := Value(Merge(nil, []string{"--host-name", "only"}, "/var/lib/native-ops"), "host-name"); v != "only" {
+		t.Fatalf("a unit without a host name takes the set's: %q", v)
+	}
 }

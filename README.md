@@ -299,6 +299,10 @@ hosts:
     address: auto
     network:
       ipv4_cidr: 10.0.101.0/24
+# The host a service without `host:` runs on: required with two or more hosts (with one, that host is
+# the default). Each host's daemon runs with `serve --host-name <host>` and applies only its own
+# services: see docs/daemon.md, "Several hosts".
+default_host: node-01
 
 # The daemon a new host installs from cloud-init (the bootstrap token's hash comes from
 # NATIVE_OPS_BOOTSTRAP_TOKEN in the environment of reconcile or host create).
@@ -328,6 +332,7 @@ host cannot yet tell which host it runs on, so its plan notes that it did not ch
 ```yaml
 name: gitea
 image: gitea:latest
+host: node-01            # an entry of fleet.yml's hosts:; left out, the default host
 profiles:
   - base
   - service
@@ -532,6 +537,11 @@ API tokens (`native-ops remote ...`), and nobody installs anything locally or lo
   the previous binary kept and put back by the unit if the new one cannot stay up. No CI job holds an
   admin token for it (`native-ops remote daemon-upgrade` remains for one-off upgrades). Its flags come from
   `fleet.yml` (`daemon.flags`) the same way: a deploy restarts it with them, so no unit is edited by hand.
+- **Several hosts: one daemon each.** A service names its host (`host:`, else `fleet.yml`'s
+  `default_host`); each host's daemon (`serve --host-name`) plans, approves and applies only its own
+  host's share, and lists the others' services as skipped. A CI matrix sends one deploy tag to every
+  daemon ([docs/ci-examples/deploy-hosts.yml](docs/ci-examples/deploy-hosts.yml)). A single-host fleet
+  needs none of it.
 - **Credentials are entered in git, kept on the host.** The daemon's own credentials (DNS token, backup
   keys, OIDC secret) go into the git server's secret store; CI pushes them to the daemon
   (`native-ops remote secret-sync`), which keeps them on the host. Nobody logs in to put them there.

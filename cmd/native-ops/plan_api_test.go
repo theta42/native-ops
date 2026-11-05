@@ -63,7 +63,7 @@ func TestThePlanEndpointPlansAnUploadedConfAgainstTheHost(t *testing.T) {
 	srv, err := server.New(server.Options{
 		Tokens: tokens, Version: "test",
 		Status: func(ctx context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil },
-		Plan:   planSource(remote.NewLocalExecutor(), []byte("0123456789abcdef0123456789abcdef"), func(string) (string, bool) { return "", false }, func(string) string { return "" }, nil),
+		Plan:   planSource(remote.NewLocalExecutor(), []byte("0123456789abcdef0123456789abcdef"), func(string) (string, bool) { return "", false }, func(string) string { return "" }, nil, ""),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -118,5 +118,67 @@ func TestThePlanEndpointPlansAnUploadedConfAgainstTheHost(t *testing.T) {
 	json.NewDecoder(res2.Body).Decode(&e)
 	if res2.StatusCode != 400 || e.Code != "bad_config" || !strings.Contains(e.Error, "env_file") {
 		t.Fatalf("an env_file outside the tree must be a 400 bad_config, got %d %+v", res2.StatusCode, e)
+	}
+}
+
+// With two hosts, the daemon's plan is its host's share (--host-name), and a daemon that was not told its
+// host refuses to plan, reading nothing from the host, rather than planning every host's services here.
+func TestThePlanEndpointPlansOnlyThisHostsShare(t *testing.T) {
+	logFile := fakeIncus(t, true, false)
+	conf := confDir(t, freshService+"host: h1\n")
+	os.WriteFile(filepath.Join(conf, "fleet.yml"), []byte("name: test\ndefault_host: h1\nhosts:\n  h1: {provider: static}\n  h2: {provider: static, network: {ipv4_cidr: 10.0.101.0/24}}\n"), 0o644)
+
+	post := func(hostName string) (int, map[string]any) {
+		dir := t.TempDir()
+		tokens, err := server.OpenTokenStore(filepath.Join(dir, "tokens.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		secret, _, _ := tokens.Create("ci", server.RoleDeployer)
+		srv, err := server.New(server.Options{
+			Tokens: tokens, Version: "test",
+			Status: func(ctx context.Context) (*status.Snapshot, error) { return &status.Snapshot{}, nil },
+			Plan:   planSource(remote.NewLocalExecutor(), []byte("0123456789abcdef0123456789abcdef"), func(string) (string, bool) { return "", false }, func(string) string { return "" }, nil, hostName),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ts := httptest.NewServer(srv.Handler())
+		defer ts.Close()
+		req, _ := http.NewRequest("POST", ts.URL+"/v1/plan", bytes.NewReader(tarGz(t, conf)))
+		req.Header.Set("Authorization", "Bearer "+secret)
+		req.Header.Set("Content-Type", "application/gzip")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		var out map[string]any
+		json.NewDecoder(res.Body).Decode(&out)
+		return res.StatusCode, out
+	}
+
+	code, out := post("")
+	if code != 400 || out["code"] != "bad_config" || !strings.Contains(out["error"].(string), "--host-name") {
+		t.Fatalf("no host name with two hosts: %d %v", code, out)
+	}
+	if calls, _ := os.ReadFile(logFile); len(calls) != 0 {
+		t.Fatalf("a refused plan reads nothing from the host:\n%s", calls)
+	}
+
+	code, out = post("h2")
+	if code != 200 || !strings.Contains(out["text"].(string), "- web (skipped: on host h1)") {
+		t.Fatalf("h2's share skips h1's service: %d %v", code, out)
+	}
+	if calls, _ := os.ReadFile(logFile); strings.Contains(string(calls), "web") {
+		t.Fatalf("h2 must not look at h1's service:\n%s", calls)
+	}
+
+	code, out = post("h1")
+	if code != 200 || !strings.Contains(out["text"].(string), "+ web (create)") {
+		t.Fatalf("h1's share plans its service: %d %v", code, out)
+	}
+	if err := validateServeFlags("--enable-apply --host-name h1"); err != nil {
+		t.Fatalf("--host-name is a serve flag: %v", err)
 	}
 }

@@ -33,7 +33,7 @@ case "$*" in
   "storage volume show default web-data") echo "Error: Storage volume not found" >&2; exit 1 ;;
   "file pull edge/etc/caddy/Caddyfile -") echo 'import /etc/caddy/sites/*.caddy' ;;
   "file pull edge/etc/caddy/sites/web.caddy -") echo "Error: Path not found" >&2; exit 1 ;;
-  "network get incusbr0 ipv4.address") echo '10.0.100.1/24' ;;
+  "network get incusbr0 ipv4.address") echo "${FAKE_INCUS_BRIDGE:-10.0.100.1/24}" ;;
   *) echo "fake incus: unexpected: $*" >&2; exit 1 ;;
 esac
 `
@@ -143,5 +143,25 @@ func TestPlanOfOneServiceAndOfNoServices(t *testing.T) {
 	}
 	if code, _, errOut := plan(t, t.TempDir()); code != 1 || !strings.Contains(errOut, "fleet config") {
 		t.Fatalf("a directory with no fleet.yml is an error, exit=%d %s", code, errOut)
+	}
+}
+
+func TestPlanOfSeveralHostsNeedsTheHostName(t *testing.T) {
+	fakeIncus(t, true, false)
+	dir := confDir(t, freshService+"host: h2\n")
+	os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte("name: test\ndefault_host: h1\nhosts:\n  h1: {provider: static}\n  h2: {provider: static, network: {ipv4_cidr: 10.0.101.0/24}}\n"), 0o644)
+	if code, _, errOut := plan(t, dir); code != 1 || !strings.Contains(errOut, "--host-name") {
+		t.Fatalf("no --host-name with two hosts: exit %d\n%s", code, errOut)
+	}
+	if code, out, errOut := plan(t, dir, "--host-name", "h1"); code != 0 || !strings.Contains(out, "- web (skipped: on host h2)") {
+		t.Fatalf("h1: exit %d\n%s\n%s", code, out, errOut)
+	}
+	// This fake host has h1's bridge, so planning as h2 is blocked on h2's own subnet.
+	if code, out, errOut := plan(t, dir, "--host-name", "h2"); code != 1 || !strings.Contains(out, "fleet.yml says 10.0.101.0/24") {
+		t.Fatalf("h2 on h1's bridge: exit %d\n%s\n%s", code, out, errOut)
+	}
+	t.Setenv("FAKE_INCUS_BRIDGE", "10.0.101.1/24") // now it is h2
+	if code, out, errOut := plan(t, dir, "--host-name", "h2"); code != 2 || !strings.Contains(out, "+ web (create)") {
+		t.Fatalf("h2: exit %d\n%s\n%s", code, out, errOut)
 	}
 }

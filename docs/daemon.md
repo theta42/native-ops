@@ -311,7 +311,7 @@ planned. Once applied, the same commit plans to nothing. That includes the netwo
 | DNS records | `fleet.yml` `dns_records` (each names its zone) | `dns-create` / `dns-update`, diffed against the provider (read only) | through the built-in provider; the zone is read again first, and if it moved since the plan the apply refuses ("plan again") |
 | The edge's main Caddyfile | `edge/Caddyfile` | `edge-caddyfile`, with the lines added and removed; its content is in the hash | validated, reloaded, and rolled back if Caddy rejects it |
 | Host ports | a service's `forwards:` | `publish-port` / `remove-port` on that service | an Incus proxy device per forward |
-| The instance bridge | `fleet.yml` `network:`, or the host's own `hosts.<name>.network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan. With more than one host in `fleet.yml` the daemon cannot tell which it runs on, and the plan notes that the bridge was not checked |
+| The instance bridge | `fleet.yml` `network:`, or the host's own `hosts.<name>.network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan. With more than one host in `fleet.yml`, each daemon checks the bridge of the host it is (`--host-name`, see [Several hosts](#several-hosts)) |
 
 Rules that keep it safe to run again and again:
 
@@ -707,6 +707,72 @@ native-ops user disable --state-dir /var/lib/native-ops --username sam
 
 A running daemon honours user changes immediately (it notices the file change).
 
+## Several hosts
+
+A fleet of several hosts runs **one daemon per host**, and each daemon plans and applies only its own
+host's share. Locks, approvals, secrets and the edge stay per daemon; nothing coordinates the daemons but
+the configuration repository and CI.
+
+```yaml
+# fleet.yml
+hosts:
+  host-a: {provider: static, address: 192.0.2.10}
+  host-b: {provider: static, address: 192.0.2.11}
+default_host: host-a     # required with two or more hosts; a service without host: is on it
+
+# services/db/service.yml
+name: db
+host: host-b             # must name an entry of hosts:; left out, the service is on default_host
+```
+
+- **Each daemon knows its host**: `native-ops serve --host-name host-b` (or `NATIVE_OPS_HOST_NAME` in
+  `serve.env`). `reconcile` puts it on the unit of each host it creates when `fleet.yml` has two or more
+  hosts. It belongs on the unit, not in `daemon.flags`: those are the same for every host, so `fleet.yml`
+  refuses a `--host-name` there when it names several hosts, and a deploy that applies `daemon.flags`
+  keeps the unit's `--host-name`.
+- **A plan is one host's share.** It plans the services of its host (their `host:`, else `default_host`)
+  and lists every other service as one line, `- db (skipped: on host host-b)`, without reading anything
+  about it from the host. A host that runs the edge instance applies `edge/Caddyfile` to it; a host without
+  one, when the edge service is pinned to another host, notes that instead of being blocked. `dns_records` are the fleet's, so only the default host's daemon plans and applies them;
+  the others note it.
+- **Each host checks its own bridge.** The plan checks the live bridge against that host's network (its
+  `hosts.<name>.network`, else the fleet's `network:`), and apply's launches make sure of that bridge, never
+  the fleet's or another host's.
+- **Each host approves its own share.** The plan's hash covers only what that daemon would apply, plus
+  its host's name: a change to another host's service does not change it (no new approval here), and two
+  hosts' shares never share a hash. Skipped services are not in the hash.
+- **Refused rather than guessed.** A daemon with no `--host-name` refuses to plan a `fleet.yml` that has
+  two or more hosts (`bad_config`, naming the hosts), instead of applying every host's services on this
+  one. A `--host-name` that is not in `hosts:` is refused the same way, and apply checks again that every
+  service it changes is its host's. The CLI's `plan` and `apply` take `--host-name` and follow the same
+  rule; `reconcile --deploy-services` (one host over SSH) is refused for several hosts.
+- **A single-host fleet is unchanged.** With one entry in `hosts:` (or none) that host is the default,
+  `--host-name` may be left out, and plans, their text and their hashes are exactly as before.
+
+**One tag, every daemon.** A deploy tag is sent to every host's daemon by a CI matrix, one job per host
+with that host's URL and token ([ci-examples/deploy-hosts.yml](ci-examples/deploy-hosts.yml)):
+
+```yaml
+jobs:
+  deploy:
+    strategy:
+      fail-fast: false        # one host failing does not cancel the others
+      matrix:
+        include:
+          - {host: host-a, url: https://native-ops.host-a.example.com, token: NATIVE_OPS_TOKEN_HOST_A}
+          - {host: host-b, url: https://native-ops.host-b.example.com, token: NATIVE_OPS_TOKEN_HOST_B}
+    runs-on: ubuntu-latest
+    env:
+      NATIVE_OPS_URL: ${{ matrix.url }}
+      NATIVE_OPS_TOKEN: ${{ secrets[matrix.token] }}
+    steps:
+      # install native-ops as in deploy.yml, then:
+      - run: native-ops remote deploy --tag "${GITHUB_REF_NAME}"
+```
+
+Each daemon checks the tag, fetches the commit and applies its own share; secret sync goes to every
+daemon the same way. `native-ops remote` fanning out to the hosts itself, with one summary, comes later.
+
 ## Running it
 
 A host created with `native-ops host create --daemon-version ...` or by `reconcile` with a `daemon:`
@@ -769,9 +835,10 @@ differ from the flags the daemon runs with now applies them, the way it applies 
    daemon there: a deploy that moved it would cut its own way back off).
 2. It stores the set in the state directory (`serve.flags`, pending), records the deploy to resume, ends
    with `result: daemon_reconfigured`, and restarts.
-3. At startup, a kept set **replaces the unit's flags**, all but `--state-dir` and, when the set has none,
-   `--addr`. So the unit needs nothing more than those two, and a host whose unit carries old flags (a
-   retired one, say) is brought in line by its next deploy, without anyone logging in.
+3. At startup, a kept set **replaces the unit's flags**, all but `--state-dir`, `--host-name` (which host
+   this is: `daemon.flags` are the same for every host, see [Several hosts](#several-hosts)) and, when the
+   set has none, `--addr`. So the unit needs nothing more than those, and a host whose unit carries old
+   flags (a retired one, say) is brought in line by its next deploy, without anyone logging in.
 4. Once the daemon has served on the new set for 30 seconds the set is committed, and the deploy resumes
    as a new job (`remote deploy` follows it). A set that keeps the daemon from starting is dropped after
    3 starts and the daemon goes back to its previous flags; the resumed deploy is then recorded as failed,
@@ -877,6 +944,7 @@ Every flag; most also read an environment variable, so they can live in `serve.e
 | `--oidc-label` | `NATIVE_OPS_OIDC_LABEL` | `single sign-on` | the sign-in button's text |
 | `--mcp-oauth` | `NATIVE_OPS_MCP_OAUTH` | on (with sign-in) | MCP clients connect by signing their person in (OAuth), acting with that person's role; `false` turns it off ([api.md](api.md#connect-by-signing-in-oauth)) |
 | `--public-url` | `NATIVE_OPS_PUBLIC_URL` | the origin of `--oidc-redirect-url` | the daemon's public origin, named in the OAuth metadata (else each request's) |
+| `--host-name` | `NATIVE_OPS_HOST_NAME` | none | which of `fleet.yml`'s `hosts:` this daemon runs on; required when there are two or more ([Several hosts](#several-hosts)) |
 
 Environment only: `NATIVE_OPS_BOOTSTRAP_TOKEN` or `NATIVE_OPS_BOOTSTRAP_TOKEN_SHA256` (the first admin
 token). Read through the secret store, then the environment: the names in the credentials table above.
@@ -894,6 +962,9 @@ record. Normally services reach a host through an approved apply.
 
 ## Roadmap
 
-Multi-host targeting (services mapped to hosts in `fleet.yml`, and `native-ops remote` fanning a plan
-or apply out to each host's daemon); instance migrate and previews as jobs; a live view of a running
-job; and per-user API tokens. The API is versioned (`/v1`) so a separate fleet manager can depend on it.
+Done: services pinned to hosts, with one daemon per host applying its own share and checking its own
+bridge subnet ([Several hosts](#several-hosts)), driven by a CI matrix. Next: `native-ops remote` fanning
+a plan or apply out to each host's daemon and gathering the results; a mesh between hosts,
+DNS and reconcile per host, backups keyed by host; instance migrate and previews as jobs; a live view of
+a running job; and per-user API tokens. The API is versioned (`/v1`) so a separate fleet manager can
+depend on it.
