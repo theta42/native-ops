@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -347,9 +348,13 @@ func TestEnvFromNamesOnlyServiceSecretsAndValidKeys(t *testing.T) {
 	}
 }
 
-// fleetWithHosts loads a fleet.yml made of extra (network: and hosts: sections).
+// fleetWithHosts loads a fleet.yml made of extra (network: and hosts: sections). A fleet of two or more
+// hosts needs a default_host; these fixtures all have a node-1, so it is that unless extra names one.
 func fleetWithHosts(t *testing.T, extra string) (*FleetConfig, error) {
 	t.Helper()
+	if strings.Contains(extra, "node-2") && !strings.Contains(extra, "default_host") {
+		extra += "default_host: node-1\n"
+	}
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte("name: test\n"+extra), 0o644); err != nil {
 		t.Fatal(err)
@@ -385,7 +390,7 @@ hosts:
 			t.Errorf("%s: got %+v, want %+v", host, got, want)
 		}
 	}
-	if _, ok := f.LocalNetwork(); ok {
+	if _, ok := f.LocalNetwork(""); ok {
 		t.Error("with three hosts the local one cannot be known")
 	}
 }
@@ -395,14 +400,14 @@ func TestLocalNetworkIsTheOnlyHostsOrTheFleets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, ok := f.LocalNetwork(); !ok || n.IPv4CIDR != "10.0.101.0/24" || n.BridgeName != "incusbr0" {
+	if n, ok := f.LocalNetwork(""); !ok || n.IPv4CIDR != "10.0.101.0/24" || n.BridgeName != "incusbr0" {
 		t.Fatalf("one host: got %+v %v", n, ok)
 	}
 	f, err = fleetWithHosts(t, "network:\n  ipv4_cidr: 10.0.50.0/24\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, ok := f.LocalNetwork(); !ok || n.IPv4CIDR != "10.0.50.0/24" {
+	if n, ok := f.LocalNetwork(""); !ok || n.IPv4CIDR != "10.0.50.0/24" {
 		t.Fatalf("no hosts: got %+v %v", n, ok)
 	}
 }
@@ -452,5 +457,97 @@ func TestOverlappingHostSubnetsAreRefused(t *testing.T) {
 		if _, err := fleetWithHosts(t, extra); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: got %v, want an error with %q", extra, err, want)
 		}
+	}
+}
+
+func writeFleet(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestASingleHostIsTheDefaultWithoutDefaultHost(t *testing.T) {
+	cfg, err := LoadFleetConfig(writeFleet(t, "name: f\nhosts:\n  only: {provider: static, address: 192.0.2.10}\n"))
+	if err != nil {
+		t.Fatalf("one host needs no default_host: %v", err)
+	}
+	if cfg.DefaultHostName() != "only" || cfg.HostOf(&ServiceConfig{Name: "web"}) != "only" {
+		t.Fatalf("the only host is the default: %q", cfg.DefaultHostName())
+	}
+	if h, filtered, err := cfg.DaemonHost(""); err != nil || filtered || h != "only" {
+		t.Fatalf("an untold daemon of a single-host fleet is that host, planning everything: %q %v %v", h, filtered, err)
+	}
+	if _, _, err := cfg.DaemonHost("other"); err == nil {
+		t.Fatal("a daemon told it is a host fleet.yml does not have is refused")
+	}
+	// No hosts: at all (a conf repo that never named one): nothing to tell apart.
+	none, err := LoadFleetConfig(writeFleet(t, "name: f\n"))
+	if err != nil || none.DefaultHostName() != "" {
+		t.Fatalf("no hosts: %v %q", err, none.DefaultHostName())
+	}
+	if _, filtered, err := none.DaemonHost(""); err != nil || filtered {
+		t.Fatalf("no hosts plans everything: %v %v", filtered, err)
+	}
+}
+
+func TestTwoHostsNeedADefaultHost(t *testing.T) {
+	two := "name: f\nhosts:\n  h1: {provider: static, address: 192.0.2.10}\n  h2: {provider: static, address: 192.0.2.11, network: {ipv4_cidr: 10.0.101.0/24}}\n"
+	_, err := LoadFleetConfig(writeFleet(t, two))
+	if err == nil || !strings.Contains(err.Error(), "default_host") || !strings.Contains(err.Error(), "h1, h2") {
+		t.Fatalf("two hosts without default_host must say why it is needed: %v", err)
+	}
+	if _, err := LoadFleetConfig(writeFleet(t, two+"default_host: h3\n")); err == nil || !strings.Contains(err.Error(), "h3") {
+		t.Fatalf("a default_host that is not a host: %v", err)
+	}
+	cfg, err := LoadFleetConfig(writeFleet(t, two+"default_host: h2\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HostOf(&ServiceConfig{Name: "a"}) != "h2" || cfg.HostOf(&ServiceConfig{Name: "b", Host: "h1"}) != "h1" {
+		t.Fatal("a service is on its host:, else the default host")
+	}
+	if _, _, err := cfg.DaemonHost(""); !errors.Is(err, ErrHostNameRequired) {
+		t.Fatalf("an untold daemon of two hosts is refused: %v", err)
+	}
+	if h, filtered, err := cfg.DaemonHost("h1"); err != nil || !filtered || h != "h1" {
+		t.Fatalf("a told daemon plans its share: %q %v %v", h, filtered, err)
+	}
+	// daemon.flags are the same for every host's daemon: they cannot say which host one is.
+	if _, err := LoadFleetConfig(writeFleet(t, two+"default_host: h1\ndaemon: {version: v1.0.0, flags: \"--enable-apply --host-name h1\"}\n")); err == nil || !strings.Contains(err.Error(), "--host-name") {
+		t.Fatalf("--host-name in daemon.flags with two hosts: %v", err)
+	}
+	if _, err := LoadFleetConfig(writeFleet(t, "name: f\nhosts:\n  only: {provider: static}\ndaemon: {flags: \"--host-name only\"}\n")); err != nil {
+		t.Fatalf("with one host, daemon.flags may name it: %v", err)
+	}
+	if _, err := LoadFleetConfig(writeFleet(t, "name: f\nhosts:\n  only: {provider: static}\ndaemon: {flags: \"--host-name=other\"}\n")); err == nil {
+		t.Fatal("with one host, daemon.flags may not name another")
+	}
+}
+
+func TestAServiceHostMustBeAHostOfTheFleet(t *testing.T) {
+	cfg, err := LoadFleetConfig(writeFleet(t, "name: f\ndefault_host: h1\nhosts:\n  h1: {provider: static}\n  h2: {provider: static, network: {ipv4_cidr: 10.0.101.0/24}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "service.yml")
+	if err := os.WriteFile(path, []byte("name: web\nimage: x\nhost: h2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := LoadServiceConfig(path)
+	if err != nil || svc.Host != "h2" {
+		t.Fatalf("host: is read from the manifest: %+v %v", svc, err)
+	}
+	if err := cfg.ValidateServiceHost(svc); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ValidateServiceHost(&ServiceConfig{Name: "web", Host: "h9"}); err == nil || !strings.Contains(err.Error(), "h9") || !strings.Contains(err.Error(), "h1, h2") {
+		t.Fatalf("an unknown host: %v", err)
+	}
+	if err := cfg.ValidateServiceHost(&ServiceConfig{Name: "web"}); err != nil {
+		t.Fatalf("no host: is the default host: %v", err)
 	}
 }

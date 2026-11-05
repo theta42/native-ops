@@ -44,6 +44,13 @@ type NetworkPlan struct {
 	bind string
 }
 
+func (n *NetworkPlan) bindOrEmpty() string {
+	if n == nil {
+		return ""
+	}
+	return n.bind
+}
+
 func (n *NetworkPlan) add(kind, format string, a ...any) {
 	n.Changes = append(n.Changes, Change{Kind: kind, Detail: fmt.Sprintf(format, a...)})
 }
@@ -90,10 +97,11 @@ func (d *Deployer) PlanNetwork(ctx context.Context, fleet *config.FleetConfig, c
 // planBridge checks the instance bridge against fleet.yml's `network:` for this host (the fleet-level one,
 // or the host's own override). The daemon never re-addresses a live bridge (every instance and route would
 // move), so a difference blocks the plan rather than being applied: fix fleet.yml to match the host, or
-// move the host on purpose. With several hosts in fleet.yml the daemon cannot tell which one it runs on,
-// so it says it did not check rather than checking against the wrong host's subnet.
+// move the host on purpose. The host is the one this daemon is (--host-name, or a single-host fleet's
+// only host); with several hosts and no host name (PlanFleet refuses that, but PlanNetwork alone does
+// not) it says it did not check rather than checking against the wrong host's subnet.
 func (d *Deployer) planBridge(ctx context.Context, n *NetworkPlan, fleet *config.FleetConfig) error {
-	local, ok := fleet.LocalNetwork()
+	local, ok := fleet.LocalNetwork(d.hostName)
 	if !ok {
 		n.note("fleet.yml declares %d hosts and this daemon does not know which one it runs on; its bridge is not checked against fleet.yml", len(fleet.Hosts))
 		return nil
@@ -139,6 +147,10 @@ func (d *Deployer) planEdgeCaddyfile(ctx context.Context, n *NetworkPlan, config
 				return nil
 			}
 		}
+		if h, other := d.share.elsewhere(edge); other {
+			n.note("edge/Caddyfile is applied by host %s's daemon, where %s runs; this host has no %s instance", h, edge, edge)
+			return nil
+		}
 		n.block("edge/Caddyfile is in the repo, but there is no %s instance to apply it to", edge)
 		return nil
 	}
@@ -166,6 +178,12 @@ func (d *Deployer) planEdgeCaddyfile(ctx context.Context, n *NetworkPlan, config
 // manifest does not mention is never deleted (mail and verification records live beside these).
 func (d *Deployer) planDNS(ctx context.Context, n *NetworkPlan, fleet *config.FleetConfig) {
 	if len(fleet.DNSRecords) == 0 {
+		return
+	}
+	// dns_records are the fleet's, not a host's: in a fleet of several hosts only the default host's
+	// daemon plans and applies them, so two daemons never write the same zone.
+	if s := d.share; s != nil && s.host != s.defaultHost {
+		n.note("dns_records are planned and applied by the daemon of the default host, %s", s.defaultHost)
 		return
 	}
 	byZone, err := fleet.DNSRecordsByZone()

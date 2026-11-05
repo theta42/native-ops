@@ -31,10 +31,14 @@ func (f *FleetConfig) HostNetwork(host string) NetworkConfig {
 	return n
 }
 
-// LocalNetwork is the bridge of the host a daemon (or a local apply) runs on, when the fleet says which
-// that is: the only host fleet.yml declares, or the fleet-level `network:` when it declares none. With
-// more than one host it cannot tell which one it is on, and ok is false.
-func (f *FleetConfig) LocalNetwork() (n NetworkConfig, ok bool) {
+// LocalNetwork is the bridge of the host a daemon (or a local apply) runs on, when that is known: the host
+// it was told it is (hostName, from `serve --host-name`), else the only host fleet.yml declares, else the
+// fleet-level `network:` when it declares none. With more than one host and no (known) host name it cannot
+// tell which one it is on, and ok is false.
+func (f *FleetConfig) LocalNetwork(hostName string) (n NetworkConfig, ok bool) {
+	if _, known := f.Hosts[hostName]; known && hostName != "" {
+		return f.HostNetwork(hostName), true
+	}
 	switch len(f.Hosts) {
 	case 0:
 		return f.Network, true

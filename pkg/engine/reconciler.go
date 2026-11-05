@@ -95,6 +95,9 @@ func (r *Reconciler) Validate(ctx context.Context) (*PlanSummary, error) {
 				if err != nil {
 					return nil, fmt.Errorf("invalid service %s: %w", svcPath, err)
 				}
+				if err := fleet.ValidateServiceHost(svc); err != nil {
+					return nil, fmt.Errorf("invalid service %s: %w", svcPath, err)
+				}
 				summary.Services = append(summary.Services, svc.Name)
 			}
 		}
@@ -215,6 +218,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("load fleet config: %w", err)
 	}
 
+	if r.DeployServices && len(fleet.Hosts) >= 2 {
+		// The break-glass path deploys every service to one host over SSH; with several hosts that would
+		// put every host's services on it. Each host's daemon applies its own share instead.
+		return fmt.Errorf("--deploy-services deploys every service to one host, and fleet.yml has %d hosts; deploy through each host's daemon (a deploy tag), which applies only that host's services", len(fleet.Hosts))
+	}
+
 	privKeyPEM, pubKeyStr, generatedKey := LoadSSHCredentials()
 	var primaryHostIP, primaryHostName string
 	var hostSSHUser string = "root"
@@ -297,6 +306,14 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					if di, err = DaemonInstallFor(fleet.Daemon); err != nil {
 						return fmt.Errorf("provision host %s: daemon: %w", hostName, err)
 					}
+					// With several hosts each daemon must know which it is; its unit carries that
+					// (a deploy's daemon.flags keep it, see pkg/serveflags).
+					if len(fleet.Hosts) >= 2 {
+						di.ServeFlags = strings.TrimSpace(di.ServeFlags + " --host-name " + hostName)
+						if err := di.Validate(); err != nil {
+							return fmt.Errorf("provision host %s: daemon: %w", hostName, err)
+						}
+					}
 				}
 				ud, err := GenerateCloudInitUserDataFor(pubKeyStr, fleet.HostNetwork(hostName), di)
 				if err != nil {
@@ -351,7 +368,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// The bridge is the host's own `network:` (fleet.yml's, or the host's override).
 	hostNet := fleet.HostNetwork(primaryHostName)
 	if primaryHostName == "" {
-		hostNet, _ = fleet.LocalNetwork()
+		hostNet, _ = fleet.LocalNetwork("")
 	}
 	deployer := r.deployer
 	if hostNet.BridgeName != "" {
