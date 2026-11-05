@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/theta42/native-ops/pkg/config"
 	"github.com/theta42/native-ops/pkg/incus"
 	"github.com/theta42/native-ops/pkg/provider"
 )
@@ -90,8 +91,17 @@ func syncDNS(ctx context.Context, p provider.DNSProvider, domain, ip string) err
 // so re-running reconcile does not stack duplicate firewall rules or re-apply
 // unchanged network settings. Failures are tolerated (`|| true`) because the
 // scoped CI user on an adopted host has no sudo and simply cannot apply them.
-func hostBootstrapCommands() []string {
-	const bridge = "incusbr0"
+//
+// The bridge's name and subnet are the host's `network:` (fleet.yml's, or the host's own override). Its
+// address is only set while the host has no instances: a live host keeps its subnet, and the plan
+// reports a difference instead of renumbering it.
+func hostBootstrapCommands(network config.NetworkConfig) ([]string, error) {
+	bridge, address, err := network.Bridge()
+	if err != nil {
+		return nil, fmt.Errorf("network: %w", err)
+	}
+	subnet, _ := network.Subnet()
+	masquerade := "-s " + subnet.String() + " -j MASQUERADE"
 	iptablesOnce := func(table, chain, rule string) string {
 		t := ""
 		if table != "" {
@@ -109,18 +119,18 @@ func hostBootstrapCommands() []string {
 		"incus storage list | grep -q default || incus storage create default dir || true",
 		"incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true",
 		`[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = 1 ] || sysctl -w net.ipv4.ip_forward=1 || true`,
-		"iptables -t nat -C POSTROUTING -s 10.0.100.0/24 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.0.100.0/24 -j MASQUERADE || true",
+		"iptables -t nat -C POSTROUTING " + masquerade + " 2>/dev/null || iptables -t nat -A POSTROUTING " + masquerade + " || true",
 		iptablesOnce("", "FORWARD", "-i "+bridge+" -j ACCEPT"),
 		iptablesOnce("", "FORWARD", "-o "+bridge+" -j ACCEPT"),
 		iptablesOnce("", "INPUT", "-i "+bridge+" -j ACCEPT"),
 		"which ufw >/dev/null 2>&1 && (ufw allow in on " + bridge + "; ufw route allow in on " + bridge + "; ufw route allow out on " + bridge + ") || true",
 		"incus network show " + bridge + " >/dev/null 2>&1 || incus network create " + bridge + " || true",
-		incus.NetworkSetIfChanged(bridge, "ipv4.address", "10.0.100.1/24"),
+		incus.BridgeAddressIfUnused(bridge, address),
 		incus.NetworkSetIfChanged(bridge, "ipv4.nat", "true"),
 		incus.NetworkSetIfChanged(bridge, "ipv6.address", "none"),
 		incus.NetworkSetIfChanged(bridge, "dns.mode", "managed"),
 		incus.NetworkSetIfChanged(bridge, "raw.dnsmasq", "server=1.1.1.1"),
 		"incus profile device show default | grep -q 'network: " + bridge + "' || incus profile device add default eth0 nic network=" + bridge + " name=eth0 || true",
 		"incus remote list | grep -q ' docker ' || incus remote add docker https://docker.io --protocol=oci --public || true",
-	}
+	}, nil
 }

@@ -139,9 +139,11 @@ func (b *BackupConfig) ValidateForBackup() error {
 	return nil
 }
 
+// NetworkConfig is a host's instance bridge: its name and its IPv4 subnet. The fleet-level `network:` is
+// every host's default; a host can override either field under `hosts.<name>.network` (see HostNetwork).
 type NetworkConfig struct {
-	BridgeName string `yaml:"bridge_name"` // default: incusbr0
-	IPv4CIDR   string `yaml:"ipv4_cidr"`   // default: 10.0.100.0/24
+	BridgeName string `yaml:"bridge_name"` // default: incusbr0 (DefaultBridgeName)
+	IPv4CIDR   string `yaml:"ipv4_cidr"`   // default: 10.0.100.0/24 (DefaultIPv4CIDR)
 }
 
 // DaemonConfig pins the native-ops release a new host's cloud-init installs as its daemon.
@@ -174,6 +176,9 @@ type HostConfig struct {
 	SSHUser     string `yaml:"ssh_user"`
 	SSHPort     int    `yaml:"ssh_port"`
 	IncusRemote string `yaml:"incus_remote"` // optional Incus remote name
+	// Network overrides the fleet-level `network:` for this host; a field left empty falls back to it.
+	// Each host needs its own subnet (LoadFleetConfig refuses two that overlap).
+	Network *NetworkConfig `yaml:"network,omitempty"`
 }
 
 // VolumeMount represents a storage volume attachment.
@@ -459,10 +464,13 @@ func LoadFleetConfig(dir string) (*FleetConfig, error) {
 	}
 
 	if cfg.Network.BridgeName == "" {
-		cfg.Network.BridgeName = "incusbr0"
+		cfg.Network.BridgeName = DefaultBridgeName
 	}
 	if cfg.Network.IPv4CIDR == "" {
-		cfg.Network.IPv4CIDR = "10.0.100.0/24"
+		cfg.Network.IPv4CIDR = DefaultIPv4CIDR
+	}
+	if err := cfg.ValidateHostNetworks(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if cfg.Backup != nil {
 		cfg.Backup.ApplyDefaults()

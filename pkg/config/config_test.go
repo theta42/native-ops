@@ -346,3 +346,111 @@ func TestEnvFromNamesOnlyServiceSecretsAndValidKeys(t *testing.T) {
 		}
 	}
 }
+
+// fleetWithHosts loads a fleet.yml made of extra (network: and hosts: sections).
+func fleetWithHosts(t *testing.T, extra string) (*FleetConfig, error) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "fleet.yml"), []byte("name: test\n"+extra), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return LoadFleetConfig(dir)
+}
+
+func TestAHostOverridesTheFleetBridgeFieldByField(t *testing.T) {
+	f, err := fleetWithHosts(t, `
+hosts:
+  node-1:
+    provider: static
+  node-2:
+    provider: static
+    network:
+      ipv4_cidr: 10.0.101.0/24
+  node-3:
+    provider: static
+    network:
+      bridge_name: br-inst
+      ipv4_cidr: 10.0.102.0/24
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for host, want := range map[string]NetworkConfig{
+		"node-1":  {BridgeName: "incusbr0", IPv4CIDR: "10.0.100.0/24"},
+		"node-2":  {BridgeName: "incusbr0", IPv4CIDR: "10.0.101.0/24"},
+		"node-3":  {BridgeName: "br-inst", IPv4CIDR: "10.0.102.0/24"},
+		"unknown": {BridgeName: "incusbr0", IPv4CIDR: "10.0.100.0/24"},
+	} {
+		if got := f.HostNetwork(host); got != want {
+			t.Errorf("%s: got %+v, want %+v", host, got, want)
+		}
+	}
+	if _, ok := f.LocalNetwork(); ok {
+		t.Error("with three hosts the local one cannot be known")
+	}
+}
+
+func TestLocalNetworkIsTheOnlyHostsOrTheFleets(t *testing.T) {
+	f, err := fleetWithHosts(t, "hosts:\n  node-1:\n    network:\n      ipv4_cidr: 10.0.101.0/24\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := f.LocalNetwork(); !ok || n.IPv4CIDR != "10.0.101.0/24" || n.BridgeName != "incusbr0" {
+		t.Fatalf("one host: got %+v %v", n, ok)
+	}
+	f, err = fleetWithHosts(t, "network:\n  ipv4_cidr: 10.0.50.0/24\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := f.LocalNetwork(); !ok || n.IPv4CIDR != "10.0.50.0/24" {
+		t.Fatalf("no hosts: got %+v %v", n, ok)
+	}
+}
+
+func TestBridgeAddressIsTheSubnetsFirstAddressUnlessOneIsNamed(t *testing.T) {
+	for cidr, want := range map[string]string{
+		"10.0.100.0/24":   "10.0.100.1/24",
+		"10.0.101.0/24":   "10.0.101.1/24",
+		"10.0.101.254/24": "10.0.101.254/24",
+		"10.0.100.1/24":   "10.0.100.1/24",
+		"172.16.0.0/16":   "172.16.0.1/16",
+	} {
+		if got, err := (NetworkConfig{IPv4CIDR: cidr}).BridgeAddress(); err != nil || got != want {
+			t.Errorf("%s: got %q %v, want %q", cidr, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "10.0.100.0", "nope", "fd00::/64", "10.0.100.0/31"} {
+		if got, err := (NetworkConfig{IPv4CIDR: bad}).BridgeAddress(); err == nil {
+			t.Errorf("%q: got %q, want an error", bad, got)
+		}
+	}
+	if _, _, err := (NetworkConfig{BridgeName: "br0; reboot", IPv4CIDR: "10.0.100.0/24"}).Bridge(); err == nil {
+		t.Error("a bridge name goes into host commands: anything but an interface name is refused")
+	}
+}
+
+func TestOverlappingHostSubnetsAreRefused(t *testing.T) {
+	ok := []string{
+		"hosts:\n  node-1: {}\n",
+		"hosts:\n  node-1: {}\n  node-2:\n    network:\n      ipv4_cidr: 10.0.101.0/24\n",
+		"hosts:\n  node-1:\n    network:\n      ipv4_cidr: 10.0.100.0/25\n  node-2:\n    network:\n      ipv4_cidr: 10.0.100.128/25\n",
+	}
+	for _, extra := range ok {
+		if _, err := fleetWithHosts(t, extra); err != nil {
+			t.Errorf("%s: %v", extra, err)
+		}
+	}
+	bad := map[string]string{
+		// Two hosts without an override share the fleet's subnet.
+		"hosts:\n  node-1: {}\n  node-2: {}\n":                                                                                   "overlapping",
+		"hosts:\n  node-1: {}\n  node-2:\n    network:\n      ipv4_cidr: 10.0.100.128/25\n":                                      "overlapping",
+		"hosts:\n  node-1:\n    network:\n      ipv4_cidr: 10.0.0.0/16\n  node-2:\n    network:\n      ipv4_cidr: 10.0.7.0/24\n": "overlapping",
+		"hosts:\n  node-1:\n    network:\n      ipv4_cidr: 10.0.300.0/24\n":                                                      "not an IPv4 CIDR",
+		"hosts:\n  node-1:\n    network:\n      bridge_name: \"a b\"\n":                                                          "not a usable interface name",
+	}
+	for extra, want := range bad {
+		if _, err := fleetWithHosts(t, extra); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want an error with %q", extra, err, want)
+		}
+	}
+}
