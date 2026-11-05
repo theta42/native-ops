@@ -230,7 +230,7 @@ ending in a colon:
 |---|---|
 | `deploy` | `POST /v1/deploy` (and a deploy resumed after a daemon upgrade) |
 | `apply` | `POST /v1/apply` (an approved plan of an uploaded tree) |
-| `instance:put`, `instance:update`, `instance:resize`, `instance:suspend`, `instance:delete` | the tenant instance endpoints |
+| `instance:put`, `instance:update`, `instance:resize`, `instance:suspend`, `instance:delete`, `instance:labels`, `instance:migrate`, `instance:adopt`, `instance:finalize-migration` | the tenant instance endpoints |
 | `image:build`, `image:prune` | image builds and retention |
 | `edge:apply`, `backup`, `restore`, `dns:sync` | maintenance endpoints |
 | `daemon:upgrade` | `POST /v1/daemon/upgrade` |
@@ -372,3 +372,5 @@ Every error is `{"error": "<for a person>", "code": "<for a program>"}`:
 | `plan_changed`, `blocked`, `stale`, `not_approvable` | 409 | an apply or approval was refused for the plan's state |
 | `not_approved`, `approval_used`, `approval_expired` | 403 | an apply needs a (fresh) admin approval |
 | `not_managed` | 403 | a tenant-instance change to something that is not a tenant instance |
+| `migrated` | 409 | a change to the stopped copy of an instance this host migrated away (manage it on its new host) |
+| `not_migratable`, `not_migrated`, `no_spec` | 409 | a migrate the instance cannot take (a host path, no recorded spec, already migrated), a finalize of an instance that was not migrated, an export of an instance with no recorded spec |

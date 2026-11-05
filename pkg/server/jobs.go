@@ -39,7 +39,7 @@ type Job struct {
 	Started      *time.Time `json:"started,omitempty"` // when it got the host; unset while queued
 	Finished     *time.Time `json:"finished,omitempty"`
 	Error        string     `json:"error,omitempty"`
-	Result       string     `json:"result,omitempty"` // how a deploy ended: applied, no_changes or daemon_upgraded
+	Result       string     `json:"result,omitempty"` // how a deploy ended (applied, no_changes or daemon_upgraded); what a migration did
 	Log          string     `json:"log,omitempty"`
 	LogTruncated bool       `json:"log_truncated,omitempty"`
 	// Position is where a queued job is in line (1 runs next). It is worked out when the job is read.

@@ -298,6 +298,8 @@ type Instances struct {
 	exec remote.Executor
 	// healthGate is a field so tests can stub the wait.
 	healthGate func(ctx context.Context, ip string, hc config.HealthCheckConfig) error
+	// migrationProbe stubs the health check a migration makes on the target (tests).
+	migrationProbe func(ctx context.Context, remote, name string, hc config.HealthCheckConfig) error
 }
 
 func NewInstances(exec remote.Executor) *Instances { return &Instances{exec: exec} }
@@ -329,10 +331,27 @@ func (i *Instances) Template(ctx context.Context, name string) (template string,
 }
 
 // Launch creates the instance, or converges the one an earlier launch of this template created.
+// It then records the spec on the instance (without its environment; see recordSpec), which is what a
+// migration to another host carries and what export-spec answers with. An instance this host migrated
+// away is refused: it runs elsewhere now, and starting this copy would serve it twice.
 func (i *Instances) Launch(ctx context.Context, name string, spec InstanceSpec, logf func(string, ...any)) (string, error) {
-	return i.manager(logf).Launch(ctx, LaunchParams{
+	rec, err := i.Record(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if rec.MigratedTo != "" {
+		return "", fmt.Errorf("%s was migrated to %s; manage it there (this host keeps only its stopped copy until finalize-migration)", name, rec.MigratedTo)
+	}
+	ip, err := i.manager(logf).Launch(ctx, LaunchParams{
 		Template: spec.TemplateConfig(), Name: name, Slug: name, Domain: spec.Domain, Env: spec.Env,
 	})
+	if err != nil {
+		return ip, err
+	}
+	if err := i.recordSpec(ctx, name, spec, logf); err != nil {
+		return ip, err
+	}
+	return ip, nil
 }
 
 // Update moves the instance to a new image through the safe update path.
