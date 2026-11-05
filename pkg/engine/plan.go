@@ -442,6 +442,9 @@ func joinKV(m map[string]string) string {
 type FleetPlan struct {
 	Services []*ServicePlan `json:"services"`
 	Network  *NetworkPlan   `json:"network,omitempty"`
+	// Mesh is this host's side of fleet.yml's WireGuard mesh; nil (and absent from the JSON, the text and
+	// the hash) when fleet.yml has no enabled mesh.
+	Mesh *MeshPlan `json:"mesh,omitempty"`
 	// Host is the host this plan is the share of, when fleet.yml has several (see config.DaemonHost):
 	// the services of the other hosts are in Services as skipped, and nothing else of theirs is planned.
 	// Empty for a fleet of one host (or none), whose plan is all of it.
@@ -460,12 +463,12 @@ func (f *FleetPlan) Counts() map[string]int {
 // Pending reports whether apply would change anything.
 func (f *FleetPlan) Pending() bool {
 	c := f.Counts()
-	return c[ActionCreate]+c[ActionUpdate] > 0 || (f.Network != nil && len(f.Network.Changes) > 0)
+	return c[ActionCreate]+c[ActionUpdate] > 0 || (f.Network != nil && len(f.Network.Changes) > 0) || (f.Mesh != nil && len(f.Mesh.Changes) > 0)
 }
 
 // Blocked reports whether apply would fail on any service, or on the network.
 func (f *FleetPlan) Blocked() bool {
-	return f.Counts()[ActionBlocked] > 0 || (f.Network != nil && len(f.Network.Blockers) > 0)
+	return f.Counts()[ActionBlocked] > 0 || (f.Network != nil && len(f.Network.Blockers) > 0) || (f.Mesh != nil && len(f.Mesh.Blockers) > 0)
 }
 
 // Render is the human-readable form.
@@ -512,6 +515,25 @@ func (f *FleetPlan) Render() string {
 			fmt.Fprintf(&sb, "    note: %s\n", note)
 		}
 	}
+	if m := f.Mesh; m != nil && (len(m.Changes)+len(m.Blockers)+len(m.Notes) > 0) {
+		switch {
+		case len(m.Blockers) > 0:
+			fmt.Fprintf(&sb, "! mesh %s (blocked)\n", m.Interface)
+		case len(m.Changes) > 0:
+			fmt.Fprintf(&sb, "~ mesh %s (update)\n", m.Interface)
+		default:
+			fmt.Fprintf(&sb, "  mesh %s (none)\n", m.Interface)
+		}
+		for _, c := range m.Changes {
+			fmt.Fprintf(&sb, "    %-22s %s\n", c.Kind, c.Detail)
+		}
+		for _, b := range m.Blockers {
+			fmt.Fprintf(&sb, "    BLOCKED: %s\n", b)
+		}
+		for _, note := range m.Notes {
+			fmt.Fprintf(&sb, "    note: %s\n", note)
+		}
+	}
 	c := f.Counts()
 	fmt.Fprintf(&sb, "\nPlan: %d to create, %d to update, %d unchanged, %d blocked", c[ActionCreate], c[ActionUpdate], c[ActionNone], c[ActionBlocked])
 	if c[ActionSkipped] > 0 {
@@ -525,6 +547,13 @@ func (f *FleetPlan) Render() string {
 		} else {
 			fmt.Fprintf(&sb, "; %d network changes", len(n.Changes))
 		}
+	}
+	if m := f.Mesh; m != nil && len(m.Blockers) > 0 {
+		sb.WriteString("; the mesh is blocked")
+	} else if m != nil && len(m.Changes) == 1 {
+		sb.WriteString("; 1 mesh change")
+	} else if m != nil && len(m.Changes) > 1 {
+		fmt.Fprintf(&sb, "; %d mesh changes", len(m.Changes))
 	}
 	sb.WriteString(".\n")
 	return sb.String()
@@ -578,6 +607,10 @@ func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service str
 	if service == "" {
 		if fp.Network, err = d.PlanNetwork(ctx, fleet, configDir, mine); err != nil {
 			return nil, fmt.Errorf("plan the network: %w", err)
+		}
+		host, _, _ := fleet.DaemonHost(d.hostName) // shareOf already refused a host name it would not take
+		if fp.Mesh, err = d.PlanMesh(ctx, fleet, host); err != nil {
+			return nil, fmt.Errorf("plan the mesh: %w", err)
 		}
 	}
 	return fp, nil
@@ -675,6 +708,16 @@ func (f *FleetPlan) Hash() string {
 	}
 	var b []byte
 	switch {
+	case f.Mesh != nil:
+		// Only a fleet with an enabled mesh hashes this shape, so every other plan keeps its hash.
+		b, _ = json.Marshal(struct {
+			Host        string
+			Services    []hashed
+			Network     *NetworkPlan
+			NetworkBind string
+			Mesh        *MeshPlan
+			MeshBind    string
+		}{f.Host, rows, f.Network, f.Network.bindOrEmpty(), f.Mesh, f.Mesh.bindOrEmpty()})
 	case f.Host != "":
 		// A share of a fleet of several hosts names its host, so it is never the same plan as another
 		// host's share that happens to do the same things.
@@ -719,7 +762,11 @@ func (d *Deployer) ApplyPlan(ctx context.Context, configDir string, plan *FleetP
 			return fmt.Errorf("network: %w", err)
 		}
 	}
-	// The network first: DNS and the edge's Caddyfile are what the services' routes are reached by.
+	// The mesh first: it is this host's own config, and nothing else depends on it being late.
+	if err := d.applyMesh(ctx, configDir, plan.Mesh); err != nil {
+		return fmt.Errorf("apply the mesh: %w", err)
+	}
+	// The network next: DNS and the edge's Caddyfile are what the services' routes are reached by.
 	if err := d.applyNetwork(ctx, configDir, plan.Network); err != nil {
 		return fmt.Errorf("apply the network: %w", err)
 	}

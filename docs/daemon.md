@@ -435,8 +435,8 @@ curl -X POST "$SOURCE/v1/instances/cust-one/finalize-migration" -d '{}'         
 - **`target_remote`** is an Incus remote configured **on the source host** for the daemon's user
   (`incus remote add host-b https://<target>:8443 ...`, trusted on the target), the same remotes the CLI's
   `--target` names. The copy is pushed directly from the source to the target, so **the two hosts must reach
-  each other** on the Incus port; that network (a WireGuard mesh between hosts, theta42/native-ops#84) is
-  set up separately.
+  each other** on the Incus port: with `fleet.yml`'s `mesh:` that is the WireGuard link between them (point
+  the remote at the target's tunnel address, see [Mesh between hosts](#mesh-between-hosts)).
 - **The spec.** Every `PUT` records the spec it was given on the instance itself
   (`user.native-ops.spec`, without `env`), so it moves with the copy. `export-spec` answers with it, with the
   image, limits and labels the instance has now. `env` is never recorded and never exported: the
@@ -847,6 +847,95 @@ jobs:
 Each daemon checks the tag, fetches the commit and applies its own share; secret sync goes to every
 daemon the same way. `native-ops remote` fanning out to the hosts itself, with one summary, comes later.
 
+## Mesh between hosts
+
+Hosts can be joined by a WireGuard mesh, declared in `fleet.yml` and converged by each host's daemon
+through the normal plan and apply, like any other host config. Each host gets one interface (`wg0`) with a
+tunnel address, a peer for every other host, and a route over the mesh to every other host's bridge
+subnet, so **an instance's bridge address on one host answers from every other host**, and from nowhere
+else.
+
+```yaml
+# fleet.yml
+mesh:
+  enabled: true
+  subnet: 10.255.0.0/24      # the tunnel addresses; must not overlap any bridge subnet
+  # interface: wg0           # the default
+  # listen_port: 51820       # the default (UDP)
+hosts:
+  host-a:
+    provider: static
+    address: 192.0.2.10      # the peers' endpoint, unless mesh.endpoint says otherwise
+    mesh:
+      public_key: <host-a's public key, from its plan>
+  host-b:
+    provider: static
+    address: 192.0.2.11
+    network: {ipv4_cidr: 10.0.101.0/24}
+    mesh:
+      public_key: <host-b's public key>
+      # address: 10.255.0.20   # optional; otherwise derived (below)
+      # endpoint: vpn-b.example.com:51820   # optional; needed when address is `auto`
+```
+
+**The key exchange.** A host's private key is generated on that host and never leaves it: it is not in
+the repository, a plan, a log, a job record or a command line. `fleet.yml` holds only public keys.
+
+1. **Deploy** with `mesh: {enabled: true, ...}` and no keys. Each host's plan has one mesh change,
+   `mesh-key`: apply generates the key in `/etc/wireguard/wg0.key` (root-only, `0600`, from a script fed
+   on stdin) and writes its public half to `/etc/wireguard/wg0.pub`. The job log prints the public key.
+2. **Read the public key.** Any plan of that host now says, and is blocked until `fleet.yml` agrees:
+   `BLOCKED: this host's mesh public key is <key>; add it to fleet.yml as hosts.host-a.mesh.public_key`.
+   The plan's JSON has it too (`mesh.public_key`). A plan also stays blocked while another host's key is
+   missing, or when `fleet.yml` has a different key from the host's (a plan never replaces a host's key).
+3. **Commit** every host's `hosts.<name>.mesh.public_key`.
+4. **Deploy again.** Each host writes `/etc/wireguard/wg0.conf`, turns on IP forwarding, adds its mesh
+   firewall rules, and enables and starts `wg-quick@wg0`. A second deploy changes nothing.
+
+The plan's lines are `mesh-interface`, `mesh-peer` (with each peer's public key, endpoint and allowed IPs),
+`mesh-route`, `mesh-restart`, `mesh-forward` and `mesh-firewall`. A host rebuilt from scratch generates a
+new key, and its plan says so (step 2) until the new key is committed. The other hosts' plans then pick up
+the new key.
+
+**Addresses.** A host's tunnel address is `hosts.<name>.mesh.address`, or else the subnet's next address in
+sorted host-name order (`host-a` 10.255.0.1, `host-b` 10.255.0.2), so every daemon works out the same
+addresses from the same `fleet.yml`. `fleet.yml` is refused when the subnet is not IPv4, overlaps a
+bridge subnet, or has no room for the hosts, and when two hosts get the same address or one falls outside
+the subnet. A disabled `mesh:` is not checked. The endpoint is `hosts.<name>.mesh.endpoint`, else the
+host's `address` with `listen_port`. A host with `address: auto` needs `mesh.endpoint`, and the plan
+says so.
+
+**How instance addresses become reachable.** On each host, every peer's `AllowedIPs` is that peer's
+tunnel address and **that peer's bridge subnet**, and wg-quick routes each of them over `wg0`. A packet
+from host A (or one of its instances) to `10.0.101.23` therefore goes into the tunnel to host B, which
+forwards it onto its bridge (`net.ipv4.ip_forward=1`, kept in `/etc/sysctl.d/60-native-ops-mesh.conf`).
+Traffic an instance starts towards another host leaves through Incus' NAT, so it arrives from its host's
+tunnel address. From the public internet the bridge subnets have no route, and the firewall drops them.
+
+**The firewall.** When ufw is active, the daemon manages only its own rules, marked
+`comment 'native-ops mesh'`: the WireGuard port (`allow 51820/udp`); on `wg0`, input from each peer's
+tunnel address to this host's; and forwarding from each peer's tunnel address and bridge subnet to this
+host's bridge subnet. A rule with that comment that the mesh no longer needs (a host removed, the port
+changed) is deleted, and no other rule is touched. When ufw is not active, the plan notes that no rules are
+written. The rest of the host firewall (the bootstrap's rules, `forwards:` ports) is still outside the
+plan, theta42/native-ops#75. Note that the bootstrap's `ufw route allow out on <bridge>` already lets any
+forwarded traffic reach the bridge; #75 is where that gets narrowed.
+
+**wg-quick, not systemd-networkd.** The interface is a `wg-quick@wg0` unit with a config file that has no
+`PrivateKey` line (`PostUp = wg set %i private-key /etc/wireguard/%i.key`), so the plan can compare the
+whole file without reading a secret. Hosts are not switched to systemd-networkd, which the bootstrap does
+not use. A changed config restarts the unit, so the tunnel drops for a moment, and only when something
+changed.
+
+**`instance migrate` uses this link.** Add the target as an Incus remote on the source by its tunnel
+address (`incus remote add host-b https://10.255.0.2:8443`, with the target's `core.https_address`
+listening on its tunnel address or on all addresses). The mesh firewall rules let a peer's tunnel address
+in, so the copy goes over WireGuard and the Incus port is never opened to the internet.
+
+The mesh is converged by plan and apply only (a plan narrowed to one service leaves it out, as it does the
+network). With `mesh:` absent or `enabled: false` nothing is read or planned, and plans, their text and
+their hashes are exactly what they were.
+
 ## Running it
 
 A host created with `native-ops host create --daemon-version ...` or by `reconcile` with a `daemon:`
@@ -1037,8 +1126,8 @@ record. Normally services reach a host through an approved apply.
 ## Roadmap
 
 Done: services pinned to hosts, with one daemon per host applying its own share and checking its own
-bridge subnet ([Several hosts](#several-hosts)), driven by a CI matrix. Next: `native-ops remote` fanning
-a plan or apply out to each host's daemon and gathering the results; a mesh between hosts,
-DNS and reconcile per host, backups keyed by host; instance migrate and previews as jobs; a live view of
+bridge subnet ([Several hosts](#several-hosts)), driven by a CI matrix, and a WireGuard mesh between them
+([Mesh between hosts](#mesh-between-hosts)). Next: `native-ops remote` fanning a plan or apply out to each
+host's daemon and gathering the results; DNS and reconcile per host, backups keyed by host; instance migrate and previews as jobs; a live view of
 a running job; and per-user API tokens. The API is versioned (`/v1`) so a separate fleet manager can
 depend on it.

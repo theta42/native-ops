@@ -223,7 +223,8 @@ DHCP is allowed on the bridge in the host firewall (the `reconcile` bootstrap do
 #### 6. Cross-Host Workload Migration (safe for CI)
 `--source` and `--target` are Incus remotes (`incus remote list`) configured where
 `native-ops` runs. The two hosts must be able to reach each other (the copy is pushed
-host-to-host), e.g. over a WireGuard link between providers.
+host-to-host), e.g. over the WireGuard mesh `fleet.yml`'s `mesh:` sets up (add each remote by its
+tunnel address; see docs/daemon.md, "Mesh between hosts").
 ```bash
 # 1. move it: the source is stopped, never deleted
 native-ops instance migrate \
@@ -299,6 +300,11 @@ hosts:
     address: auto
     network:
       ipv4_cidr: 10.0.101.0/24
+    # This host's part of the mesh (below): its WireGuard public key, as its daemon's plan reports it.
+    # Optional: address (its tunnel address; otherwise derived from mesh.subnet and the sorted host
+    # names) and endpoint (host[:port]; otherwise this host's address and mesh.listen_port).
+    mesh:
+      public_key: <node-02's public key>
 # The host a service without `host:` runs on: required with two or more hosts (with one, that host is
 # the default). Each host's daemon runs with `serve --host-name <host>` and applies only its own
 # services: see docs/daemon.md, "Several hosts".
@@ -327,6 +333,16 @@ snapshots:
   schedule: "@daily"       # snapshots.schedule: a cron expression or @hourly/@daily/@weekly/...
   expiry: 2w               # snapshots.expiry: M(inutes) H d w m(onths) y, e.g. "7d", "1d 12H"
   pattern: "auto-%d"       # snapshots.pattern (optional)
+
+# A WireGuard mesh between the hosts, converged by each host's daemon: a route to every other host's bridge
+# subnet over wg0, so instances' bridge addresses answer across hosts. Private keys are generated on the
+# hosts and never leave them; each host's plan reports its public key for hosts.<name>.mesh.public_key.
+# Absent or enabled: false, nothing is planned. See docs/daemon.md, "Mesh between hosts".
+mesh:
+  enabled: true
+  subnet: 10.255.0.0/24    # tunnel addresses; must not overlap a bridge subnet
+  interface: wg0           # the default
+  listen_port: 51820       # the default (UDP)
 
 # Off-host backups (see "Backup & Restore"); `schedule` makes the daemon run them itself.
 backup:
