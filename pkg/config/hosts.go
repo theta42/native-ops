@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -64,6 +65,20 @@ func (f *FleetConfig) ValidateHosts() error {
 	if len(names) >= 2 && f.DefaultHost == "" {
 		return fmt.Errorf("fleet.yml has %d hosts (%s) and no default_host: a service without `host:` must belong to exactly one of them, and with more than one host none is the obvious choice; set default_host: to one of them", len(names), strings.Join(names, ", "))
 	}
+	remoteOf := map[string]string{}
+	for _, name := range names {
+		r := f.Hosts[name].IncusRemote
+		if r == "" {
+			continue
+		}
+		if !incusRemoteRe.MatchString(r) || r == "local" {
+			return fmt.Errorf("hosts.%s.incus_remote %q is not the name of an Incus remote (letters, digits, dots, dashes and underscores; not \"local\", which is every host itself)", name, r)
+		}
+		if other, ok := remoteOf[r]; ok {
+			return fmt.Errorf("hosts.%s and hosts.%s both have incus_remote %q: a remote reaches one host", other, name, r)
+		}
+		remoteOf[r] = name
+	}
 	if f.Daemon != nil {
 		if v, ok := serveflags.Value(strings.Fields(f.Daemon.Flags), "host-name"); ok {
 			switch {
@@ -121,6 +136,9 @@ func (f *FleetConfig) DaemonHost(hostName string) (host string, filtered bool, e
 	}
 	return hostName, true, nil
 }
+
+// incusRemoteRe is the shape of an Incus remote's name that a migration accepts (see incus.ValidName).
+var incusRemoteRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 
 func listOrNone(names []string) string {
 	if len(names) == 0 {

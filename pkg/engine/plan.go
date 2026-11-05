@@ -568,7 +568,7 @@ var ErrBadConfig = errors.New("invalid configuration")
 //
 // When fleet.yml names several hosts, the plan is this daemon's share (WithHostName): the services of
 // the other hosts are listed as skipped and never planned against this host, and the fleet-wide work
-// that another host's daemon does (dns_records: the default host's) is left to it. Without a host name
+// that another host's daemon does (the DNS records that point at another host) is left to it. Without a host name
 // such a fleet is refused, rather than every host's services being planned here.
 func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service string, opts ...PlanOption) (*FleetPlan, error) {
 	fleet, err := config.LoadFleetConfig(configDir)
@@ -588,6 +588,9 @@ func PlanFleet(ctx context.Context, exec remote.Executor, configDir, service str
 		return nil, err
 	}
 	d.share = share
+	if service == "" {
+		d.fleetServices = services
+	}
 	fp := &FleetPlan{Services: []*ServicePlan{}}
 	if share != nil {
 		fp.Host = share.host
@@ -632,7 +635,7 @@ func HostServices(fleet *config.FleetConfig, services []*config.ServiceConfig, h
 // hostShare is what a plan of one host's share knows about the rest of the fleet.
 type hostShare struct {
 	host        string            // the host this daemon is
-	defaultHost string            // fleet.yml's default host: its daemon does the fleet-wide work (dns_records)
+	defaultHost string            // fleet.yml's default host: its daemon writes the DNS records tied to no service
 	others      map[string]string // the services of other hosts, by name, with their host
 }
 

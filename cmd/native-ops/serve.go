@@ -479,6 +479,8 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			opts.ResumeFile = filepath.Join(cfg.StateDir, "deploy-resume.json")
 			opts.Flags = cfg.Flags
 		}
+		// A deploy tag records fleet.yml's hosts and their Incus remotes, for a migration by target_host.
+		opts.HostRemotesFile, opts.HostName = filepath.Join(cfg.StateDir, "host-remotes.json"), cfg.HostName
 		if cfg.EnableBackup {
 			opts.BackupScheduleDir = filepath.Join(cfg.StateDir, "backup-schedule")
 			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup, cfg.HostName), restoreSource(cfg.Exec, cfg.Pool, lookup, cfg.HostName)

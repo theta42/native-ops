@@ -86,7 +86,7 @@ func (d *Deployer) PlanNetwork(ctx context.Context, fleet *config.FleetConfig, c
 	if err := d.planEdgeCaddyfile(ctx, n, configDir, services); err != nil {
 		return nil, err
 	}
-	d.planDNS(ctx, n, fleet)
+	d.planDNS(ctx, n, fleet, services)
 	if d.bind != nil {
 		b, _ := json.Marshal(struct{ Caddyfile string }{n.edgeCaddyfile})
 		n.bind = d.bind(b)
@@ -174,22 +174,44 @@ func (d *Deployer) planEdgeCaddyfile(ctx context.Context, n *NetworkPlan, config
 	return nil
 }
 
-// planDNS plans fleet.yml's dns_records against the provider. It only ever creates or updates: a record the
-// manifest does not mention is never deleted (mail and verification records live beside these).
-func (d *Deployer) planDNS(ctx context.Context, n *NetworkPlan, fleet *config.FleetConfig) {
-	if len(fleet.DNSRecords) == 0 {
-		return
+// planDNS plans the fleet's DNS records against the provider: fleet.yml's dns_records, and the records
+// of the routes of services off the default host (see config.FleetConfig.DNSRecordsByHost). In a fleet of
+// several hosts it plans only the records that point at this daemon's host (and, on the default host, those
+// tied to no service), and notes which host does each of the others, so two daemons never write the same
+// record. It only ever creates or updates: a record the manifest does not mention is never deleted (mail
+// and verification records live beside these).
+func (d *Deployer) planDNS(ctx context.Context, n *NetworkPlan, fleet *config.FleetConfig, services []*config.ServiceConfig) {
+	if d.fleetServices != nil {
+		services = d.fleetServices
 	}
-	// dns_records are the fleet's, not a host's: in a fleet of several hosts only the default host's
-	// daemon plans and applies them, so two daemons never write the same zone.
-	if s := d.share; s != nil && s.host != s.defaultHost {
-		n.note("dns_records are planned and applied by the daemon of the default host, %s", s.defaultHost)
-		return
-	}
-	byZone, err := fleet.DNSRecordsByZone()
+	all, err := fleet.DNSRecordsByHost(services)
 	if err != nil {
 		n.block("dns_records: %v", err)
 		return
+	}
+	if len(all) == 0 {
+		return
+	}
+	mine, others := all, map[string][]string{}
+	if s := d.share; s != nil {
+		mine = nil
+		for _, r := range all {
+			if r.Host == s.host {
+				mine = append(mine, r)
+				continue
+			}
+			others[r.Host] = append(others[r.Host], r.Type+" "+dnsName(r.Name, r.Zone))
+		}
+	}
+	for _, h := range sortedZones(others) {
+		n.note("dns: host %s's daemon plans and applies %s (they point at host %s)", h, strings.Join(others[h], ", "), h)
+	}
+	if len(mine) == 0 {
+		return
+	}
+	byZone := map[string][]config.DNSRecordConfig{}
+	for _, r := range mine {
+		byZone[r.Zone] = append(byZone[r.Zone], r.DNSRecordConfig)
 	}
 	zones := sortedZones(byZone)
 	if fleet.Domain != "" {
@@ -244,12 +266,15 @@ func (d *Deployer) planDNS(ctx context.Context, n *NetworkPlan, fleet *config.Fl
 	}
 }
 
-func dnsDetail(zone string, r provider.DNSRecord) string {
-	name := r.Name + "." + zone
-	if r.Name == "@" {
-		name = zone
+func dnsName(name, zone string) string {
+	if name == "@" {
+		return zone
 	}
-	s := fmt.Sprintf("%s %s %s", r.Type, name, r.Value)
+	return name + "." + zone
+}
+
+func dnsDetail(zone string, r provider.DNSRecord) string {
+	s := fmt.Sprintf("%s %s %s", r.Type, dnsName(r.Name, zone), r.Value)
 	if r.Priority > 0 {
 		s += fmt.Sprintf(" priority %d", r.Priority)
 	}

@@ -103,6 +103,10 @@ func (s *Server) startDeploy(tag, actor string, resume *deployResume) (Job, erro
 			if err := s.followBackupSchedule(root, logf); err != nil {
 				return err
 			}
+			// fleet.yml's hosts and their incus_remote: where a migration by target_host goes.
+			if err := s.followHostRemotes(root, logf); err != nil {
+				return err
+			}
 
 			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			fp, err := s.opts.Plan(pctx, root, "")

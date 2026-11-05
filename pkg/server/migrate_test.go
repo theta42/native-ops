@@ -123,7 +123,7 @@ func TestMigrateIsRefusedForWhatCannotMove(t *testing.T) {
 		"this host":        {nil, "demo-old", map[string]any{"target_remote": "local"}, 400, "this host"},
 		"a bad remote":     {nil, "demo-old", map[string]any{"target_remote": "host b"}, 400, "target_remote"},
 		"no remote":        {nil, "demo-old", map[string]any{}, 400, "target_remote"},
-		"an unknown field": {nil, "demo-old", map[string]any{"target_remote": "host-b", "target_host": "x"}, 400, "bad_request"},
+		"an unknown field": {nil, "demo-old", map[string]any{"target_remote": "host-b", "target_hots": "x"}, 400, "bad_request"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

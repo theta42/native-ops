@@ -1,0 +1,22 @@
+--- log
+==> [GitOps] Starting complete fleet reconciliation from <config-dir>
+==> [GitOps] Reconciling host: only (provider=static)
+==> [GitOps] Syncing DNS records for example.com -> 198.51.100.10
+    DNS synchronized successfully.
+==> [GitOps] Connecting to host 198.51.100.10:2222 via SSH (ops)...
+--- error
+init SSH executor to 198.51.100.10: connection refused
+--- ssh
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+dial ops@198.51.100.10:2222
+--- dns
+example.com: A @ 198.51.100.10, A * 198.51.100.10
+--- commands on local

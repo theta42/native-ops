@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -36,6 +37,14 @@ type Reconciler struct {
 	hostMgr   *HostManager
 	// DeployServices also deploys every service directly, bypassing the daemon's approval gate.
 	DeployServices bool
+
+	// The ways reconcile reaches the world, replaced by tests: SSH credentials, an SSH session to a host,
+	// waiting for a host's SSH port, the pause between SSH attempts, and the fleet's DNS provider.
+	sshCreds      func() (priv []byte, pub string, generated bool)
+	dialSSH       func(host string, port int, user string, key []byte) (remote.Executor, error)
+	waitSSH       func(ctx context.Context, host string, port int, timeout time.Duration) error
+	sshRetryDelay time.Duration
+	dnsFor        func(fleet *config.FleetConfig) (provider.DNSProvider, error)
 }
 
 func NewReconciler(configDir string, exec remote.Executor) *Reconciler {
@@ -44,6 +53,32 @@ func NewReconciler(configDir string, exec remote.Executor) *Reconciler {
 		exec:      exec,
 		deployer:  NewDeployer(exec),
 		hostMgr:   NewHostManager(),
+		sshCreds:  LoadSSHCredentials,
+		dialSSH: func(host string, port int, user string, key []byte) (remote.Executor, error) {
+			return remote.NewSSHExecutor(host, port, user, key)
+		},
+		waitSSH:       waitForSSH,
+		sshRetryDelay: 3 * time.Second,
+		dnsFor:        fleetDNSProvider(configDir),
+	}
+}
+
+// fleetDNSProvider is the DNS provider fleet.yml's dns_provider names: DigitalOcean, or a script plugin in
+// the config repo.
+func fleetDNSProvider(configDir string) func(fleet *config.FleetConfig) (provider.DNSProvider, error) {
+	return func(fleet *config.FleetConfig) (provider.DNSProvider, error) {
+		if fleet.DNSProvider == "digitalocean" || fleet.DNSProvider == "do" {
+			do, err := digitalocean.New("")
+			if err != nil {
+				return nil, fmt.Errorf("DO DNS init: %w", err)
+			}
+			return do, nil
+		}
+		p, err := plugin.NewScriptDNSProvider(fleet.DNSProvider, configDir)
+		if err != nil {
+			return nil, fmt.Errorf("custom DNS plugin init: %w", err)
+		}
+		return p, nil
 	}
 }
 
@@ -55,6 +90,18 @@ type PlanSummary struct {
 	Hosts       []string
 	Services    []string
 	Templates   []string
+	// PerHost is what each host's daemon plans and applies, in the order of the hosts' names: its services
+	// and the DNS records that point at it. Empty when fleet.yml has no hosts:.
+	PerHost []HostSummary
+}
+
+// HostSummary is one host's share of the fleet.
+type HostSummary struct {
+	Name     string
+	Address  string
+	Default  bool     // the default host: services without host: and DNS records tied to no service
+	Services []string // sorted
+	DNS      []string // "TYPE name value", as fleet.yml declares them (dns_records first, then routes)
 }
 
 // Validate loads and validates all configuration files and returns a PlanSummary.
@@ -78,9 +125,8 @@ func (r *Reconciler) Validate(ctx context.Context) (*PlanSummary, error) {
 		DNSProvider: fleet.DNSProvider,
 	}
 
-	for hostName := range fleet.Hosts {
-		summary.Hosts = append(summary.Hosts, hostName)
-	}
+	summary.Hosts = fleet.HostNames()
+	var services []*config.ServiceConfig
 
 	// Validate services
 	servicesDir := filepath.Join(r.configDir, "services")
@@ -99,8 +145,34 @@ func (r *Reconciler) Validate(ctx context.Context) (*PlanSummary, error) {
 					return nil, fmt.Errorf("invalid service %s: %w", svcPath, err)
 				}
 				summary.Services = append(summary.Services, svc.Name)
+				if svc.Name == "" {
+					svc.Name = e.Name()
+				}
+				services = append(services, svc)
 			}
 		}
+	}
+
+	// Each host's share: its services, and the DNS records that point at it (refusing a record no host can
+	// own alone).
+	records, err := fleet.DNSRecordsByHost(services)
+	if err != nil {
+		return nil, fmt.Errorf("fleet.yml dns: %w", err)
+	}
+	for _, name := range summary.Hosts {
+		hs := HostSummary{Name: name, Address: fleet.Hosts[name].Address, Default: name == fleet.DefaultHostName()}
+		for _, svc := range services {
+			if fleet.HostOf(svc) == name {
+				hs.Services = append(hs.Services, svc.Name)
+			}
+		}
+		sort.Strings(hs.Services)
+		for _, r := range records {
+			if r.Host == name {
+				hs.DNS = append(hs.DNS, strings.TrimSpace(r.Type+" "+dnsName(r.Name, r.Zone)+" "+r.Value))
+			}
+		}
+		summary.PerHost = append(summary.PerHost, hs)
 	}
 
 	// Validate templates
@@ -209,7 +281,37 @@ func waitForSSH(ctx context.Context, host string, port int, timeout time.Duratio
 	return fmt.Errorf("timed out waiting for SSH port %s", addr)
 }
 
-// Reconcile executes Level 0 host verification/creation, DNS sync, and Level 1 service deployment.
+// hostRun is one host's reconcile: what it found, and how it failed.
+type hostRun struct {
+	name string
+	ip   string // the host's public address; "" when it has none (not provisioned by reconcile, no address:)
+	user string
+	port int
+	err  error
+	// net is the host's bridge; exec and deployer reach the host (over SSH once it was bootstrapped).
+	net      config.NetworkConfig
+	exec     remote.Executor
+	deployer *Deployer
+}
+
+// sshAccess is the SSH user and port a host is reached on: its own, else root and 22.
+func sshAccess(h config.HostConfig) (string, int) {
+	user, port := "root", 22
+	if h.SSHUser != "" {
+		user = h.SSHUser
+	}
+	if h.SSHPort > 0 {
+		port = h.SSHPort
+	}
+	return user, port
+}
+
+// Reconcile brings each of fleet.yml's hosts up on its own, in the order of their names: Level 0 (the host
+// exists: provisioned with its daemon from cloud-init, or adopted at its address), then the fleet's DNS,
+// then each host's Incus runtime over SSH. With several hosts a host that fails is reported and the
+// others carry on; the run fails at the end, naming every host that failed. The fleet's `domain:` (its
+// apex and wildcard) points at the default host. Services are deployed by each host's daemon, or here
+// with the break-glass DeployServices (a single host only).
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	log.Printf("==> [GitOps] Starting complete fleet reconciliation from %s\n", r.configDir)
 
@@ -224,200 +326,93 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("--deploy-services deploys every service to one host, and fleet.yml has %d hosts; deploy through each host's daemon (a deploy tag), which applies only that host's services", len(fleet.Hosts))
 	}
 
-	privKeyPEM, pubKeyStr, generatedKey := LoadSSHCredentials()
-	var primaryHostIP, primaryHostName string
-	var hostSSHUser string = "root"
-	var hostSSHPort int = 22
-
-	// 1. Level 0: Reconcile Cloud / Hypervisor Hosts
-	for hostName, hostCfg := range fleet.Hosts {
-		log.Printf("==> [GitOps] Reconciling host: %s (provider=%s)\n", hostName, hostCfg.Provider)
-
-		if hostCfg.SSHUser != "" {
-			hostSSHUser = hostCfg.SSHUser
+	privKeyPEM, pubKeyStr, generatedKey := r.sshCreds()
+	names := fleet.HostNames()
+	several := len(names) >= 2
+	// failed reports a host's failure. With one host it is the run's error, as it always was; with several
+	// the other hosts carry on and the run fails at the end.
+	failed := func(h *hostRun, err error) error {
+		h.err = err
+		if !several {
+			return err
 		}
-		if hostCfg.SSHPort > 0 {
-			hostSSHPort = hostCfg.SSHPort
-		}
+		log.Printf("    Host %s failed: %v (the other hosts carry on; the run will fail at the end)\n", h.name, err)
+		return nil
+	}
 
-		if hostCfg.Address != "" && hostCfg.Address != "auto" {
-			primaryHostIP = hostCfg.Address
-			primaryHostName = hostName
-			continue
-		}
-
-		// Query provider to see if host exists
-		if hostCfg.Provider == "digitalocean" || hostCfg.Provider == "do" {
-			do, err := digitalocean.New("")
-			if err != nil {
-				return fmt.Errorf("digitalocean provider init: %w", err)
-			}
-			hosts, err := do.ListHosts(ctx)
-			if err != nil {
-				return fmt.Errorf("list hosts: %w", err)
-			}
-			existing, action, err := classifyHost(hosts, hostName)
-			if err != nil {
+	// 1. Level 0: each host exists.
+	runs := make([]*hostRun, 0, len(names))
+	for _, name := range names {
+		hostCfg := fleet.Hosts[name]
+		h := &hostRun{name: name}
+		h.user, h.port = sshAccess(hostCfg)
+		runs = append(runs, h)
+		log.Printf("==> [GitOps] Reconciling host: %s (provider=%s)\n", name, hostCfg.Provider)
+		if h.ip, err = r.provisionHost(ctx, fleet, name, hostCfg, h.user, h.port, privKeyPEM, pubKeyStr, generatedKey); err != nil {
+			if err := failed(h, err); err != nil {
 				return err
-			}
-			switch action {
-			case hostUse:
-				primaryHostIP = existing.PublicIP
-				primaryHostName = hostName
-				log.Printf("    Host %s already active at IP %s\n", hostName, primaryHostIP)
-			case hostWait:
-				log.Printf("    Host %s (id %s) is still provisioning; waiting for it instead of creating another\n", hostName, existing.ID)
-				h, err := waitHostActive(ctx, do, existing.ID, 5*time.Minute, 5*time.Second)
-				if err != nil {
-					return err
-				}
-				primaryHostIP = h.PublicIP
-				primaryHostName = hostName
-			}
-
-			// A host that exists must be reachable with our credentials. If it is not,
-			// stop and say so: reconcile never destroys or rebuilds a host on its own.
-			if primaryHostIP != "" && len(privKeyPEM) > 0 {
-				testExec, testErr := remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
-				if testErr == nil {
-					if _, err := testExec.Run(ctx, "true"); err != nil {
-						testErr = err
-					}
-					testExec.Close()
-				}
-				if testErr != nil {
-					return fmt.Errorf("host %s (%s) exists but SSH verification failed: %v. Not destroying or re-provisioning it automatically (it may hold data): fix the SSH key or user, or remove the host yourself if you want it rebuilt", hostName, primaryHostIP, testErr)
-				}
-			}
-
-			// Not found: provision it
-			if primaryHostIP == "" {
-				log.Printf("    Host %s not found. Provisioning with cloud-init...\n", hostName)
-				spec := config.HostSpec{
-					Name:     hostName,
-					Provider: "digitalocean",
-					Size:     fleet.Providers.DigitalOcean.DefaultSize,
-					Region:   fleet.Providers.DigitalOcean.Region,
-				}
-				// The cloud-init opens the firewall for this host's own bridge, and, with fleet.yml's daemon
-				// section, installs the daemon.
-				var di *DaemonInstall
-				if fleet.Daemon != nil {
-					if di, err = DaemonInstallFor(fleet.Daemon); err != nil {
-						return fmt.Errorf("provision host %s: daemon: %w", hostName, err)
-					}
-					// With several hosts each daemon must know which it is; its unit carries that
-					// (a deploy's daemon.flags keep it, see pkg/serveflags).
-					if len(fleet.Hosts) >= 2 {
-						di.ServeFlags = strings.TrimSpace(di.ServeFlags + " --host-name " + hostName)
-						if err := di.Validate(); err != nil {
-							return fmt.Errorf("provision host %s: daemon: %w", hostName, err)
-						}
-					}
-				}
-				ud, err := GenerateCloudInitUserDataFor(pubKeyStr, fleet.HostNetwork(hostName), di)
-				if err != nil {
-					return fmt.Errorf("provision host %s: %w", hostName, err)
-				}
-				spec.UserData = ud
-				if di != nil {
-					log.Printf("    The host's cloud-init installs the native-ops daemon %s\n", fleet.Daemon.Version)
-				}
-				// A throwaway key is acceptable here: this run uses it to SSH in. But a failure to
-				// register the key must stop the run BEFORE a droplet nobody can log in to is created.
-				if err := r.hostMgr.PrepareAccess(ctx, &spec, pubKeyStr, generatedKey, true); err != nil {
-					return fmt.Errorf("provision host %s: %w", hostName, err)
-				}
-				newHost, err := r.hostMgr.CreateHost(ctx, spec)
-				if err != nil {
-					return fmt.Errorf("provision host %s: %w", hostName, err)
-				}
-				primaryHostIP = newHost.PublicIP
-				primaryHostName = hostName
 			}
 		}
 	}
 
-	// 2. Sync DNS. A failure is remembered and returned at the end: services can
-	// still be deployed, but the run must not report success with stale DNS.
+	// 2. Sync the fleet domain's DNS to the default host. A failure is remembered and returned at the end:
+	// the hosts can still be brought up, but the run must not report success with stale DNS.
 	var dnsErr error
-	if primaryHostIP != "" && fleet.Domain != "" {
-		log.Printf("==> [GitOps] Syncing DNS records for %s -> %s\n", fleet.Domain, primaryHostIP)
-		var dnsProv provider.DNSProvider
-		if fleet.DNSProvider == "digitalocean" || fleet.DNSProvider == "do" {
-			do, err := digitalocean.New("")
-			if err != nil {
-				return fmt.Errorf("DO DNS init: %w", err)
-			}
-			dnsProv = do
-		} else {
-			p, err := plugin.NewScriptDNSProvider(fleet.DNSProvider, r.configDir)
-			if err != nil {
-				return fmt.Errorf("custom DNS plugin init: %w", err)
-			}
-			dnsProv = p
+	dnsHost := hostRunOf(runs, fleet.DefaultHostName())
+	if several && fleet.Domain != "" && dnsHost != nil && dnsHost.err != nil {
+		dnsErr = fmt.Errorf("%s points at the default host %s, which failed", fleet.Domain, dnsHost.name)
+		log.Printf("==> [GitOps] Not syncing DNS for %s: the default host %s failed\n", fleet.Domain, dnsHost.name)
+	} else if dnsHost != nil && dnsHost.ip != "" && fleet.Domain != "" {
+		log.Printf("==> [GitOps] Syncing DNS records for %s -> %s\n", fleet.Domain, dnsHost.ip)
+		dnsProv, err := r.dnsFor(fleet)
+		if err != nil && !several {
+			return err
 		}
-		if dnsErr = syncDNS(ctx, dnsProv, fleet.Domain, primaryHostIP); dnsErr != nil {
+		if err == nil {
+			err = syncDNS(ctx, dnsProv, fleet.Domain, dnsHost.ip)
+		}
+		if dnsErr = err; dnsErr != nil {
 			log.Printf("    DNS sync failed: %v (continuing with services; the run will fail at the end)\n", dnsErr)
 		} else {
 			log.Printf("    DNS synchronized successfully.\n")
 		}
 	}
 
-	// 3. Level 1: Reconcile Declarative Services
-	// The bridge is the host's own `network:` (fleet.yml's, or the host's override).
-	hostNet := fleet.HostNetwork(primaryHostName)
-	if primaryHostName == "" {
-		hostNet, _ = fleet.LocalNetwork("")
-	}
-	deployer := r.deployer
-	if hostNet.BridgeName != "" {
-		if err := deployer.SetNetwork(hostNet); err != nil {
-			return fmt.Errorf("host %s: %w", primaryHostName, err)
+	// 3. Level 1: each host's Incus runtime, over SSH.
+	for _, h := range runs {
+		if h.err != nil {
+			continue
 		}
-	}
-	var activeExec remote.Executor = r.exec
-
-	// If target host is remote and we have an SSH key, execute deployments over SSH
-	if primaryHostIP != "" && primaryHostIP != "127.0.0.1" && primaryHostIP != "localhost" && len(privKeyPEM) > 0 {
-		log.Printf("==> [GitOps] Connecting to host %s:%d via SSH (%s)...\n", primaryHostIP, hostSSHPort, hostSSHUser)
-		if err := waitForSSH(ctx, primaryHostIP, hostSSHPort, 120*time.Second); err != nil {
-			return fmt.Errorf("wait for host SSH: %w", err)
-		}
-
-		// Allow cloud-init to insert authorized_keys if just booted
-		var sshExec *remote.SSHExecutor
-		var sshErr error
-		for attempt := 1; attempt <= 10; attempt++ {
-			sshExec, sshErr = remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
-			if sshErr == nil {
-				break
+		if err := r.bootstrapHost(ctx, fleet, h, privKeyPEM); err != nil {
+			if err := failed(h, err); err != nil {
+				return err
 			}
-			time.Sleep(3 * time.Second)
 		}
-		if sshErr != nil {
-			return fmt.Errorf("init SSH executor to %s: %w", primaryHostIP, sshErr)
+		if h.exec != nil && h.exec != r.exec {
+			defer h.exec.Close()
 		}
-		defer sshExec.Close()
-		activeExec = sshExec
+	}
+	var hostErrs []error
+	for _, h := range runs {
+		if h.err != nil {
+			hostErrs = append(hostErrs, fmt.Errorf("host %s: %w", h.name, h.err))
+		}
+	}
+	if len(hostErrs) > 0 {
+		err := fmt.Errorf("%d of %d hosts failed: %w", len(hostErrs), len(runs), errors.Join(hostErrs...))
+		if dnsErr != nil {
+			err = fmt.Errorf("%w; and DNS sync failed: %v", err, dnsErr)
+		}
+		return err
+	}
 
-		// Pre-flight host initialization
-		log.Printf("==> [GitOps] Verifying host runtime on %s...\n", primaryHostIP)
-		bootstrap, err := hostBootstrapCommands(hostNet)
-		if err != nil {
-			return fmt.Errorf("host %s: %w", primaryHostName, err)
-		}
-		for _, cmd := range bootstrap {
-			_, _ = sshExec.Run(ctx, cmd)
-		}
-
-		bridge, _, _ := hostNet.Bridge()
-		diag, _ := sshExec.Run(ctx, "echo '--- NETWORK ---'; incus network show "+bridge+"; echo '--- DEFAULT PROFILE ---'; incus profile show default; echo '--- STORAGE ---'; incus storage list")
-		log.Printf("==> [GitOps] Host runtime diagnostics:\n%s\n", diag)
-
-		deployer = NewDeployer(sshExec)
+	// The break-glass deploy has at most one host (several are refused above), or none: then it runs here.
+	deployer, activeExec := r.deployer, r.exec
+	if len(runs) == 1 {
+		deployer, activeExec = runs[0].deployer, runs[0].exec
+	} else if hostNet, _ := fleet.LocalNetwork(""); hostNet.BridgeName != "" {
 		if err := deployer.SetNetwork(hostNet); err != nil {
-			return fmt.Errorf("host %s: %w", primaryHostName, err)
+			return fmt.Errorf("host : %w", err) // as before the per-host loop, which named no host here
 		}
 	}
 
@@ -486,5 +481,179 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("services reconciled, but DNS sync failed: %w", dnsErr)
 	}
 	log.Printf("==> [GitOps] Full fleet reconciliation completed successfully!\n")
+	return nil
+}
+
+func hostRunOf(runs []*hostRun, name string) *hostRun {
+	for _, h := range runs {
+		if h.name == name {
+			return h
+		}
+	}
+	return nil
+}
+
+// provisionHost makes sure one host exists and returns its public address: the one fleet.yml gives, or the
+// provider's (creating the host, with its daemon from cloud-init, when there is none). "" means the host
+// has no address reconcile knows (a provider it does not provision).
+func (r *Reconciler) provisionHost(ctx context.Context, fleet *config.FleetConfig, hostName string, hostCfg config.HostConfig, sshUser string, sshPort int, privKeyPEM []byte, pubKeyStr string, generatedKey bool) (string, error) {
+	if hostCfg.Address != "" && hostCfg.Address != "auto" {
+		return hostCfg.Address, nil
+	}
+	if hostCfg.Provider != "digitalocean" && hostCfg.Provider != "do" {
+		return "", nil
+	}
+	var ip string
+	// Query provider to see if host exists
+	do, err := digitalocean.New("")
+	if err != nil {
+		return "", fmt.Errorf("digitalocean provider init: %w", err)
+	}
+	hosts, err := do.ListHosts(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list hosts: %w", err)
+	}
+	existing, action, err := classifyHost(hosts, hostName)
+	if err != nil {
+		return "", err
+	}
+	switch action {
+	case hostUse:
+		ip = existing.PublicIP
+		log.Printf("    Host %s already active at IP %s\n", hostName, ip)
+	case hostWait:
+		log.Printf("    Host %s (id %s) is still provisioning; waiting for it instead of creating another\n", hostName, existing.ID)
+		h, err := waitHostActive(ctx, do, existing.ID, 5*time.Minute, 5*time.Second)
+		if err != nil {
+			return "", err
+		}
+		ip = h.PublicIP
+	}
+
+	// A host that exists must be reachable with our credentials. If it is not,
+	// stop and say so: reconcile never destroys or rebuilds a host on its own.
+	if ip != "" && len(privKeyPEM) > 0 {
+		testExec, testErr := r.dialSSH(ip, sshPort, sshUser, privKeyPEM)
+		if testErr == nil {
+			if _, err := testExec.Run(ctx, "true"); err != nil {
+				testErr = err
+			}
+			testExec.Close()
+		}
+		if testErr != nil {
+			return "", fmt.Errorf("host %s (%s) exists but SSH verification failed: %v. Not destroying or re-provisioning it automatically (it may hold data): fix the SSH key or user, or remove the host yourself if you want it rebuilt", hostName, ip, testErr)
+		}
+	}
+	if ip != "" {
+		return ip, nil
+	}
+
+	// Not found: provision it
+	log.Printf("    Host %s not found. Provisioning with cloud-init...\n", hostName)
+	spec := config.HostSpec{
+		Name:     hostName,
+		Provider: "digitalocean",
+		Size:     fleet.Providers.DigitalOcean.DefaultSize,
+		Region:   fleet.Providers.DigitalOcean.Region,
+	}
+	// The cloud-init opens the firewall for this host's own bridge, and, with fleet.yml's daemon
+	// section, installs the daemon.
+	var di *DaemonInstall
+	if fleet.Daemon != nil {
+		if di, err = DaemonInstallFor(fleet.Daemon); err != nil {
+			return "", fmt.Errorf("provision host %s: daemon: %w", hostName, err)
+		}
+		// With several hosts each daemon must know which it is; its unit carries that
+		// (a deploy's daemon.flags keep it, see pkg/serveflags).
+		if len(fleet.Hosts) >= 2 {
+			di.ServeFlags = strings.TrimSpace(di.ServeFlags + " --host-name " + hostName)
+			if err := di.Validate(); err != nil {
+				return "", fmt.Errorf("provision host %s: daemon: %w", hostName, err)
+			}
+		}
+	}
+	ud, err := GenerateCloudInitUserDataFor(pubKeyStr, fleet.HostNetwork(hostName), di)
+	if err != nil {
+		return "", fmt.Errorf("provision host %s: %w", hostName, err)
+	}
+	spec.UserData = ud
+	if di != nil {
+		log.Printf("    The host's cloud-init installs the native-ops daemon %s\n", fleet.Daemon.Version)
+	}
+	// A throwaway key is acceptable here: this run uses it to SSH in. But a failure to
+	// register the key must stop the run BEFORE a droplet nobody can log in to is created.
+	if err := r.hostMgr.PrepareAccess(ctx, &spec, pubKeyStr, generatedKey, true); err != nil {
+		return "", fmt.Errorf("provision host %s: %w", hostName, err)
+	}
+	newHost, err := r.hostMgr.CreateHost(ctx, spec)
+	if err != nil {
+		return "", fmt.Errorf("provision host %s: %w", hostName, err)
+	}
+	return newHost.PublicIP, nil
+}
+
+// bootstrapHost prepares one host's Incus runtime over SSH (when it has a remote address and there is a
+// key) and sets h's executor and deployer for it. A host reconcile cannot reach (no address, or the
+// local machine) keeps the reconciler's own executor.
+func (r *Reconciler) bootstrapHost(ctx context.Context, fleet *config.FleetConfig, h *hostRun, privKeyPEM []byte) error {
+	// The bridge is the host's own `network:` (fleet.yml's, or the host's override).
+	h.net = fleet.HostNetwork(h.name)
+	if h.ip == "" {
+		h.net, _ = fleet.LocalNetwork("")
+	}
+	h.deployer, h.exec = r.deployer, r.exec
+	if len(fleet.Hosts) >= 2 {
+		h.deployer = NewDeployer(r.exec)
+	}
+	if h.net.BridgeName != "" {
+		if err := h.deployer.SetNetwork(h.net); err != nil {
+			return fmt.Errorf("host %s: %w", h.name, err)
+		}
+	}
+	if h.ip == "" || h.ip == "127.0.0.1" || h.ip == "localhost" || len(privKeyPEM) == 0 {
+		if len(fleet.Hosts) >= 2 {
+			log.Printf("    Host %s is not reached over SSH (no address reconcile knows, the local machine, or no SSH key); its runtime is not bootstrapped from here\n", h.name)
+		}
+		return nil
+	}
+
+	log.Printf("==> [GitOps] Connecting to host %s:%d via SSH (%s)...\n", h.ip, h.port, h.user)
+	if err := r.waitSSH(ctx, h.ip, h.port, 120*time.Second); err != nil {
+		return fmt.Errorf("wait for host SSH: %w", err)
+	}
+
+	// Allow cloud-init to insert authorized_keys if just booted
+	var sshExec remote.Executor
+	var sshErr error
+	for attempt := 1; attempt <= 10; attempt++ {
+		sshExec, sshErr = r.dialSSH(h.ip, h.port, h.user, privKeyPEM)
+		if sshErr == nil {
+			break
+		}
+		time.Sleep(r.sshRetryDelay)
+	}
+	if sshErr != nil {
+		return fmt.Errorf("init SSH executor to %s: %w", h.ip, sshErr)
+	}
+	h.exec = sshExec
+
+	// Pre-flight host initialization
+	log.Printf("==> [GitOps] Verifying host runtime on %s...\n", h.ip)
+	bootstrap, err := hostBootstrapCommands(h.net)
+	if err != nil {
+		return fmt.Errorf("host %s: %w", h.name, err)
+	}
+	for _, cmd := range bootstrap {
+		_, _ = sshExec.Run(ctx, cmd)
+	}
+
+	bridge, _, _ := h.net.Bridge()
+	diag, _ := sshExec.Run(ctx, "echo '--- NETWORK ---'; incus network show "+bridge+"; echo '--- DEFAULT PROFILE ---'; incus profile show default; echo '--- STORAGE ---'; incus storage list")
+	log.Printf("==> [GitOps] Host runtime diagnostics:\n%s\n", diag)
+
+	h.deployer = NewDeployer(sshExec)
+	if err := h.deployer.SetNetwork(h.net); err != nil {
+		return fmt.Errorf("host %s: %w", h.name, err)
+	}
 	return nil
 }

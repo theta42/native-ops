@@ -51,7 +51,7 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `PATCH /v1/instances/{name}/labels` | deployer | change a tenant instance's labels live (`{"set": {...}, "remove": [...]}`), as a job; no restart |
 | `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
 | `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
-| `POST /v1/instances/{name}/migrate` | admin, or a token scoped to the instance | on the source host: move a tenant instance and its volumes to another host (`{"target_remote": "..."}`), as a job; on success its route here is dropped and the copy here is marked migrated ([Moving an instance to another host](#moving-an-instance-to-another-host)) |
+| `POST /v1/instances/{name}/migrate` | admin, or a token scoped to the instance | on the source host: move a tenant instance and its volumes to another host (`{"target_remote": "..."}`, or `{"target_host": "..."}`, a `fleet.yml` host whose `incus_remote` is used), as a job; on success its route here is dropped and the copy here is marked migrated ([Moving an instance to another host](#moving-an-instance-to-another-host)) |
 | `GET /v1/instances/{name}/export-spec` | viewer | the instance's spec (image, limits, volumes, health, domain, route directives, labels), never its environment, for the target host to adopt |
 | `POST /v1/instances/{name}/adopt` | admin, or a token scoped to the instance | on the target host: take over an instance a migration put there (check it, record the spec, publish the route), as a job; refused if it is not there |
 | `POST /v1/instances/{name}/finalize-migration` | admin, or a token scoped to the instance | on the source host: delete the stopped copy of an instance it migrated away, as a job, once the target is verified |
@@ -312,7 +312,7 @@ planned. Once applied, the same commit plans to nothing. That includes the netwo
 
 | What | Declared in | Planned as | Applied |
 |---|---|---|---|
-| DNS records | `fleet.yml` `dns_records` (each names its zone) | `dns-create` / `dns-update`, diffed against the provider (read only) | through the built-in provider; the zone is read again first, and if it moved since the plan the apply refuses ("plan again") |
+| DNS records | `fleet.yml` `dns_records` (each names its zone); with several hosts, only those that point at this daemon's host ([DNS with several hosts](#dns-with-several-hosts)) | `dns-create` / `dns-update`, diffed against the provider (read only) | through the built-in provider; the zone is read again first, and if it moved since the plan the apply refuses ("plan again") |
 | The edge's main Caddyfile | `edge/Caddyfile` | `edge-caddyfile`, with the lines added and removed; its content is in the hash | validated, reloaded, and rolled back if Caddy rejects it |
 | Host ports | a service's `forwards:` | `publish-port` / `remove-port` on that service | an Incus proxy device per forward |
 | The instance bridge | `fleet.yml` `network:`, or the host's own `hosts.<name>.network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan. With more than one host in `fleet.yml`, each daemon checks the bridge of the host it is (`--host-name`, see [Several hosts](#several-hosts)) |
@@ -410,7 +410,7 @@ manager, or an admin) runs the sequence:
 
 ```bash
 # 1. on the SOURCE daemon: copy the instance and its volumes to the target, stop the source, start and check the target
-curl -X POST "$SOURCE/v1/instances/cust-one/migrate" -d '{"target_remote": "host-b"}'      # 202, a job: wait for it
+curl -X POST "$SOURCE/v1/instances/cust-one/migrate" -d '{"target_host": "host-b"}'        # 202, a job: wait for it (or "target_remote")
 # 2. on the SOURCE daemon: the spec the target needs (never the environment)
 curl "$SOURCE/v1/instances/cust-one/export-spec"                                             # {"name", "spec", "migrated_to"}
 # 3. on the TARGET daemon: take the instance over, with that spec
@@ -432,6 +432,11 @@ curl -X POST "$SOURCE/v1/instances/cust-one/finalize-migration" -d '{}'         
   source with its copy of the volumes. `resume: true` continues an interrupted run onto the stopped copy it
   left on the target. Refused (`409 not_migratable`) for an instance that mounts a host path, has no
   recorded spec, or was already migrated.
+- **`target_host`** names the target by its `fleet.yml` host: the daemon resolves it to that host's
+  `hosts.<name>.incus_remote`, as the `fleet.yml` of the last deploy tag it applied gives it (a deploy
+  records the hosts and their remotes in the state directory). It is refused when no deploy recorded the
+  hosts yet, when the host is not in them or has no `incus_remote`, when it is this daemon's own host, and
+  with `target_remote` beside it. `target_remote` still works without `fleet.yml`.
 - **`target_remote`** is an Incus remote configured **on the source host** for the daemon's user
   (`incus remote add host-b https://<target>:8443 ...`, trusted on the target), the same remotes the CLI's
   `--target` names. The copy is pushed directly from the source to the target, so **the two hosts must reach
@@ -807,8 +812,10 @@ host: host-b             # must name an entry of hosts:; left out, the service i
 - **A plan is one host's share.** It plans the services of its host (their `host:`, else `default_host`)
   and lists every other service as one line, `- db (skipped: on host host-b)`, without reading anything
   about it from the host. A host that runs the edge instance applies `edge/Caddyfile` to it; a host without
-  one, when the edge service is pinned to another host, notes that instead of being blocked. `dns_records` are the fleet's, so only the default host's daemon plans and applies them;
-  the others note it.
+  one, when the edge service is pinned to another host, notes that instead of being blocked.
+- **DNS follows the host.** Each daemon plans and applies only the DNS records that point at its own host,
+  so two daemons never write the same record (below). Its plan names, per other host, the records that
+  host's daemon does (`note: dns: host host-b's daemon plans and applies A db.example.com, ...`).
 - **Each host checks its own bridge.** The plan checks the live bridge against that host's network (its
   `hosts.<name>.network`, else the fleet's `network:`), and apply's launches make sure of that bridge, never
   the fleet's or another host's.
@@ -820,8 +827,51 @@ host: host-b             # must name an entry of hosts:; left out, the service i
   one. A `--host-name` that is not in `hosts:` is refused the same way, and apply checks again that every
   service it changes is its host's. The CLI's `plan` and `apply` take `--host-name` and follow the same
   rule; `reconcile --deploy-services` (one host over SSH) is refused for several hosts.
+- **`validate` shows each host's share**: with two or more hosts it lists, per host, its address, its
+  services and the DNS records that point at it.
 - **A single-host fleet is unchanged.** With one entry in `hosts:` (or none) that host is the default,
   `--host-name` may be left out, and plans, their text and their hashes are exactly as before.
+
+### DNS with several hosts
+
+Which host's daemon writes a record:
+
+| Record | Points at | Written by |
+|---|---|---|
+| `domain:`'s apex and wildcard (`A @`, `A *`) | the default host | `reconcile`, as before |
+| a `dns_records` entry with `service: <name>` | that service's host (`host:`, else `default_host`); an `A`/`AAAA` record leaves `value:` out and gets the host's `address:` | that host's daemon |
+| a route (`routing.domain`) of a service **not** on the default host, under `domain:` | an `A` record of that name at its host's `address:` (the wildcard points at the default host, so without it the name would reach the wrong host) | that host's daemon |
+| any other `dns_records` entry (no `service:`) | its `value:`, as written | the default host's daemon |
+
+```yaml
+# fleet.yml
+domain: example.com
+dns_records:
+  - {type: A, name: mail, service: mailer}                                   # mailer's host's address
+  - {type: MX, name: "@", value: mail.example.com., priority: 10, service: mailer}  # follows mailer
+  - {type: TXT, name: "@", value: "v=spf1 mx -all"}                           # the default host's
+```
+
+Refused by `validate` and blocking the plan, with a message that says why:
+
+- a record tied to a service whose name is a **wildcard** (it would claim the names of other hosts'
+  services), and a service off the default host **routed at a wildcard** or at the domain's apex;
+- a record **two hosts would claim** (the same zone, name and type, or a `CNAME` beside any record of
+  its name, with different hosts), including a record that collides with `domain:`'s apex or wildcard;
+- a record tied to a service that does not exist, an `A`/`AAAA` record tied to a service that also gives
+  `value:`, and one whose host has no IP address of that family in `hosts.<name>.address`.
+
+A route outside `domain:`'s zone gets no record of its own: declare it in `dns_records` with `service:`.
+`native-ops dns sync` (an operator's tool, not a daemon) writes every host's records. A fleet of one
+host has nothing to split: its records, plans and hashes are as before.
+
+### Reconcile with several hosts
+
+`native-ops reconcile` brings each host up on its own, in the order of their names: each with its own
+address, SSH user and port, and bridge. A host that fails (it cannot be provisioned, or SSH never
+answers) is logged, the others carry on, and the run fails at the end naming every host that failed.
+The fleet's `domain:` points at the default host, whatever order the hosts are in. With one host the
+output and errors are exactly as before.
 
 **One tag, every daemon.** A deploy tag is sent to every host's daemon by a CI matrix, one job per host
 with that host's URL and token ([ci-examples/deploy-hosts.yml](ci-examples/deploy-hosts.yml)):
@@ -1063,6 +1113,7 @@ Everything the daemon keeps is in `--state-dir` (default `/var/lib/native-ops`, 
 | `audit.log` | one JSON line per request and per finished job (never a value or credential) |
 | `bin/` | the daemon's binary, the previous one, and the upgrade markers (see above) |
 | `deploy-resume.json` | a deploy that upgraded the daemon to `fleet.yml`'s pin, until the new binary resumes it |
+| `host-remotes.json` | `fleet.yml`'s hosts and their `incus_remote`, from the last deploy tag: where a migration's `target_host` goes |
 
 All files are 0600. Back the directory up if losing approvals, job history or users matters to you;
 tokens and secrets can be re-created from the git server.
@@ -1127,7 +1178,9 @@ record. Normally services reach a host through an approved apply.
 
 Done: services pinned to hosts, with one daemon per host applying its own share and checking its own
 bridge subnet ([Several hosts](#several-hosts)), driven by a CI matrix, and a WireGuard mesh between them
-([Mesh between hosts](#mesh-between-hosts)). Next: `native-ops remote` fanning a plan or apply out to each
-host's daemon and gathering the results; DNS and reconcile per host, backups keyed by host; instance migrate and previews as jobs; a live view of
-a running job; and per-user API tokens. The API is versioned (`/v1`) so a separate fleet manager can
+([Mesh between hosts](#mesh-between-hosts)); DNS that follows each service's host and reconcile per host
+([DNS with several hosts](#dns-with-several-hosts)); backups keyed by host; instance migrate as a job, with
+`target_host` resolved through `incus_remote`. Next: `native-ops remote` fanning a plan or apply out to each
+host's daemon and gathering the results; previews as jobs; a live view of a running job; and per-user API
+tokens. The API is versioned (`/v1`) so a separate fleet manager can
 depend on it.

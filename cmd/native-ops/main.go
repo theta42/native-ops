@@ -166,6 +166,34 @@ func handleValidateCommand(ctx context.Context, args []string) {
 	fmt.Printf("  • Hosts:     %d (%v)\n", len(summary.Hosts), summary.Hosts)
 	fmt.Printf("  • Services:  %d (%v)\n", len(summary.Services), summary.Services)
 	fmt.Printf("  • Templates: %d (%v)\n", len(summary.Templates), summary.Templates)
+	// With several hosts, what each host's daemon plans and applies.
+	if len(summary.PerHost) >= 2 {
+		for _, h := range summary.PerHost {
+			def := ""
+			if h.Default {
+				def = ", default host"
+			}
+			fmt.Printf("  • Host %s (%s%s)\n", h.Name, orDash(h.Address), def)
+			fmt.Printf("      services: %s\n", orDash(strings.Join(h.Services, ", ")))
+			if len(h.DNS) == 0 {
+				fmt.Printf("      dns:      -\n")
+			}
+			for i, r := range h.DNS {
+				label := "          "
+				if i == 0 {
+					label = "dns:      "
+				}
+				fmt.Printf("      %s%s\n", label, r)
+			}
+		}
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func handleReconcileCommand(ctx context.Context, args []string) {
@@ -553,18 +581,27 @@ func handleDNSCommand(ctx context.Context, args []string) {
 	}
 
 	logf := func(format string, a ...any) { fmt.Printf(format+"\n", a...) }
-	if err := syncDeclaredRecords(ctx, fleet, dnsProv, logf); err != nil {
+	// Every host's records: this is the operator's tool, not a daemon, so it is not limited to one host's share.
+	services, err := config.LoadServices(*configDir, "")
+	if err != nil && len(fleet.Hosts) >= 2 {
+		log.Fatalf("Load services (the DNS records of a fleet of several hosts follow their services): %v", err)
+	}
+	if err := syncDeclaredRecords(ctx, fleet, services, dnsProv, logf); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// syncDeclaredRecords creates or updates the records declared in fleet.yml (`dns_records:`), zone by
-// zone. A sync never deletes a record it was not told about. `dns sync` and the daemon's
-// POST /v1/dns/sync both use it.
-func syncDeclaredRecords(ctx context.Context, fleet *config.FleetConfig, dnsProv provider.DNSProvider, logf func(string, ...any)) error {
-	byZone, err := fleet.DNSRecordsByZone()
+// syncDeclaredRecords creates or updates the fleet's DNS records (fleet.yml's `dns_records:`, with each
+// record tied to a service pointing at that service's host, and the records of the routes of services off
+// the default host), zone by zone. A sync never deletes a record it was not told about.
+func syncDeclaredRecords(ctx context.Context, fleet *config.FleetConfig, services []*config.ServiceConfig, dnsProv provider.DNSProvider, logf func(string, ...any)) error {
+	all, err := fleet.DNSRecordsByHost(services)
 	if err != nil {
 		return fmt.Errorf("dns_records: %w", err)
+	}
+	byZone := map[string][]config.DNSRecordConfig{}
+	for _, r := range all {
+		byZone[r.Zone] = append(byZone[r.Zone], r.DNSRecordConfig)
 	}
 	zones := make([]string, 0, len(byZone))
 	for z := range byZone {
