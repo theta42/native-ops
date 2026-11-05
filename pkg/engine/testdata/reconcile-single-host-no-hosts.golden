@@ -1,0 +1,12 @@
+--- log
+==> [GitOps] Starting complete fleet reconciliation from <config-dir>
+==> [GitOps] --deploy-services: deploying services directly, without the daemon's plan approval
+==> [GitOps] Edge container diagnostics:
+
+==> [GitOps] Full fleet reconciliation completed successfully!
+--- error
+<nil>
+--- ssh
+--- dns
+--- commands on local
+sleep 10; echo '--- TAIL 40 CADDY LOG ---'; incus exec edge -- tail -n 40 /var/log/caddy.log || true

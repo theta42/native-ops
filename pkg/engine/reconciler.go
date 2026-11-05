@@ -36,6 +36,14 @@ type Reconciler struct {
 	hostMgr   *HostManager
 	// DeployServices also deploys every service directly, bypassing the daemon's approval gate.
 	DeployServices bool
+
+	// The ways reconcile reaches the world, replaced by tests: SSH credentials, an SSH session to a host,
+	// waiting for a host's SSH port, the pause between SSH attempts, and the fleet's DNS provider.
+	sshCreds      func() (priv []byte, pub string, generated bool)
+	dialSSH       func(host string, port int, user string, key []byte) (remote.Executor, error)
+	waitSSH       func(ctx context.Context, host string, port int, timeout time.Duration) error
+	sshRetryDelay time.Duration
+	dnsFor        func(fleet *config.FleetConfig) (provider.DNSProvider, error)
 }
 
 func NewReconciler(configDir string, exec remote.Executor) *Reconciler {
@@ -44,6 +52,32 @@ func NewReconciler(configDir string, exec remote.Executor) *Reconciler {
 		exec:      exec,
 		deployer:  NewDeployer(exec),
 		hostMgr:   NewHostManager(),
+		sshCreds:  LoadSSHCredentials,
+		dialSSH: func(host string, port int, user string, key []byte) (remote.Executor, error) {
+			return remote.NewSSHExecutor(host, port, user, key)
+		},
+		waitSSH:       waitForSSH,
+		sshRetryDelay: 3 * time.Second,
+		dnsFor:        fleetDNSProvider(configDir),
+	}
+}
+
+// fleetDNSProvider is the DNS provider fleet.yml's dns_provider names: DigitalOcean, or a script plugin in
+// the config repo.
+func fleetDNSProvider(configDir string) func(fleet *config.FleetConfig) (provider.DNSProvider, error) {
+	return func(fleet *config.FleetConfig) (provider.DNSProvider, error) {
+		if fleet.DNSProvider == "digitalocean" || fleet.DNSProvider == "do" {
+			do, err := digitalocean.New("")
+			if err != nil {
+				return nil, fmt.Errorf("DO DNS init: %w", err)
+			}
+			return do, nil
+		}
+		p, err := plugin.NewScriptDNSProvider(fleet.DNSProvider, configDir)
+		if err != nil {
+			return nil, fmt.Errorf("custom DNS plugin init: %w", err)
+		}
+		return p, nil
 	}
 }
 
@@ -224,7 +258,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("--deploy-services deploys every service to one host, and fleet.yml has %d hosts; deploy through each host's daemon (a deploy tag), which applies only that host's services", len(fleet.Hosts))
 	}
 
-	privKeyPEM, pubKeyStr, generatedKey := LoadSSHCredentials()
+	privKeyPEM, pubKeyStr, generatedKey := r.sshCreds()
 	var primaryHostIP, primaryHostName string
 	var hostSSHUser string = "root"
 	var hostSSHPort int = 22
@@ -278,7 +312,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			// A host that exists must be reachable with our credentials. If it is not,
 			// stop and say so: reconcile never destroys or rebuilds a host on its own.
 			if primaryHostIP != "" && len(privKeyPEM) > 0 {
-				testExec, testErr := remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
+				testExec, testErr := r.dialSSH(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
 				if testErr == nil {
 					if _, err := testExec.Run(ctx, "true"); err != nil {
 						testErr = err
@@ -343,19 +377,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	var dnsErr error
 	if primaryHostIP != "" && fleet.Domain != "" {
 		log.Printf("==> [GitOps] Syncing DNS records for %s -> %s\n", fleet.Domain, primaryHostIP)
-		var dnsProv provider.DNSProvider
-		if fleet.DNSProvider == "digitalocean" || fleet.DNSProvider == "do" {
-			do, err := digitalocean.New("")
-			if err != nil {
-				return fmt.Errorf("DO DNS init: %w", err)
-			}
-			dnsProv = do
-		} else {
-			p, err := plugin.NewScriptDNSProvider(fleet.DNSProvider, r.configDir)
-			if err != nil {
-				return fmt.Errorf("custom DNS plugin init: %w", err)
-			}
-			dnsProv = p
+		dnsProv, err := r.dnsFor(fleet)
+		if err != nil {
+			return err
 		}
 		if dnsErr = syncDNS(ctx, dnsProv, fleet.Domain, primaryHostIP); dnsErr != nil {
 			log.Printf("    DNS sync failed: %v (continuing with services; the run will fail at the end)\n", dnsErr)
@@ -381,19 +405,19 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// If target host is remote and we have an SSH key, execute deployments over SSH
 	if primaryHostIP != "" && primaryHostIP != "127.0.0.1" && primaryHostIP != "localhost" && len(privKeyPEM) > 0 {
 		log.Printf("==> [GitOps] Connecting to host %s:%d via SSH (%s)...\n", primaryHostIP, hostSSHPort, hostSSHUser)
-		if err := waitForSSH(ctx, primaryHostIP, hostSSHPort, 120*time.Second); err != nil {
+		if err := r.waitSSH(ctx, primaryHostIP, hostSSHPort, 120*time.Second); err != nil {
 			return fmt.Errorf("wait for host SSH: %w", err)
 		}
 
 		// Allow cloud-init to insert authorized_keys if just booted
-		var sshExec *remote.SSHExecutor
+		var sshExec remote.Executor
 		var sshErr error
 		for attempt := 1; attempt <= 10; attempt++ {
-			sshExec, sshErr = remote.NewSSHExecutor(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
+			sshExec, sshErr = r.dialSSH(primaryHostIP, hostSSHPort, hostSSHUser, privKeyPEM)
 			if sshErr == nil {
 				break
 			}
-			time.Sleep(3 * time.Second)
+			time.Sleep(r.sshRetryDelay)
 		}
 		if sshErr != nil {
 			return fmt.Errorf("init SSH executor to %s: %w", primaryHostIP, sshErr)
