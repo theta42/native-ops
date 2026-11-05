@@ -266,6 +266,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		DeployRepo:       *deployRepo,
 		DeployTags:       *deployTags,
 		EnableBackup:     *enableBackup,
+		HostName:         backupHostName(),
 		EnableAuth:       *enableAuth,
 		MCPOAuth:         *mcpOAuth,
 		PublicURL:        *publicURL,
@@ -304,6 +305,7 @@ func handleServeCommand(ctx context.Context, args []string) {
 		}
 	}()
 	go srv.RunImageRetention(ctx, *imagePruneEvery)
+	go srv.RunBackupSchedule(ctx)
 	log.Printf("native-ops %s serving on http://%s (state: %s, apply: %v, self-upgrade: %v)", Version, *addr, *stateDir, *enableApply, managedBinDir(binDir) != "")
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
@@ -343,6 +345,9 @@ type daemonConfig struct {
 	DeployRepo   string
 	DeployTags   string
 	EnableBackup bool
+	// HostName is this host's name in backup object keys (<prefix>/<host>/<volume>/...); empty falls back
+	// to the OS host name. serve fills it from NATIVE_OPS_HOST_NAME.
+	HostName string
 	// DNSProviderName ("digitalocean") lists DNS records for the status page with the provider's token
 	// read through the secret store at each listing; DNS, when set, is used instead (tests).
 	DNSProviderName string
@@ -462,7 +467,8 @@ func newDaemon(cfg daemonConfig) (*server.Server, func(), error) {
 			opts.Flags = cfg.Flags
 		}
 		if cfg.EnableBackup {
-			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup), restoreSource(cfg.Exec, cfg.Pool, lookup)
+			opts.BackupScheduleDir = filepath.Join(cfg.StateDir, "backup-schedule")
+			opts.Backup, opts.Restore = backupSource(cfg.Exec, cfg.Pool, lookup, cfg.HostName), restoreSource(cfg.Exec, cfg.Pool, lookup, cfg.HostName)
 		}
 		if cfg.GitURL != "" || cfg.DeployRepo != "" {
 			if !cfg.EnableApply {
@@ -658,9 +664,9 @@ func imagePruneSource(exec remote.Executor, keep engine.ImageRetention) server.I
 
 // backupSource is what POST /v1/backups runs: back up one volume (or every allowed one) as the uploaded
 // fleet.yml's backup section says, then optionally apply retention.
-func backupSource(exec remote.Executor, pool string, lookup func(string) string) server.BackupFunc {
+func backupSource(exec remote.Executor, pool string, lookup func(string) string, host string) server.BackupFunc {
 	return func(ctx context.Context, dir string, req server.BackupRequest, logf func(string, ...any)) error {
-		mgr, err := daemonBackupStore(dir, exec, lookup)
+		mgr, err := daemonBackupStore(dir, exec, lookup, host)
 		if err != nil {
 			return fmt.Errorf("backup config: %w", err)
 		}
@@ -697,9 +703,9 @@ func backupSource(exec remote.Executor, pool string, lookup func(string) string)
 }
 
 // restoreSource is what POST /v1/backups/restore runs.
-func restoreSource(exec remote.Executor, pool string, lookup func(string) string) server.RestoreFunc {
+func restoreSource(exec remote.Executor, pool string, lookup func(string) string, host string) server.RestoreFunc {
 	return func(ctx context.Context, dir string, req server.RestoreRequest, logf func(string, ...any)) error {
-		mgr, err := daemonBackupStore(dir, exec, lookup)
+		mgr, err := daemonBackupStore(dir, exec, lookup, host)
 		if err != nil {
 			return fmt.Errorf("backup config: %w", err)
 		}
@@ -877,7 +883,7 @@ func handleUserCommand(args []string) {
 // to: the destination must be the one pinned on the daemon (NATIVE_OPS_BACKUP_ENDPOINT and
 // NATIVE_OPS_BACKUP_BUCKET, synced from the git server's secrets), or a deployer token could send the
 // host's volumes to storage of its own choosing. The keys come from the secret store too.
-func daemonBackupStore(dir string, exec remote.Executor, lookup func(string) string) (*backup.Manager, error) {
+func daemonBackupStore(dir string, exec remote.Executor, lookup func(string) string, host string) (*backup.Manager, error) {
 	fleet, err := config.LoadFleetConfig(dir)
 	if err != nil {
 		return nil, err
@@ -892,7 +898,7 @@ func daemonBackupStore(dir string, exec remote.Executor, lookup func(string) str
 	if !strings.EqualFold(strings.TrimRight(fleet.Backup.Endpoint, "/"), strings.TrimRight(endpoint, "/")) || fleet.Backup.Bucket != bucket {
 		return nil, fmt.Errorf("fleet.yml's backup destination (%s, bucket %s) is not the one pinned on this daemon", fleet.Backup.Endpoint, fleet.Backup.Bucket)
 	}
-	return backupManagerFor(fleet.Backup, exec, lookup)
+	return backupManagerFor(fleet.Backup, exec, lookup, host)
 }
 
 // lazyDO lists DNS records for the status page with the token the secret store has at that moment,

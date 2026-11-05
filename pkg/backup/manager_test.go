@@ -99,7 +99,7 @@ func (s *fakeStore) DeleteObject(_ context.Context, key string) error {
 }
 
 func testCfg() *config.BackupConfig {
-	c := &config.BackupConfig{Endpoint: "https://nyc3.digitaloceanspaces.com", Region: "nyc3", Bucket: "b", Prefix: "incus/"}
+	c := &config.BackupConfig{Endpoint: "https://nyc3.digitaloceanspaces.com", Region: "nyc3", Bucket: "b", Prefix: "incus/", HostName: "host-a"}
 	c.ApplyDefaults()
 	return c
 }
@@ -119,13 +119,13 @@ func TestCreateVolumeUploadsArtifactAndManifest(t *testing.T) {
 	if man.SHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatalf("sha = %s", man.SHA256)
 	}
-	if man.Key != "incus/rest-sicily-data/20260924T120000Z.tar.gz" {
+	if man.Key != "incus/host-a/rest-sicily-data/20260924T120000Z.tar.gz" {
 		t.Fatalf("key = %s", man.Key)
 	}
 	if _, ok := store.objects[man.Key]; !ok {
 		t.Fatal("artifact not uploaded")
 	}
-	if _, ok := store.objects["incus/rest-sicily-data/latest.json"]; !ok {
+	if _, ok := store.objects["incus/host-a/rest-sicily-data/latest.json"]; !ok {
 		t.Fatal("manifest not uploaded")
 	}
 	if !exec.has("storage volume snapshot create") {
@@ -188,7 +188,7 @@ func TestSelectPrune(t *testing.T) {
 		"p/vol/20260901T120000Z.tar.gz",
 		"p/vol/20260801T120000Z.tar.gz",
 	}
-	del := strings.Join(selectPrune(keys, 1, 2, now), ",")
+	del := strings.Join(selectPrune(keys, 1, 2, 0, now), ",")
 	// keep newest (Sep 24) + newest of the last two months (Sep 24, Aug 1)
 	for _, want := range []string{"20260923", "20260922", "20260901"} {
 		if !strings.Contains(del, want) {

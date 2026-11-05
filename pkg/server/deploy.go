@@ -98,6 +98,11 @@ func (s *Server) startDeploy(tag, actor string, resume *deployResume) (Job, erro
 				}
 				return err
 			}
+			// fleet.yml's backup.schedule is the daemon's own scheduled backup: the tag sets, changes or
+			// removes it, whatever the plan says about the services.
+			if err := s.followBackupSchedule(root, logf); err != nil {
+				return err
+			}
 
 			pctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			fp, err := s.opts.Plan(pctx, root, "")

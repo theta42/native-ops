@@ -10,7 +10,8 @@ import (
 // driven from CI like everything else. A scheduled pipeline uploads the configuration tree it checked
 // out (fleet.yml holds the backup settings), and the daemon runs the work as a job. The daemon holds the
 // credentials (the object store's keys, in its environment); CI holds
-// only a token. There is no scheduler in the daemon: the pipeline's schedule is the schedule.
+// only a token. The daemon can also run the backup on fleet.yml's backup.schedule by itself (see
+// backup_schedule.go).
 //
 //	POST /v1/backups?volume=<name>&prune=1          deployer: back up one volume, or every allowlisted
 //	                                                  volume without volume=; prune=1 then applies retention

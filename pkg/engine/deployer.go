@@ -345,6 +345,9 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 			return fmt.Errorf("ensure volume %s: %w", vol.Name, err)
 		}
 	}
+	if _, err := d.ensureVolumeSnapshots(ctx, svc.Volumes, configDir); err != nil {
+		return err
+	}
 	if svc.Hooks.PreDeploy != "" {
 		d.log("    Running pre-deploy hook for %s...\n", svc.Name)
 		if err := d.runHostHook(ctx, "pre-deploy", svc.Name, hookScript(configDir, svc.Name, svc.Hooks.PreDeploy)); err != nil {
@@ -642,6 +645,13 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 				return err
 			}
 		}
+	}
+
+	// Scheduled snapshots are the volumes' own config (Incus takes and expires them).
+	if snapChanged, err := d.ensureVolumeSnapshots(ctx, svc.Volumes, configDir); err != nil {
+		return err
+	} else if snapChanged {
+		changed = true
 	}
 
 	// Re-publish the declared host ports, so a forward added to the manifest (or one lost with a

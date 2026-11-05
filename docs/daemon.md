@@ -536,10 +536,19 @@ The daemon loads it as an in-memory `admin` token named `bootstrap`; it is never
 Rotate it by changing the secret and restarting. On the host itself, `native-ops token create|list|revoke
 --state-dir /var/lib/native-ops` works on the same file, and a running daemon notices the change.
 
-## Backups and retention from CI
+## Backups and retention
 
-The recurring work is a daemon job that a **scheduled pipeline** starts; the pipeline's schedule is
-the schedule, so the daemon needs none of its own. (DNS is not maintenance: it is part of the plan.)
+Backups run as daemon jobs in one of two ways. (DNS is not maintenance: it is part of the plan.)
+
+- **On the daemon's own schedule**, from `fleet.yml`'s `backup.schedule` (daily `HH:MM` UTC times). A
+  deploy tag records the commit's `backup:` section in the state directory (`backup-schedule/fleet.yml`;
+  the deploy log says `backup schedule set`, `unchanged` or `removed`), and the daemon backs up every
+  allowed volume at those times, then applies retention, as a `backup` job by `native-ops (scheduled)`.
+  The job waits its turn for the host like any change; if the previous scheduled backup is still queued
+  or running, the next is skipped (process log and audit log, `SCHEDULE /v1/backups` with status 409).
+  Retention deletes only objects under this host's prefix. Without `backup.schedule` the daemon runs no
+  backups of its own.
+- **From a scheduled pipeline**, which starts the same job over the API:
 
 ```bash
 native-ops remote backup --prune                 # every volume fleet.yml's backup section allows
@@ -551,7 +560,10 @@ native-ops remote restore --volume gitea-data --as gitea-drill    # admin: a res
 (see the next section): the object store's keys (`BACKUP_S3_ACCESS_KEY`/`BACKUP_S3_SECRET_KEY`, or the
 names `fleet.yml` gives). The upload cannot redirect them: a backup goes only to the destination pinned
 on the daemon (`NATIVE_OPS_BACKUP_ENDPOINT` and `NATIVE_OPS_BACKUP_BUCKET`); an upload naming another one
-is refused, or a deployer token could send the host's volumes to storage of its own. An in-place restore
+is refused, or a deployer token could send the host's volumes to storage of its own. Object keys carry
+the host (`<prefix>/<host>/<volume>/...`; the host is `NATIVE_OPS_HOST_NAME` in the daemon's environment,
+else the OS host name), so hosts sharing a bucket never overwrite each other; backups from before keys
+carried the host are still listed and restorable. An in-place restore
 stops the containers that mount the volume (`force=1`), copies the current volume aside to
 `<volume>-pre-restore-<time>` first, and always starts the containers again.
 

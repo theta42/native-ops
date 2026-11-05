@@ -122,6 +122,10 @@ func (m *InstanceManager) Launch(ctx context.Context, p LaunchParams) (string, e
 		if err := m.incus.EnsureVolume(ctx, vol.Pool, actualVolName, vol.Shifted); err != nil {
 			return "", fmt.Errorf("ensure volume %s: %w", actualVolName, err)
 		}
+		// A template volume's own snapshot schedule, if it declares one (Incus keeps it).
+		if _, err := ensureSnapshotPolicy(ctx, m.incus, vol.Pool, actualVolName, vol.Snapshots, m.log); err != nil {
+			return "", err
+		}
 		pool := vol.Pool
 		if pool == "" {
 			pool = "default"

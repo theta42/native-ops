@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -22,6 +23,10 @@ type FleetConfig struct {
 	Providers   ProvidersConfig       `yaml:"providers"`
 	Hosts       map[string]HostConfig `yaml:"hosts"`
 	Backup      *BackupConfig         `yaml:"backup,omitempty"`
+	// Snapshots is the default local snapshot policy for every volume a service declares (a volume's own
+	// `snapshots:` replaces it). It is applied as Incus' own storage-volume config by plan and apply, so
+	// the host needs no snapshot timer. Absent, volumes' snapshot config is left as it is.
+	Snapshots *SnapshotPolicy `yaml:"snapshots,omitempty"`
 	// Daemon, when set, has a host that reconcile creates install the native-ops daemon from its
 	// cloud-init (see engine.DaemonInstall); the bootstrap admin token comes from the environment.
 	Daemon *DaemonConfig `yaml:"daemon,omitempty"`
@@ -86,9 +91,127 @@ type BackupConfig struct {
 	// Retention. Zero means "keep everything".
 	RetainDaily   int `yaml:"retain_daily,omitempty"`
 	RetainMonthly int `yaml:"retain_monthly,omitempty"`
+	// RetainDays also keeps every object younger than this many days. With any retention set, the
+	// newest object of a volume is always kept.
+	RetainDays int `yaml:"retain_days,omitempty"`
 	// KeepLocalSnapshots keeps the transient pre-backup snapshot on the host
 	// after a successful upload (default false).
 	KeepLocalSnapshots bool `yaml:"keep_local_snapshots,omitempty"`
+	// Schedule makes the daemon back up every allowed volume by itself, then apply retention, as a
+	// recorded job: one or more daily UTC times, "HH:MM" or "HH:MM,HH:MM". Empty: no schedule (backups
+	// run only when asked, e.g. by POST /v1/backups). See ScheduleTimes.
+	Schedule string `yaml:"schedule,omitempty"`
+	// HostName is the host this backup runs on, the second part of every object key
+	// (<prefix>/<host>/<volume>/...), so hosts sharing a bucket never overwrite each other. It is never
+	// read from fleet.yml, which every host shares: the daemon (or the CLI) sets it, and the backup
+	// package falls back to the OS host name.
+	HostName string `yaml:"-"`
+}
+
+var scheduleTimeRe = regexp.MustCompile(`^([01][0-9]|2[0-3]):([0-5][0-9])$`)
+
+// ScheduleTimes parses Schedule into minutes after midnight UTC, sorted and without duplicates. An
+// empty Schedule gives none.
+func (b *BackupConfig) ScheduleTimes() ([]int, error) {
+	if strings.TrimSpace(b.Schedule) == "" {
+		return nil, nil
+	}
+	seen := map[int]bool{}
+	var out []int
+	for _, part := range strings.Split(b.Schedule, ",") {
+		m := scheduleTimeRe.FindStringSubmatch(strings.TrimSpace(part))
+		if m == nil {
+			return nil, fmt.Errorf("backup.schedule: %q is not a daily UTC time HH:MM (00:00-23:59)", strings.TrimSpace(part))
+		}
+		h, _ := strconv.Atoi(m[1])
+		mi, _ := strconv.Atoi(m[2])
+		if t := h*60 + mi; !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	sort.Ints(out)
+	return out, nil
+}
+
+// Validate checks the parts of the section that need no object store: the schedule and retention.
+func (b *BackupConfig) Validate() error {
+	if _, err := b.ScheduleTimes(); err != nil {
+		return err
+	}
+	if b.RetainDaily < 0 || b.RetainMonthly < 0 || b.RetainDays < 0 {
+		return fmt.Errorf("backup: retention counts cannot be negative")
+	}
+	return nil
+}
+
+// SnapshotPolicy is a volume's local snapshot schedule, kept by Incus itself through the custom volume's
+// own config (snapshots.schedule, snapshots.expiry, snapshots.pattern), so no host timer is needed. A
+// declared policy is exactly what the volume carries: a field left empty unsets that key (Incus' default
+// then applies), and an empty policy (`snapshots: {}`) turns scheduled snapshots off.
+type SnapshotPolicy struct {
+	// Schedule is a cron expression or an alias Incus accepts ("@daily", "0 */6 * * *"); several are
+	// separated by commas.
+	Schedule string `yaml:"schedule,omitempty" json:"schedule,omitempty"`
+	// Expiry is how long a snapshot is kept, e.g. "7d", "2w", "1d 12H" (M minutes, H hours, d days,
+	// w weeks, m months, y years).
+	Expiry string `yaml:"expiry,omitempty" json:"expiry,omitempty"`
+	// Pattern names the snapshots, e.g. "snap%d" or "auto-{{ creation_date|date:'2006-01-02_15-04' }}".
+	Pattern string `yaml:"pattern,omitempty" json:"pattern,omitempty"`
+}
+
+// Snapshot config keys on an Incus custom volume, in the order plans list them.
+var SnapshotKeys = []string{"snapshots.schedule", "snapshots.expiry", "snapshots.pattern"}
+
+var (
+	snapshotScheduleRe = regexp.MustCompile(`^[A-Za-z0-9@*/,\- ]{1,200}$`)
+	snapshotExpiryRe   = regexp.MustCompile(`^[0-9]+[MHdwmy]( +[0-9]+[MHdwmy])*$`)
+)
+
+// VolumeConfig is the policy as the Incus volume config keys it sets (an empty value means unset).
+func (p SnapshotPolicy) VolumeConfig() map[string]string {
+	return map[string]string{
+		"snapshots.schedule": strings.TrimSpace(p.Schedule),
+		"snapshots.expiry":   strings.TrimSpace(p.Expiry),
+		"snapshots.pattern":  strings.TrimSpace(p.Pattern),
+	}
+}
+
+// Validate refuses values Incus would reject, or that do not belong in a volume's config.
+func (p SnapshotPolicy) Validate() error {
+	for _, raw := range []string{p.Schedule, p.Expiry, p.Pattern} {
+		for _, r := range raw {
+			if r < 0x20 || r == 0x7f {
+				return fmt.Errorf("snapshots: a value has a control character")
+			}
+		}
+	}
+	c := p.VolumeConfig()
+	if v := c["snapshots.schedule"]; v != "" && !snapshotScheduleRe.MatchString(v) {
+		return fmt.Errorf("snapshots.schedule %q is not a cron expression or @alias", v)
+	}
+	if v := c["snapshots.expiry"]; v != "" && !snapshotExpiryRe.MatchString(v) {
+		return fmt.Errorf("snapshots.expiry %q is not a duration like 7d, 2w or \"1d 12H\"", v)
+	}
+	if v := c["snapshots.pattern"]; v != "" {
+		if len(v) > 200 || strings.ContainsAny(v, "/") {
+			return fmt.Errorf("snapshots.pattern %q: at most 200 characters, and no '/'", v)
+		}
+	}
+	return nil
+}
+
+// validateVolumeSnapshots checks every volume's own snapshot policy.
+func validateVolumeSnapshots(vols []VolumeMount) error {
+	for _, v := range vols {
+		if v.Snapshots == nil {
+			continue
+		}
+		if err := v.Snapshots.Validate(); err != nil {
+			return fmt.Errorf("volume %s: %w", v.Name, err)
+		}
+	}
+	return nil
 }
 
 // ApplyDefaults fills in optional backup settings.
@@ -187,6 +310,19 @@ type VolumeMount struct {
 	// fresh volume attaches root-owned regardless of the image, so a service that runs as another user
 	// otherwise cannot write to its own data directory). Empty leaves it as Incus attaches it.
 	Owner string `yaml:"owner,omitempty"`
+	// Snapshots is this volume's local snapshot policy (see SnapshotPolicy); it replaces fleet.yml's
+	// `snapshots:` default. Absent, the fleet default applies, and without one the volume's snapshot
+	// config is left as it is. (The json name keeps a plan's hash unchanged for a manifest without it.)
+	Snapshots *SnapshotPolicy `yaml:"snapshots,omitempty" json:",omitempty"`
+}
+
+// SnapshotPolicyFor is the policy a volume gets: its own, else the fleet default, else nil (leave the
+// volume's snapshot config alone).
+func SnapshotPolicyFor(vol VolumeMount, fleetDefault *SnapshotPolicy) *SnapshotPolicy {
+	if vol.Snapshots != nil {
+		return vol.Snapshots
+	}
+	return fleetDefault
 }
 
 // UnmarshalYAML makes `shifted` default to true when a manifest leaves it out, as documented; a plain
@@ -466,6 +602,14 @@ func LoadFleetConfig(dir string) (*FleetConfig, error) {
 	}
 	if cfg.Backup != nil {
 		cfg.Backup.ApplyDefaults()
+		if err := cfg.Backup.Validate(); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	if cfg.Snapshots != nil {
+		if err := cfg.Snapshots.Validate(); err != nil {
+			return nil, fmt.Errorf("%s: snapshots: %w", path, err)
+		}
 	}
 
 	return &cfg, nil
@@ -492,6 +636,9 @@ func LoadServiceConfig(path string) (*ServiceConfig, error) {
 		return nil, fmt.Errorf("service config %s: %w", path, err)
 	}
 	if err := ValidateEnvFrom(&svc); err != nil {
+		return nil, fmt.Errorf("service config %s: %w", path, err)
+	}
+	if err := validateVolumeSnapshots(svc.Volumes); err != nil {
 		return nil, fmt.Errorf("service config %s: %w", path, err)
 	}
 
@@ -552,6 +699,9 @@ func LoadTemplateConfig(path string) (*TemplateConfig, error) {
 	var tmpl TemplateConfig
 	if err := yaml.Unmarshal(data, &tmpl); err != nil {
 		return nil, fmt.Errorf("failed to parse template config %s: %w", path, err)
+	}
+	if err := validateVolumeSnapshots(tmpl.Volumes); err != nil {
+		return nil, fmt.Errorf("template config %s: %w", path, err)
 	}
 
 	return &tmpl, nil
