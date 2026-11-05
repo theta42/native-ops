@@ -34,6 +34,8 @@ type hostSim struct {
 	nextIP  int
 	// fail, when set, is asked about every command before it runs; a non-nil error is returned instead.
 	fail func(cmd string) error
+	// bridges is each bridge's live ipv4.address; nil means the one bridge incusbr0 at 10.0.100.1/24.
+	bridges map[string]string
 }
 
 type simCtr struct {
@@ -59,15 +61,16 @@ func newHostSim(t *testing.T) *hostSim {
 }
 
 var (
-	simLaunchRe = regexp.MustCompile(`^incus launch '([^']+)' '([^']+)'(.*)$`)
-	simFlagRe   = regexp.MustCompile(`--(profile|config) '([^']*)'`)
-	simListRe   = regexp.MustCompile(`^incus list '?([^' ]+)'? --format json$`)
-	simDevRe    = regexp.MustCompile(`^incus config device add '([^']+)' '([^']+)' '?(\w+)'?((?: '[^']*')*)$`)
-	simPushRe   = regexp.MustCompile(`^incus file push .* - '([^/']+)(/[^']*)'$`)
-	simPullRe   = regexp.MustCompile(`^incus file pull '([^/']+)(/[^']*)' -$`)
-	simExecRe   = regexp.MustCompile(`^incus exec '?([^' ]+)'? -- (.*)$`)
-	simHookRe   = regexp.MustCompile(`^(bash -s|incus exec '([^']+)' -- bash -s)$`)
-	simQuotedRe = regexp.MustCompile(`'([^']*)'`)
+	simBridgeGetRe = regexp.MustCompile(`^incus network get '([^']+)' ipv4\.address$`)
+	simLaunchRe    = regexp.MustCompile(`^incus launch '([^']+)' '([^']+)'(.*)$`)
+	simFlagRe      = regexp.MustCompile(`--(profile|config) '([^']*)'`)
+	simListRe      = regexp.MustCompile(`^incus list '?([^' ]+)'? --format json$`)
+	simDevRe       = regexp.MustCompile(`^incus config device add '([^']+)' '([^']+)' '?(\w+)'?((?: '[^']*')*)$`)
+	simPushRe      = regexp.MustCompile(`^incus file push .* - '([^/']+)(/[^']*)'$`)
+	simPullRe      = regexp.MustCompile(`^incus file pull '([^/']+)(/[^']*)' -$`)
+	simExecRe      = regexp.MustCompile(`^incus exec '?([^' ]+)'? -- (.*)$`)
+	simHookRe      = regexp.MustCompile(`^(bash -s|incus exec '([^']+)' -- bash -s)$`)
+	simQuotedRe    = regexp.MustCompile(`'([^']*)'`)
 	// simStatRe/simChownRe match the two calls EnsurePathOwner makes: a plain read of the current owner,
 	// then -- only when it differs -- a chown to the one asked for.
 	simStatRe    = regexp.MustCompile(`^stat -c %U '([^']*)'$`)
@@ -98,8 +101,16 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		return string(b), nil
 	case cmd == "incus image list --format json":
 		return "[]", nil
-	case cmd == "incus network get 'incusbr0' ipv4.address":
-		return "10.0.100.1/24", nil
+	case simBridgeGetRe.MatchString(cmd):
+		name := simBridgeGetRe.FindStringSubmatch(cmd)[1]
+		if s.bridges == nil {
+			if name == "incusbr0" {
+				return "10.0.100.1/24", nil
+			}
+		} else if addr, ok := s.bridges[name]; ok {
+			return addr, nil
+		}
+		return "", fmt.Errorf("Error: Network not found")
 	case simListRe.MatchString(cmd):
 		name := simListRe.FindStringSubmatch(cmd)[1]
 		c, ok := s.get(name)

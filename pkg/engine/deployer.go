@@ -64,6 +64,15 @@ func NewDeployer(exec remote.Executor) *Deployer {
 	}
 }
 
+// SetNetwork makes the deployer's launches make sure of the host's instance bridge (its `network:` in
+// fleet.yml; see incus.Client.SetBridge). Without it a launch leaves the host's network alone.
+func (d *Deployer) SetNetwork(n config.NetworkConfig) error {
+	if err := d.incus.SetBridge(n); err != nil {
+		return err
+	}
+	return d.inst.SetNetwork(n)
+}
+
 // SetLogger sends the progress this deployer (and its instance manager) reports to logf instead of
 // the process log. A daemon uses it to keep each job's log to itself.
 func (d *Deployer) SetLogger(logf func(format string, a ...any)) {

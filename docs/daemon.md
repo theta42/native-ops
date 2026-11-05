@@ -51,6 +51,10 @@ the host, or by your IaC. It is not something a person sets up by hand.
 | `PATCH /v1/instances/{name}/labels` | deployer | change a tenant instance's labels live (`{"set": {...}, "remove": [...]}`), as a job; no restart |
 | `POST /v1/instances/{name}/resize` | deployer | a live `limits.cpu`/`limits.memory` change, as a job; no restart |
 | `POST /v1/instances/{name}/suspend` | deployer | replace the published route with a static 503 naming a reason, as a job, without touching the instance; undone by asking for the instance again (`PUT`), which always republishes the normal route |
+| `POST /v1/instances/{name}/migrate` | admin, or a token scoped to the instance | on the source host: move a tenant instance and its volumes to another host (`{"target_remote": "..."}`), as a job; on success its route here is dropped and the copy here is marked migrated ([Moving an instance to another host](#moving-an-instance-to-another-host)) |
+| `GET /v1/instances/{name}/export-spec` | viewer | the instance's spec (image, limits, volumes, health, domain, route directives, labels), never its environment, for the target host to adopt |
+| `POST /v1/instances/{name}/adopt` | admin, or a token scoped to the instance | on the target host: take over an instance a migration put there (check it, record the spec, publish the route), as a job; refused if it is not there |
+| `POST /v1/instances/{name}/finalize-migration` | admin, or a token scoped to the instance | on the source host: delete the stopped copy of an instance it migrated away, as a job, once the target is verified |
 | `POST /v1/images/build` | deployer | build and publish an application image from an uploaded configuration tree, as a job (only with `--enable-image-build`) |
 | `POST /v1/images/prune` | deployer (unscoped) | image retention as a job: delete images no instance runs that are orphans or old tags (`?dry_run=1` reports only; with `--enable-image-build`) |
 | `GET /v1/instances`, `GET /v1/instances/{name}` | viewer | the tenant instances the token may see, with their labels; `?label=environment=production` (repeatable) keeps those carrying every label given |
@@ -311,7 +315,7 @@ planned. Once applied, the same commit plans to nothing. That includes the netwo
 | DNS records | `fleet.yml` `dns_records` (each names its zone) | `dns-create` / `dns-update`, diffed against the provider (read only) | through the built-in provider; the zone is read again first, and if it moved since the plan the apply refuses ("plan again") |
 | The edge's main Caddyfile | `edge/Caddyfile` | `edge-caddyfile`, with the lines added and removed; its content is in the hash | validated, reloaded, and rolled back if Caddy rejects it |
 | Host ports | a service's `forwards:` | `publish-port` / `remove-port` on that service | an Incus proxy device per forward |
-| The instance bridge | `fleet.yml` `network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan |
+| The instance bridge | `fleet.yml` `network:`, or the host's own `hosts.<name>.network:` | checked only | never: the daemon does not re-address a live bridge, so a difference **blocks** the plan. With more than one host in `fleet.yml` the daemon cannot tell which it runs on, and the plan notes that the bridge was not checked |
 
 Rules that keep it safe to run again and again:
 
@@ -397,6 +401,64 @@ What stops a fleet manager, or anyone holding its token, from doing more than th
   in its turn ([One change at a time](#one-change-at-a-time)), and a finished job means the host is free (or
   handed to the next in line). Each change is a job with a record; tenant secrets in `env` never appear in a
   job log, the audit log or any answer.
+
+### Moving an instance to another host
+
+A tenant instance can move to another host without anyone holding a key to either. Each daemon still
+acts only on its own host and no daemon calls another, so something that holds a token on both (the fleet
+manager, or an admin) runs the sequence:
+
+```bash
+# 1. on the SOURCE daemon: copy the instance and its volumes to the target, stop the source, start and check the target
+curl -X POST "$SOURCE/v1/instances/cust-one/migrate" -d '{"target_remote": "host-b"}'      # 202, a job: wait for it
+# 2. on the SOURCE daemon: the spec the target needs (never the environment)
+curl "$SOURCE/v1/instances/cust-one/export-spec"                                             # {"name", "spec", "migrated_to"}
+# 3. on the TARGET daemon: take the instance over, with that spec
+curl -X POST "$TARGET/v1/instances/cust-one/adopt" -d "$SPEC"                                # 202, a job: wait for it
+# 4. point the instance's DNS record at the target host
+# 5. later, once the target has been watched: on the SOURCE daemon, delete the stopped copy
+curl -X POST "$SOURCE/v1/instances/cust-one/finalize-migration" -d '{}'                     # add "purge_source_volumes": true to drop its volumes too
+```
+
+- **`migrate`** (source) is a job with exactly the steps and rollback of `native-ops instance migrate`: a
+  `pre-migrate-*` snapshot of each volume, a warm copy while the instance serves, a clean stop, a final
+  `--refresh` copy, then start and health-check the target from inside the container (with the health check
+  recorded in the instance's spec). Any failure after the stop stops the target copy and starts the source
+  again, and the route here is left as it was. On success the source **drops the instance's route from its
+  edge** and **marks its stopped copy `migrated_to` the target** (visible in `GET /v1/instances`): the copy
+  and its spec are kept, for export-spec and as the rollback copy, and nothing here may start or change it
+  any more (`PUT`, update, resize, suspend and labels answer `409 migrated`; `DELETE` still removes it). The
+  job's `result` says what happened, including that **volume snapshots were not moved**: they stay on the
+  source with its copy of the volumes. `resume: true` continues an interrupted run onto the stopped copy it
+  left on the target. Refused (`409 not_migratable`) for an instance that mounts a host path, has no
+  recorded spec, or was already migrated.
+- **`target_remote`** is an Incus remote configured **on the source host** for the daemon's user
+  (`incus remote add host-b https://<target>:8443 ...`, trusted on the target), the same remotes the CLI's
+  `--target` names. The copy is pushed directly from the source to the target, so **the two hosts must reach
+  each other** on the Incus port; that network (a WireGuard mesh between hosts, theta42/native-ops#84) is
+  set up separately.
+- **The spec.** Every `PUT` records the spec it was given on the instance itself
+  (`user.native-ops.spec`, without `env`), so it moves with the copy. `export-spec` answers with it, with the
+  image, limits and labels the instance has now. `env` is never recorded and never exported: the
+  instance's environment file moved with it. An instance launched before specs were recorded has none
+  (`409 no_spec` from export-spec, `409 not_migratable` from migrate); asking for it again with `PUT` and the
+  same spec records one, and changes nothing else.
+- **`adopt`** (target) never creates, starts or replaces anything. It checks the instance is on this host,
+  running, from the spec's template, with every volume of the spec attached; records the spec as its own;
+  health-checks it; and publishes its route exactly as a `PUT` does. Repeating it changes nothing. It is
+  refused (`404`) when no such instance is on the host, and a spec with `env` is refused. A suspended
+  instance arrives unsuspended (adopt publishes the normal route): suspend it again on the target.
+- **DNS** is the orchestrator's step: the daemons move the instance and its route, and the record follows
+  whichever host now serves it.
+- **`finalize-migration`** (source) is the CLI's `--finalize` as a job: it refuses unless the instance was
+  migrated away, the target is running with every volume and passes the health check, and only then deletes
+  the stopped copy (its volumes are kept unless `purge_source_volumes`). Repeating it after it succeeded
+  succeeds when `target_remote` names the host the instance runs on.
+- **Who may.** These three changes need an admin, or a token scoped to the instance (names and labels, as
+  for every instance endpoint; adopt also checks the spec's image and domain against the scope). An
+  unscoped deployer, the token a configuration repository's CI holds, is refused: moving a tenant is the
+  tenant manager's decision, or an admin's. export-spec is a read, scoped like `GET /v1/instances/{name}`.
+  Each job is audited and holds the host like every other change.
 
 ## Image builds and recipe approval
 

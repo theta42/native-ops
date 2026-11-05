@@ -274,9 +274,11 @@ name: my-cluster
 domain: example.com
 dns_provider: digitalocean # built in; or the name of a script plugin in providers/dns/ (CLI only)
 
+# Every host's instance bridge, unless the host sets its own (below). The bridge gets the subnet's
+# first address (10.0.100.1/24 here).
 network:
-  bridge_name: incusbr0
-  ipv4_cidr: 10.0.100.0/24
+  bridge_name: incusbr0     # the default
+  ipv4_cidr: 10.0.100.0/24  # the default
 
 providers:
   digitalocean:
@@ -289,6 +291,14 @@ hosts:
   node-01:
     provider: digitalocean
     address: auto
+  # A second host needs its own bridge subnet: fleet.yml is refused when two hosts' subnets overlap
+  # (two hosts without `network:` both have the fleet's, so they overlap too). Either field may be set;
+  # the other falls back to the fleet-level `network:`.
+  node-02:
+    provider: digitalocean
+    address: auto
+    network:
+      ipv4_cidr: 10.0.101.0/24
 
 # The daemon a new host installs from cloud-init (the bootstrap token's hash comes from
 # NATIVE_OPS_BOOTSTRAP_TOKEN in the environment of reconcile or host create).
@@ -323,6 +333,13 @@ backup:
   schedule: "03:30"        # daily, UTC; several: "03:30,15:30"
   retain_daily: 14
 ```
+
+A host's bridge subnet is set when the host is bootstrapped (`reconcile`), while it has no
+instances. After that it keeps it: neither reconcile nor an apply renumbers a live bridge (every
+instance and route would move). If fleet.yml and the live bridge disagree, the daemon's plan reports
+the difference and is blocked until fleet.yml matches the host. A daemon on a fleet with more than one
+host cannot yet tell which host it runs on, so its plan notes that it did not check the bridge
+(services are not mapped to hosts yet).
 
 ### `services/gitea/service.yml`
 ```yaml

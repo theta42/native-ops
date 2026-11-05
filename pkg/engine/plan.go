@@ -601,6 +601,16 @@ func (d *Deployer) ApplyPlan(ctx context.Context, configDir string, plan *FleetP
 	if plan.Blocked() {
 		return errors.New("the plan is blocked; nothing was applied")
 	}
+	// A launch makes sure of this host's bridge, as fleet.yml declares it (when it says which host this is).
+	fleet, err := config.LoadFleetConfig(configDir)
+	if err != nil {
+		return err
+	}
+	if n, ok := fleet.LocalNetwork(); ok {
+		if err := d.SetNetwork(n); err != nil {
+			return fmt.Errorf("network: %w", err)
+		}
+	}
 	// The network first: DNS and the edge's Caddyfile are what the services' routes are reached by.
 	if err := d.applyNetwork(ctx, configDir, plan.Network); err != nil {
 		return fmt.Errorf("apply the network: %w", err)

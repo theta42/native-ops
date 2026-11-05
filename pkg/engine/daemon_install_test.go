@@ -129,3 +129,72 @@ func TestValidateChecksTheDaemonSection(t *testing.T) {
 		t.Fatal("a daemon section without a pinned version and checksum must not validate")
 	}
 }
+
+// The cloud-init opens the firewall for the host's own bridge. With the default bridge it is the user data
+// it always was, byte for byte.
+func TestCloudInitOpensTheFirewallForTheHostsBridge(t *testing.T) {
+	const key = "ssh-ed25519 AAAA test"
+	// The user data before hosts had their own bridge, word for word.
+	want := "#cloud-config\nchpasswd:\n  expire: false\nssh_pwauth: false\npackage_update: true\npackage_upgrade: true\n" +
+		"ssh_authorized_keys:\n  - " + key + "\n" + `packages:
+  - curl
+  - ufw
+  - git
+  - jq
+  - ca-certificates
+
+runcmd:
+  # 0. Ensure root account is active without password expiration
+  - chage -I -1 -m 0 -M 99999 -E -1 root || true
+  - passwd -d root || true
+
+  # 1. Install Zabbly Incus repo
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+  - echo "deb [signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/stable $(lsb_release -cs) main" > /etc/apt/sources.list.d/zabbly-incus-stable.list
+  - apt-get update
+  - apt-get install -y incus
+
+  # 2. Configure Firewall
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow in on incusbr0
+  - ufw route allow in on incusbr0
+  - ufw route allow out on incusbr0
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+`
+	if got := GenerateCloudInitUserData(key); got != want {
+		t.Fatalf("the default user data changed:\n%s", got)
+	}
+	fleet := &config.FleetConfig{
+		Network: config.NetworkConfig{BridgeName: config.DefaultBridgeName, IPv4CIDR: config.DefaultIPv4CIDR},
+		Hosts: map[string]config.HostConfig{
+			"node-1": {Provider: "digitalocean"},
+			"node-2": {Provider: "digitalocean", Network: &config.NetworkConfig{BridgeName: "br-inst", IPv4CIDR: "10.0.101.0/24"}},
+		},
+	}
+	if got, err := GenerateCloudInitUserDataFor(key, fleet.HostNetwork("node-1"), nil); err != nil || got != want {
+		t.Fatalf("a host on the fleet's bridge gets the default user data: %v\n%s", err, got)
+	}
+	got, err := GenerateCloudInitUserDataFor(key, fleet.HostNetwork("node-2"), testInstall())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "incusbr0") {
+		t.Fatalf("node-2's firewall rules name the default bridge:\n%s", got)
+	}
+	for _, rule := range []string{"  - ufw allow in on br-inst\n", "  - ufw route allow in on br-inst\n", "  - ufw route allow out on br-inst\n"} {
+		if !strings.Contains(got, rule) {
+			t.Errorf("node-2's user data is missing %q", rule)
+		}
+	}
+	if !strings.Contains(got, "native-ops") {
+		t.Error("the daemon section is still added")
+	}
+	if _, err := GenerateCloudInitUserDataFor(key, config.NetworkConfig{BridgeName: "br0; reboot", IPv4CIDR: "10.0.100.0/24"}, nil); err == nil {
+		t.Fatal("a bridge name that is not an interface name never reaches the user data")
+	}
+}

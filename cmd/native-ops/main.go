@@ -281,6 +281,11 @@ func handleApplyCommand(ctx context.Context, args []string) {
 	}
 	exec := remote.NewLocalExecutor()
 	deployer := engine.NewDeployer(exec)
+	if n, ok := fleet.LocalNetwork(); ok {
+		if err := deployer.SetNetwork(n); err != nil {
+			log.Fatalf("fleet.yml network: %v", err)
+		}
+	}
 	for _, svcCfg := range services {
 		if err := deployer.DeployService(ctx, svcCfg, *configDir); err != nil {
 			log.Fatalf("Failed to deploy service %s: %v", svcCfg.Name, err)
@@ -353,6 +358,15 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 
 		if *name == "" || *slug == "" {
 			log.Fatal("Error: --name and --slug are required")
+		}
+
+		// The bridge a launch makes sure of is fleet.yml's for this host, when the config says which that is.
+		if fleet, err := config.LoadFleetConfig(*configDir); err == nil {
+			if n, ok := fleet.LocalNetwork(); ok {
+				if err := mgr.SetNetwork(n); err != nil {
+					log.Fatalf("fleet.yml network: %v", err)
+				}
+			}
 		}
 
 		tmplPath := filepath.Join(*configDir, "templates", *templateName, "template.yml")
@@ -483,6 +497,8 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 		}); err != nil {
 			log.Fatalf("Migration failed: %v", err)
 		}
+		log.Printf("    Next: point DNS / edge routing at %s and watch it. Then run `instance migrate --finalize` to delete the source.\n", *dst)
+		log.Printf("    To roll back instead: `instance migrate --source %s --target %s --name %s --resume` (copies changes back).\n", *dst, *src, *name)
 		fmt.Printf("Instance %s is running on %s; %s on %s is stopped and intact. Repoint DNS/edge, then run with --finalize.\n", *name, *dst, *name, *src)
 	}
 }

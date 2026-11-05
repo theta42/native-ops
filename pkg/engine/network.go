@@ -87,11 +87,18 @@ func (d *Deployer) PlanNetwork(ctx context.Context, fleet *config.FleetConfig, c
 	return n, nil
 }
 
-// planBridge checks the instance bridge against fleet.yml's `network:`. The daemon never re-addresses a
-// live bridge (every instance and route would move), so a difference blocks the plan rather than being
-// applied: fix fleet.yml to match the host, or move the host on purpose.
+// planBridge checks the instance bridge against fleet.yml's `network:` for this host (the fleet-level one,
+// or the host's own override). The daemon never re-addresses a live bridge (every instance and route would
+// move), so a difference blocks the plan rather than being applied: fix fleet.yml to match the host, or
+// move the host on purpose. With several hosts in fleet.yml the daemon cannot tell which one it runs on,
+// so it says it did not check rather than checking against the wrong host's subnet.
 func (d *Deployer) planBridge(ctx context.Context, n *NetworkPlan, fleet *config.FleetConfig) error {
-	bridge, want := fleet.Network.BridgeName, fleet.Network.IPv4CIDR
+	local, ok := fleet.LocalNetwork()
+	if !ok {
+		n.note("fleet.yml declares %d hosts and this daemon does not know which one it runs on; its bridge is not checked against fleet.yml", len(fleet.Hosts))
+		return nil
+	}
+	bridge, want := local.BridgeName, local.IPv4CIDR
 	_, wantNet, err := net.ParseCIDR(want)
 	if err != nil {
 		n.block("fleet.yml network.ipv4_cidr %q is not a CIDR", want)

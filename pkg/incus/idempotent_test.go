@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/theta42/native-ops/pkg/config"
 )
 
 func TestParseRenderMergeEnv(t *testing.T) {
@@ -381,5 +385,104 @@ func TestSetEnvKeysReplacesAppendsAndKeepsTheRest(t *testing.T) {
 	}
 	if got := SetEnvKeys("", map[string]string{"K": "v"}); got != "K=v\n" {
 		t.Fatalf("an empty file gets the key: %q", got)
+	}
+}
+
+// The bridge's address is set only on a host with no instances: run the command against a fake incus
+// for each case and see whether it set anything.
+func TestBridgeAddressIsOnlySetOnAHostWithoutInstances(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	cases := []struct {
+		name, live, list string
+		listFails, sets  bool
+	}{
+		{name: "already right", live: "10.0.101.1/24", list: "web", sets: false},
+		{name: "already right, empty host", live: "10.0.101.1/24", list: "", sets: false},
+		{name: "fresh host", live: "10.183.7.1/24", list: "", sets: true},
+		{name: "live host", live: "10.0.100.1/24", list: "web\nedge", sets: false},
+		{name: "instances unreadable", live: "10.0.100.1/24", listFails: true, sets: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			log := filepath.Join(dir, "log")
+			listExit := "0"
+			if c.listFails {
+				listExit = "1"
+			}
+			fake := "#!/bin/sh\necho \"$*\" >> " + log + "\ncase \"$1 $2\" in\n" +
+				"  \"network get\") echo '" + c.live + "' ;;\n" +
+				"  \"list --format\") printf '" + c.list + "'; exit " + listExit + " ;;\n" +
+				"esac\n"
+			if err := os.WriteFile(filepath.Join(dir, "incus"), []byte(fake), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(bash, "-c", BridgeAddressIfUnused("incusbr0", "10.0.101.1/24"))
+			cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("the command must never fail a bootstrap: %v %s", err, out)
+			}
+			b, _ := os.ReadFile(log)
+			set := strings.Contains(string(b), "network set incusbr0 ipv4.address=10.0.101.1/24")
+			if set != c.sets {
+				t.Fatalf("set=%v, want %v; incus was called with:\n%s", set, c.sets, b)
+			}
+		})
+	}
+}
+
+// A client that was not told the host's bridge leaves the network alone; one that was makes sure of
+// that bridge, by the same commands as before for the default one, except that the address is no
+// longer forced onto a live bridge.
+func TestEnsureProfileMakesSureOfTheConfiguredBridgeOnly(t *testing.T) {
+	ctx := context.Background()
+	ex := &stubExec{}
+	if err := NewClient(ex).EnsureProfile(ctx, "service"); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range ex.cmds {
+		if strings.Contains(c, "network") {
+			t.Fatalf("no bridge was set, yet the network was touched: %s", c)
+		}
+	}
+
+	ex = &stubExec{}
+	c := NewClient(ex)
+	if err := c.SetBridge(config.NetworkConfig{BridgeName: config.DefaultBridgeName, IPv4CIDR: config.DefaultIPv4CIDR}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EnsureProfile(ctx, "service"); err != nil {
+		t.Fatal(err)
+	}
+	// The commands before this change, word for word, but for the address line.
+	want := []string{
+		"incus storage list | grep -q default || incus storage create default dir || true",
+		"incus profile device show default | grep -q 'path: /' || incus profile device add default root disk path=/ pool=default || true",
+		"incus network show incusbr0 >/dev/null 2>&1 || incus network create incusbr0 || true",
+		BridgeAddressIfUnused("incusbr0", "10.0.100.1/24"),
+		`[ "$(incus network get 'incusbr0' 'ipv4.nat' 2>/dev/null)" = 'true' ] || incus network set 'incusbr0' 'ipv4.nat=true' || true`,
+		`[ "$(incus network get 'incusbr0' 'ipv6.address' 2>/dev/null)" = 'none' ] || incus network set 'incusbr0' 'ipv6.address=none' || true`,
+		"incus profile device show default | grep -q 'network: incusbr0' || incus profile device add default eth0 nic network=incusbr0 name=eth0 || true",
+		"incus profile show 'service'",
+	}
+	if strings.Join(ex.cmds, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got:\n%s\nwant:\n%s", strings.Join(ex.cmds, "\n"), strings.Join(want, "\n"))
+	}
+
+	ex = &stubExec{}
+	c = NewClient(ex)
+	if err := c.SetBridge(config.NetworkConfig{BridgeName: "br-inst", IPv4CIDR: "10.0.101.0/24"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.EnsureProfile(ctx, "service")
+	joined := strings.Join(ex.cmds, "\n")
+	if strings.Contains(joined, "incusbr0") || strings.Contains(joined, "10.0.100.") || !strings.Contains(joined, "'ipv4.address=10.0.101.1/24'") || !strings.Contains(joined, "nic network=br-inst") {
+		t.Fatalf("a host's own bridge is used throughout:\n%s", joined)
+	}
+	if err := NewClient(ex).SetBridge(config.NetworkConfig{BridgeName: "incusbr0", IPv4CIDR: "bogus"}); err == nil {
+		t.Fatal("a bridge without a usable subnet is refused")
 	}
 }
