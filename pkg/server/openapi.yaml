@@ -877,6 +877,94 @@ paths:
         "202": { $ref: "#/components/responses/JobStarted" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "429": { $ref: "#/components/responses/QueueFull" }
+  /v1/instances/{name}/migrate:
+    post:
+      operationId: migrateInstance
+      tags: [instances]
+      summary: Move a tenant instance and its volumes to another host
+      description: |
+        Called on the source host's daemon. A job with the steps and rollback of `instance migrate`: snapshot the volumes (`pre-migrate-*`), warm copy, stop, final `--refresh` copy, start and health-check the target (the instance's recorded health check), and restart the source on any failure. `target_remote` is an Incus remote configured on this host; the two hosts must reach each other. On success the route here is removed and the stopped copy here is marked `migrated_to` the target; the job's `result` says so, and that volume snapshots were not moved. Needs an admin, or a token scoped to the instance (an unscoped deployer is refused). Refused (409 not_migratable) for an instance that mounts a host path, has no recorded spec, or was already migrated.
+      x-native-ops-role: admin
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_remote]
+              properties:
+                target_remote: { type: string, description: "The Incus remote of the target host, as configured on this host." }
+                resume: { type: boolean, description: "Allow a stopped copy on the target from an interrupted earlier run." }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "not_migratable (a host path, no recorded spec, or already migrated) or migrated." }
+        "429": { $ref: "#/components/responses/QueueFull" }
+  /v1/instances/{name}/export-spec:
+    get:
+      operationId: exportInstanceSpec
+      tags: [instances]
+      summary: The spec another host needs to adopt the instance
+      description: The spec recorded when the instance was launched, with its image, limits and labels as they are now. It never includes `env`. 409 no_spec for an instance launched before specs were recorded (a PUT with the same spec records one).
+      x-native-ops-role: viewer
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      responses:
+        "200": { description: "{name, spec, migrated_to}.", content: { application/json: {} } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "no_spec: none is recorded on this instance." }
+  /v1/instances/{name}/adopt:
+    post:
+      operationId: adoptInstance
+      tags: [instances]
+      summary: Take over an instance a migration put on this host
+      description: Called on the target host's daemon with the source's export-spec. A job that checks the instance is here, running, from the spec's template and with its volumes attached, records the spec, and publishes its route as a PUT does. It never creates or starts anything, and repeating it changes nothing. Refused (404) when the instance is not on this host. `env` is refused. Needs an admin, or a token scoped to the instance.
+      x-native-ops-role: admin
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/InstanceSpec" } } }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "not_managed: the instance here comes from another template." }
+        "429": { $ref: "#/components/responses/QueueFull" }
+  /v1/instances/{name}/finalize-migration:
+    post:
+      operationId: finalizeInstanceMigration
+      tags: [instances]
+      summary: Delete this host's stopped copy of an instance it migrated away
+      description: A job that checks the target (running, every volume there, healthy) and then deletes the copy here; its volumes are kept unless `purge_source_volumes`. Refused (409 not_migrated) for an instance that was not migrated. Repeating it succeeds when `target_remote` names the host the instance runs on. Needs an admin, or a token scoped to the instance.
+      x-native-ops-role: admin
+      x-native-ops-scoped: true
+      x-native-ops-enabled-by: --enable-instances
+      parameters: [{ $ref: "#/components/parameters/InstanceName" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_remote: { type: string, description: "Must match where it was migrated; required once the copy here is gone." }
+                purge_source_volumes: { type: boolean }
+      responses:
+        "202": { $ref: "#/components/responses/JobStarted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "not_migrated." }
+        "429": { $ref: "#/components/responses/QueueFull" }
 
   /v1/images/build:
     post:

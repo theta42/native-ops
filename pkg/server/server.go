@@ -525,6 +525,10 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("POST /v1/instances/{name}/suspend", s.authScoped(RoleDeployer, s.handleInstanceSuspend))
 		mux.Handle("DELETE /v1/instances/{name}", s.authScoped(RoleDeployer, s.handleInstanceDelete))
 		mux.Handle("PATCH /v1/instances/{name}/labels", s.authScoped(RoleDeployer, s.handleInstanceLabels))
+		mux.Handle("POST /v1/instances/{name}/migrate", s.authMigrate(s.handleInstanceMigrate))
+		mux.Handle("GET /v1/instances/{name}/export-spec", s.authScoped(RoleViewer, s.handleInstanceExportSpec))
+		mux.Handle("POST /v1/instances/{name}/adopt", s.authMigrate(s.handleInstanceAdopt))
+		mux.Handle("POST /v1/instances/{name}/finalize-migration", s.authMigrate(s.handleInstanceFinalizeMigration))
 	}
 	if s.opts.Jobs != nil {
 		mux.Handle("GET /v1/jobs", s.authScoped(RoleViewer, s.handleJobs))

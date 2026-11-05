@@ -497,6 +497,8 @@ func handleInstanceCommand(ctx context.Context, args []string) {
 		}); err != nil {
 			log.Fatalf("Migration failed: %v", err)
 		}
+		log.Printf("    Next: point DNS / edge routing at %s and watch it. Then run `instance migrate --finalize` to delete the source.\n", *dst)
+		log.Printf("    To roll back instead: `instance migrate --source %s --target %s --name %s --resume` (copies changes back).\n", *dst, *src, *name)
 		fmt.Printf("Instance %s is running on %s; %s on %s is stopped and intact. Repoint DNS/edge, then run with --finalize.\n", *name, *dst, *name, *src)
 	}
 }

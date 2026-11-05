@@ -149,6 +149,8 @@ func ParseInstances(out string) ([]Instance, error) {
 					in.Labels = map[string]string{}
 				}
 				in.Labels[strings.TrimPrefix(k, "user.native-ops.label.")] = v
+			case k == "user.native-ops.spec":
+				// The recorded spec (engine.InstanceSpec, no environment) is for export-spec, not the status.
 			case strings.HasPrefix(k, "user.native-ops."):
 				if in.Recorded == nil {
 					in.Recorded = map[string]string{}

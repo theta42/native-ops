@@ -17,6 +17,16 @@ const ImageKey = "user.native-ops.image"
 // never adopts an unrelated instance that happens to share the name.
 const TemplateKey = "user.native-ops.template"
 
+// SpecKey records, on a tenant instance, the spec the daemon launched it from (engine.InstanceSpec as
+// JSON, without its environment, which may hold secrets and lives in the instance's environment file).
+// It is instance config, so it moves with the instance when the instance is copied to another host.
+const SpecKey = "user.native-ops.spec"
+
+// MigratedToKey marks the stopped source copy of an instance that was migrated to another host: its
+// value is the Incus remote the instance now runs on. Nothing on this host may start or change that copy
+// any more; it is kept, stopped, as the rollback copy until a finalize deletes it.
+const MigratedToKey = "user.native-ops.migrated-to"
+
 // ParseEnv parses an environment file: KEY=VALUE lines, blank lines and #
 // comments ignored, one pair of surrounding quotes stripped from values.
 func ParseEnv(text string) map[string]string {
