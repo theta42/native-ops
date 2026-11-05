@@ -31,8 +31,13 @@ func (r *readOnly) Run(ctx context.Context, command string) (string, error) {
 	return r.inner.Run(ctx, command)
 }
 
-// RunWithInput is always refused: feeding a command stdin is how things get written.
-func (r *readOnly) RunWithInput(_ context.Context, command string, _ io.Reader) (string, error) {
+// RunWithInput is refused: feeding a command stdin is how things get written. The one exception is the
+// mesh probe (MeshProbeScript), a fixed read-only script let through only when command and stdin are
+// exactly it.
+func (r *readOnly) RunWithInput(ctx context.Context, command string, stdin io.Reader) (string, error) {
+	if out, ok, err := readOnlyProbe(ctx, r.inner, command, stdin); ok {
+		return out, err
+	}
 	return "", &ReadOnlyError{Command: command}
 }
 

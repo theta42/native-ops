@@ -37,6 +37,9 @@ type FleetConfig struct {
 	// beyond the computed apex/wildcard A. Each names its own zone, so a fleet that spans zones (and
 	// leaves `domain` empty) can still declare records — e.g. an MX for an intake domain.
 	DNSRecords []DNSRecordConfig `yaml:"dns_records,omitempty"`
+	// Mesh joins the hosts with a WireGuard mesh (see MeshConfig); absent or disabled, nothing about one
+	// is planned.
+	Mesh *MeshConfig `yaml:"mesh,omitempty"`
 }
 
 // DNSRecordConfig is one record declared in fleet.yml. Name is zone-relative ("@", "*", "inbound");
@@ -311,6 +314,9 @@ type HostConfig struct {
 	// Network overrides the fleet-level `network:` for this host; a field left empty falls back to it.
 	// Each host needs its own subnet (LoadFleetConfig refuses two that overlap).
 	Network *NetworkConfig `yaml:"network,omitempty"`
+	// Mesh is this host's part of fleet.yml's `mesh:`: its public key, and optionally its tunnel address
+	// and endpoint.
+	Mesh *HostMeshConfig `yaml:"mesh,omitempty"`
 }
 
 // VolumeMount represents a storage volume attachment.
@@ -637,6 +643,9 @@ func LoadFleetConfig(dir string) (*FleetConfig, error) {
 		}
 	}
 	if err := cfg.ValidateHosts(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := cfg.ValidateMesh(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 
