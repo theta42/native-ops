@@ -216,7 +216,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	}
 
 	privKeyPEM, pubKeyStr, generatedKey := LoadSSHCredentials()
-	var primaryHostIP string
+	var primaryHostIP, primaryHostName string
 	var hostSSHUser string = "root"
 	var hostSSHPort int = 22
 
@@ -233,6 +233,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 		if hostCfg.Address != "" && hostCfg.Address != "auto" {
 			primaryHostIP = hostCfg.Address
+			primaryHostName = hostName
 			continue
 		}
 
@@ -253,6 +254,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			switch action {
 			case hostUse:
 				primaryHostIP = existing.PublicIP
+				primaryHostName = hostName
 				log.Printf("    Host %s already active at IP %s\n", hostName, primaryHostIP)
 			case hostWait:
 				log.Printf("    Host %s (id %s) is still provisioning; waiting for it instead of creating another\n", hostName, existing.ID)
@@ -261,6 +263,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					return err
 				}
 				primaryHostIP = h.PublicIP
+				primaryHostName = hostName
 			}
 
 			// A host that exists must be reachable with our credentials. If it is not,
@@ -287,17 +290,20 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					Size:     fleet.Providers.DigitalOcean.DefaultSize,
 					Region:   fleet.Providers.DigitalOcean.Region,
 				}
-				// fleet.yml's daemon section: the new host installs the daemon from its cloud-init.
+				// The cloud-init opens the firewall for this host's own bridge, and, with fleet.yml's daemon
+				// section, installs the daemon.
+				var di *DaemonInstall
 				if fleet.Daemon != nil {
-					di, err := DaemonInstallFor(fleet.Daemon)
-					if err != nil {
+					if di, err = DaemonInstallFor(fleet.Daemon); err != nil {
 						return fmt.Errorf("provision host %s: daemon: %w", hostName, err)
 					}
-					ud, err := GenerateCloudInitUserDataWith(pubKeyStr, di)
-					if err != nil {
-						return fmt.Errorf("provision host %s: %w", hostName, err)
-					}
-					spec.UserData = ud
+				}
+				ud, err := GenerateCloudInitUserDataFor(pubKeyStr, fleet.HostNetwork(hostName), di)
+				if err != nil {
+					return fmt.Errorf("provision host %s: %w", hostName, err)
+				}
+				spec.UserData = ud
+				if di != nil {
 					log.Printf("    The host's cloud-init installs the native-ops daemon %s\n", fleet.Daemon.Version)
 				}
 				// A throwaway key is acceptable here: this run uses it to SSH in. But a failure to
@@ -310,6 +316,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					return fmt.Errorf("provision host %s: %w", hostName, err)
 				}
 				primaryHostIP = newHost.PublicIP
+				primaryHostName = hostName
 			}
 		}
 	}
@@ -341,7 +348,17 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	}
 
 	// 3. Level 1: Reconcile Declarative Services
+	// The bridge is the host's own `network:` (fleet.yml's, or the host's override).
+	hostNet := fleet.HostNetwork(primaryHostName)
+	if primaryHostName == "" {
+		hostNet, _ = fleet.LocalNetwork()
+	}
 	deployer := r.deployer
+	if hostNet.BridgeName != "" {
+		if err := deployer.SetNetwork(hostNet); err != nil {
+			return fmt.Errorf("host %s: %w", primaryHostName, err)
+		}
+	}
 	var activeExec remote.Executor = r.exec
 
 	// If target host is remote and we have an SSH key, execute deployments over SSH
@@ -369,14 +386,22 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 		// Pre-flight host initialization
 		log.Printf("==> [GitOps] Verifying host runtime on %s...\n", primaryHostIP)
-		for _, cmd := range hostBootstrapCommands() {
+		bootstrap, err := hostBootstrapCommands(hostNet)
+		if err != nil {
+			return fmt.Errorf("host %s: %w", primaryHostName, err)
+		}
+		for _, cmd := range bootstrap {
 			_, _ = sshExec.Run(ctx, cmd)
 		}
 
-		diag, _ := sshExec.Run(ctx, "echo '--- NETWORK ---'; incus network show incusbr0; echo '--- DEFAULT PROFILE ---'; incus profile show default; echo '--- STORAGE ---'; incus storage list")
+		bridge, _, _ := hostNet.Bridge()
+		diag, _ := sshExec.Run(ctx, "echo '--- NETWORK ---'; incus network show "+bridge+"; echo '--- DEFAULT PROFILE ---'; incus profile show default; echo '--- STORAGE ---'; incus storage list")
 		log.Printf("==> [GitOps] Host runtime diagnostics:\n%s\n", diag)
 
 		deployer = NewDeployer(sshExec)
+		if err := deployer.SetNetwork(hostNet); err != nil {
+			return fmt.Errorf("host %s: %w", primaryHostName, err)
+		}
 	}
 
 	if !r.DeployServices {

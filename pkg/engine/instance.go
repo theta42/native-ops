@@ -34,6 +34,10 @@ func NewInstanceManager(exec remote.Executor) *InstanceManager {
 	}
 }
 
+// SetNetwork makes the manager's launches make sure of the host's instance bridge (see
+// incus.Client.SetBridge). Without it a launch leaves the host's network alone.
+func (m *InstanceManager) SetNetwork(n config.NetworkConfig) error { return m.incus.SetBridge(n) }
+
 func (m *InstanceManager) log(format string, a ...any) {
 	if m.logf != nil {
 		m.logf(format, a...)
