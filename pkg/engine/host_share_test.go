@@ -40,8 +40,9 @@ var singleHostServices = map[string]string{
 	"db":  "name: db\nimage: postgres:16\nvolumes:\n  - {name: db-data, path: /var/lib/postgresql}\n",
 }
 
-// What the plan of singleHostServices was before services could name a host (taken from the release
-// before it, with the same tree, host state and key). A single-host fleet must plan exactly as it did:
+// What the plan of singleHostServices was before services could name a host (taken from main without
+// it, with the same tree, host state and key; regenerated after #92 moved an OCI image's env to
+// environment.*). A single-host fleet must plan exactly as it did:
 // the same text, the same JSON and the same hash, so no approval goes stale on upgrade.
 const (
 	goldenSingleHostRender = `+ db (create)
@@ -50,13 +51,13 @@ const (
     attach-volume          db-data at /var/lib/postgresql
 + web (create)
     create-instance        launch web from docker:gitea:latest with profiles base,service and limits.cpu=1
-    set-env                write /etc/default/web with 1 keys: PORT
+    set-env                write environment.* with 1 keys: PORT
     publish-route          web.example.com -> web:80 (the address is assigned when the instance is launched)
 
 Plan: 2 to create, 0 to update, 0 unchanged, 0 blocked.
 `
-	goldenSingleHostJSON = `{"services":[{"service":"db","action":"create","changes":[{"kind":"create-instance","detail":"launch db from docker:postgres:16 with profiles base,service"},{"kind":"create-volume","detail":"db-data on pool default"},{"kind":"attach-volume","detail":"db-data at /var/lib/postgresql"}]},{"service":"web","action":"create","changes":[{"kind":"create-instance","detail":"launch web from docker:gitea:latest with profiles base,service and limits.cpu=1"},{"kind":"set-env","detail":"write /etc/default/web with 1 keys: PORT"},{"kind":"publish-route","detail":"web.example.com -\u003e web:80 (the address is assigned when the instance is launched)"}]}],"network":{}}`
-	goldenSingleHostHash = "b985ec69fe351c0487f5e367e8a2e58a6a4c9dce73a70a6c6e136379e39b37ff"
+	goldenSingleHostJSON = `{"services":[{"service":"db","action":"create","changes":[{"kind":"create-instance","detail":"launch db from docker:postgres:16 with profiles base,service"},{"kind":"create-volume","detail":"db-data on pool default"},{"kind":"attach-volume","detail":"db-data at /var/lib/postgresql"}]},{"service":"web","action":"create","changes":[{"kind":"create-instance","detail":"launch web from docker:gitea:latest with profiles base,service and limits.cpu=1"},{"kind":"set-env","detail":"write environment.* with 1 keys: PORT"},{"kind":"publish-route","detail":"web.example.com -\u003e web:80 (the address is assigned when the instance is launched)"}]}],"network":{}}`
+	goldenSingleHostHash = "d172ffc01717b1ab49a48b381bcfe082930c0f1a4f82d56a0b3ce5beea341c12"
 )
 
 func TestASingleHostFleetPlansByteForByteAsBefore(t *testing.T) {

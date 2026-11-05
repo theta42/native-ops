@@ -210,6 +210,9 @@ func (d *Deployer) planFresh(ctx context.Context, p *ServicePlan, svc *config.Se
 			p.add(ChangeAttachVolume, "the existing volume %s at %s (its data is kept)", vol.Name, vol.Path)
 		}
 	}
+	if err := d.planVolumeSnapshots(ctx, p, svc.Volumes, configDir); err != nil {
+		return err
+	}
 	declared, err := d.declaredEnv(svc, configDir)
 	if err != nil {
 		p.block("%v", err)
@@ -222,7 +225,11 @@ func (d *Deployer) planFresh(ctx context.Context, p *ServicePlan, svc *config.Se
 			}
 		}
 		sort.Strings(keys)
-		p.add(ChangeSetEnv, "write /etc/default/%s with %d keys: %s", svc.Unit(), len(keys), strings.Join(envKeyLabels(svc, keys), ", "))
+		where := fmt.Sprintf("/etc/default/%s", svc.Unit())
+		if ociImageRef(deployRef) {
+			where = "environment.*"
+		}
+		p.add(ChangeSetEnv, "write %s with %d keys: %s", where, len(keys), strings.Join(envKeyLabels(svc, keys), ", "))
 	}
 	for _, fwd := range svc.Forwards {
 		props, err := fwd.DeviceProps()
@@ -308,33 +315,27 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 			}
 		}
 	}
+	// A volume's snapshot schedule is its own config, converged whether or not the image is replaced (a
+	// replacement keeps the same volumes).
+	if err := d.planVolumeSnapshots(ctx, p, svc.Volumes, configDir); err != nil {
+		return err
+	}
 
 	if len(declared) > 0 && envErr == nil {
-		es, err := readEnvState(ctx, d.incus, svc.Name, svc.Unit(), declared)
-		if err != nil {
-			return err
-		}
-		if !es.Found || es.Differs {
-			var parts []string
-			if !es.Found {
-				parts = append(parts, "the file does not exist yet")
+		if usesOCIEnv(st, deployRef) {
+			es := diffEnv(true, ociLiveEnv(st), declared)
+			if es.Differs {
+				p.add(ChangeSetEnv, "environment.*: %s", envChangeDetail(svc, es, false))
+				p.add(ChangeRestart, "%s restarts to pick up the environment", svc.Name)
 			}
-			if len(es.Added) > 0 {
-				parts = append(parts, "add "+strings.Join(envKeyLabels(svc, es.Added), ", "))
+		} else {
+			es, err := readEnvState(ctx, d.incus, svc.Name, svc.Unit(), declared)
+			if err != nil {
+				return err
 			}
-			if len(es.Changed) > 0 {
-				parts = append(parts, "change "+strings.Join(envKeyLabels(svc, es.Changed), ", "))
-			}
-			if es.Kept > 0 {
-				parts = append(parts, fmt.Sprintf("%d keys the manifest does not declare are kept", es.Kept))
-			}
-			p.add(ChangeSetEnv, "/etc/default/%s: %s", svc.Unit(), strings.Join(parts, "; "))
-			p.add(ChangeRestart, "%s restarts to pick up the environment", svc.Unit())
-		}
-		for k := range st.Config {
-			if strings.HasPrefix(k, "environment.") {
-				p.note("%s takes its environment from environment.* instance config (an OCI container); apply writes /etc/default/%s, which that container does not read", svc.Name, svc.Unit())
-				break
+			if !es.Found || es.Differs {
+				p.add(ChangeSetEnv, "/etc/default/%s: %s", svc.Unit(), envChangeDetail(svc, es, !es.Found))
+				p.add(ChangeRestart, "%s restarts to pick up the environment", svc.Unit())
 			}
 		}
 	}
@@ -346,7 +347,7 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 	// A running instance is health-checked and routed to by address. A stopped one has none, and
 	// apply would fail waiting for it, unless it is being replaced (the replacement gets its own).
 	var ips []string
-	if svc.HealthCheck.Path != "" || (svc.Routing != nil && svc.Routing.Domain != "") {
+	if svc.HealthCheck.Path != "" || routeManaged(svc) {
 		ips, err = d.incus.GlobalIPv4s(ctx, svc.Name)
 		if err != nil {
 			return err
@@ -373,6 +374,9 @@ const (
 
 // planRoute adds the route change, if any.
 func (d *Deployer) planRoute(ctx context.Context, p *ServicePlan, svc *config.ServiceConfig, ips []string, mode routeMode) error {
+	if svc.Routing != nil && svc.Routing.External {
+		return nil
+	}
 	if svc.Routing == nil || svc.Routing.Domain == "" {
 		return nil
 	}

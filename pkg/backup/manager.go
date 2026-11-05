@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -48,19 +49,60 @@ type Manifest struct {
 }
 
 // Manager coordinates Incus volume export/import with an object store.
+//
+// Object keys are <prefix>/<host>/<volume>/<timestamp>.tar.gz, with <prefix>/<host>/<volume>/latest.json
+// as the manifest, so hosts that share a bucket never overwrite each other's backups. Backups written
+// before keys carried the host (<prefix><volume>/...) are still listed and restorable, but nothing new is
+// written there and retention never deletes them (they may be another host's).
 type Manager struct {
-	incus *incus.Client
-	store ObjectStore
-	cfg   *config.BackupConfig
-	now   func() time.Time
+	incus   *incus.Client
+	store   ObjectStore
+	cfg     *config.BackupConfig
+	host    string
+	hostErr error
+	now     func() time.Time
 }
 
-// New builds a manager. store may be nil when only local operations are used.
+var hostNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$`)
+
+// New builds a manager. store may be nil when only local operations are used. The host in the object
+// keys is cfg.HostName, else the OS host name.
 func New(exec remote.Executor, store ObjectStore, cfg *config.BackupConfig) *Manager {
-	return &Manager{incus: incus.NewClient(exec), store: store, cfg: cfg, now: func() time.Time { return time.Now().UTC() }}
+	m := &Manager{incus: incus.NewClient(exec), store: store, cfg: cfg, now: func() time.Time { return time.Now().UTC() }}
+	m.host = strings.TrimSpace(cfg.HostName)
+	if m.host == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			m.hostErr = fmt.Errorf("backup: no host name for the object keys: %w", err)
+		}
+		m.host = h
+	}
+	if m.hostErr == nil && (!hostNameRe.MatchString(m.host) || strings.Contains(m.host, "..")) {
+		m.hostErr = fmt.Errorf("backup: host name %q cannot be part of an object key (letters, digits, '.', '_', '-')", m.host)
+	}
+	return m
 }
 
+// Host is the host name in this manager's object keys.
+func (m *Manager) Host() string { return m.host }
+
+// base is the configured prefix as a key path ("" or ending in "/").
+func (m *Manager) base() string {
+	p := strings.TrimPrefix(m.cfg.Prefix, "/")
+	if p != "" && !strings.HasSuffix(p, "/") {
+		p += "/"
+	}
+	return p
+}
+
+// keyPrefix is where this host's backups of a volume live: <prefix>/<host>/<volume>/.
 func (m *Manager) keyPrefix(volume string) string {
+	return m.base() + m.host + "/" + volume + "/"
+}
+
+// legacyKeyPrefix is where a volume's backups lived before keys carried the host: exactly the old
+// formula (the prefix as written, then the volume), so old objects are found where they were put.
+func (m *Manager) legacyKeyPrefix(volume string) string {
 	return strings.TrimPrefix(m.cfg.Prefix, "/") + volume + "/"
 }
 
@@ -70,6 +112,10 @@ func (m *Manager) objectKey(volume string, t time.Time) string {
 
 func (m *Manager) manifestKey(volume string) string {
 	return m.keyPrefix(volume) + "latest.json"
+}
+
+func (m *Manager) legacyManifestKey(volume string) string {
+	return m.legacyKeyPrefix(volume) + "latest.json"
 }
 
 // EnsureBucket creates the destination bucket if the store supports it and
@@ -90,6 +136,9 @@ func (m *Manager) EnsureBucket(ctx context.Context) error {
 func (m *Manager) CreateVolume(ctx context.Context, pool, volume string) (*Manifest, error) {
 	if m.store == nil {
 		return nil, errors.New("backup: no object store configured")
+	}
+	if m.hostErr != nil {
+		return nil, m.hostErr
 	}
 	if pool == "" {
 		pool = "default"
@@ -172,18 +221,52 @@ func (m *Manager) CreateVolumes(ctx context.Context, pool string) ([]*Manifest, 
 	return out, nil
 }
 
-// ListVolume returns the stored objects and (if present) the manifest.
+// ListVolume returns the stored objects, newest first, and (if present) the manifest of the latest
+// backup: this host's, and the ones written before keys carried the host (legacy layout).
 func (m *Manager) ListVolume(ctx context.Context, volume string) ([]s3.Object, *Manifest, error) {
-	objs, err := m.store.ListObjects(ctx, m.keyPrefix(volume))
+	if m.store == nil {
+		return nil, nil, errors.New("backup: no object store configured")
+	}
+	var objs []s3.Object
+	if m.hostErr == nil {
+		own, err := m.store.ListObjects(ctx, m.keyPrefix(volume))
+		if err != nil {
+			return nil, nil, err
+		}
+		objs = own
+	}
+	legacy, err := m.listLegacy(ctx, volume)
 	if err != nil {
 		return nil, nil, err
 	}
+	objs = append(objs, legacy...)
 	man, err := m.readManifest(ctx, volume)
 	if err != nil && !errors.Is(err, ErrNoManifest) {
 		return nil, nil, err
 	}
 	sort.Slice(objs, func(i, j int) bool { return objs[i].LastModified.After(objs[j].LastModified) })
 	return objs, man, nil
+}
+
+// listLegacy lists a volume's objects in the layout without the host. Only keys directly under
+// <prefix><volume>/ count: a host named like the volume has its own keys below that, and they are not
+// legacy objects.
+func (m *Manager) listLegacy(ctx context.Context, volume string) ([]s3.Object, error) {
+	lp := m.legacyKeyPrefix(volume)
+	if m.hostErr == nil && lp == m.keyPrefix(volume) {
+		return nil, nil
+	}
+	objs, err := m.store.ListObjects(ctx, lp)
+	if err != nil {
+		return nil, err
+	}
+	var out []s3.Object
+	for _, o := range objs {
+		if rest := strings.TrimPrefix(o.Key, lp); rest != "" && !strings.Contains(rest, "/") {
+			out = append(out, o)
+		}
+	}
+	return out, nil
 }
 
 // RestoreOptions controls a restore.
@@ -212,8 +295,8 @@ func (m *Manager) Restore(ctx context.Context, o RestoreOptions) error {
 			return err
 		}
 		key, wantSHA = man.Key, man.SHA256
-	} else if man, err := m.readManifest(ctx, o.Volume); err == nil && man.Key == key {
-		wantSHA = man.SHA256
+	} else {
+		wantSHA = m.knownSHA(ctx, o.Volume, key)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "native-ops-restore-")
@@ -316,24 +399,36 @@ func (m *Manager) PruneAll(ctx context.Context, pool string) ([]string, error) {
 }
 
 // Prune applies retention to a volume's objects, keeping the newest
-// RetainDaily overall plus the newest object in each of the last
-// RetainMonthly calendar months. latest.json is never removed.
+// RetainDaily overall, the newest object in each of the last
+// RetainMonthly calendar months, and every object younger than RetainDays
+// days; the newest object is always kept. latest.json is never removed.
+//
+// Only this host's objects (<prefix>/<host>/<volume>/) are ever considered: another host's, and the ones
+// in the layout without the host, are never deleted.
 func (m *Manager) Prune(ctx context.Context, volume string) ([]string, error) {
-	if m.cfg.RetainDaily == 0 && m.cfg.RetainMonthly == 0 {
+	if m.cfg.RetainDaily == 0 && m.cfg.RetainMonthly == 0 && m.cfg.RetainDays == 0 {
 		return nil, nil
 	}
-	objs, err := m.store.ListObjects(ctx, m.keyPrefix(volume))
+	if m.store == nil {
+		return nil, errors.New("backup: no object store configured")
+	}
+	if m.hostErr != nil {
+		return nil, m.hostErr
+	}
+	prefix := m.keyPrefix(volume)
+	objs, err := m.store.ListObjects(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
 	var keys []string
 	for _, o := range objs {
-		if !strings.HasSuffix(o.Key, ".tar.gz") {
+		// Belt and braces: a key outside this host's prefix, or below it, is never a candidate.
+		if !strings.HasPrefix(o.Key, prefix) || strings.Contains(strings.TrimPrefix(o.Key, prefix), "/") || !strings.HasSuffix(o.Key, ".tar.gz") {
 			continue
 		}
 		keys = append(keys, o.Key)
 	}
-	del := selectPrune(keys, m.cfg.RetainDaily, m.cfg.RetainMonthly, m.now())
+	del := selectPrune(keys, m.cfg.RetainDaily, m.cfg.RetainMonthly, m.cfg.RetainDays, m.now())
 	for _, k := range del {
 		if err := m.store.DeleteObject(ctx, k); err != nil {
 			return nil, fmt.Errorf("delete %s: %w", k, err)
@@ -364,8 +459,33 @@ func (m *Manager) writeManifest(ctx context.Context, man *Manifest) error {
 	return m.store.PutObject(ctx, m.manifestKey(man.Volume), strings.NewReader(string(buf)), int64(len(buf)), sha256Hex(buf), "application/json")
 }
 
+// knownSHA is the checksum a manifest (this host's, or the legacy one) records for key, or "".
+func (m *Manager) knownSHA(ctx context.Context, volume, key string) string {
+	keys := []string{m.legacyManifestKey(volume)}
+	if m.hostErr == nil {
+		keys = append([]string{m.manifestKey(volume)}, keys...)
+	}
+	for _, mk := range keys {
+		if man, err := m.readManifestAt(ctx, mk, volume); err == nil && man.Key == key {
+			return man.SHA256
+		}
+	}
+	return ""
+}
+
+// readManifest reads a volume's manifest: this host's, else the one in the layout without the host.
 func (m *Manager) readManifest(ctx context.Context, volume string) (*Manifest, error) {
-	rc, _, err := m.store.GetObject(ctx, m.manifestKey(volume))
+	if m.hostErr == nil {
+		man, err := m.readManifestAt(ctx, m.manifestKey(volume), volume)
+		if !errors.Is(err, ErrNoManifest) {
+			return man, err
+		}
+	}
+	return m.readManifestAt(ctx, m.legacyManifestKey(volume), volume)
+}
+
+func (m *Manager) readManifestAt(ctx context.Context, key, volume string) (*Manifest, error) {
+	rc, _, err := m.store.GetObject(ctx, key)
 	if errors.Is(err, s3.ErrNotFound) {
 		return nil, ErrNoManifest
 	}
@@ -400,7 +520,7 @@ func sha256Hex(b []byte) string {
 }
 
 // selectPrune returns the object keys that fall outside the retention policy.
-func selectPrune(keys []string, daily, monthly int, now time.Time) []string {
+func selectPrune(keys []string, daily, monthly, days int, now time.Time) []string {
 	type item struct {
 		key string
 		ts  time.Time
@@ -414,6 +534,17 @@ func selectPrune(keys []string, daily, monthly int, now time.Time) []string {
 	sort.Slice(items, func(i, j int) bool { return items[i].ts.After(items[j].ts) })
 
 	keep := map[string]bool{}
+	if len(items) > 0 {
+		keep[items[0].key] = true // the newest backup is never pruned
+	}
+	if days > 0 {
+		cutoff := now.Add(-time.Duration(days) * 24 * time.Hour)
+		for _, it := range items {
+			if it.ts.After(cutoff) {
+				keep[it.key] = true
+			}
+		}
+	}
 	for i := 0; i < len(items) && i < daily; i++ {
 		keep[items[i].key] = true
 	}

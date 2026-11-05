@@ -158,9 +158,9 @@ func observed(kind string, sim *hostSim, existedBefore bool) bool {
 	case ChangeSetLabels:
 		return has("incus config set", incus.LabelPrefix) || has("incus config unset", incus.LabelPrefix)
 	case ChangeSetEnv:
-		return has("incus file push", "/etc/default/")
+		return has("incus file push", "/etc/default/") || has("incus config set", "environment.")
 	case ChangeRestart:
-		return has("systemctl restart") && !strings.Contains(mut, "incus launch")
+		return (has("systemctl restart") || has("incus restart")) && !strings.Contains(mut, "incus launch")
 	case ChangePublishRoute, ChangeUpdateRoute:
 		return has("incus file push", "/etc/caddy/sites/")
 	case ChangeRunHook:
@@ -185,6 +185,10 @@ func TestPlanPredictsWhatApplyDoes(t *testing.T) {
 			sim.aliases["gitea:latest"] = fpA
 			return sim, newTestDeployer(sim), giteaSvc()
 		}, nil, false, []string{ChangeCreateInstance, ChangeCreateVolume, ChangeAttachVolume, ChangeSetEnv, ChangePublishRoute, ChangeRunHook, ChangeRunHook, ChangeRunHook}, ActionCreate},
+		{"an OCI container does not exist yet", func(t *testing.T) (*hostSim, *Deployer, *config.ServiceConfig) {
+			sim := newHostSim(t)
+			return sim, newTestDeployer(sim), &config.ServiceConfig{Name: "db", Image: "postgres:16", Env: map[string]string{"POSTGRES_DB": "app"}}
+		}, nil, false, []string{ChangeCreateInstance, ChangeSetEnv}, ActionCreate},
 		{"already converged", deployedGitea, nil, true, nil, ActionNone},
 		{"labels already match the manifest", deployedLabelledGitea, nil, true, nil, ActionNone},
 		{"labels were added to a service that had none", deployedGitea, func(sim *hostSim, svc *config.ServiceConfig) {
@@ -209,6 +213,16 @@ func TestPlanPredictsWhatApplyDoes(t *testing.T) {
 			svc.Env["GITEA_PORT"] = "3001"
 			svc.Env["NEW_KEY"] = "n"
 		}, true, []string{ChangeSetEnv, ChangeRestart}, ActionUpdate},
+		{"an OCI environment value changed and a key was added", deployedDB, func(sim *hostSim, svc *config.ServiceConfig) {
+			sim.ctrs["db"].config["volatile.container.oci"] = "true"
+			sim.ctrs["db"].config["environment.POSTGRES_DB"] = "old"
+			sim.ctrs["db"].config["environment.POSTGRES_PASSWORD"] = "keep-me"
+			svc.Env = map[string]string{"POSTGRES_DB": "app", "POSTGRES_USER": "app"}
+		}, true, []string{ChangeSetEnv, ChangeRestart}, ActionUpdate},
+		{"a route marked external is left to the hand-maintained Caddyfile", deployedGitea, func(sim *hostSim, svc *config.ServiceConfig) {
+			svc.Routing.External = true
+			delete(sim.ctrs["edge"].files, "/etc/caddy/sites/gitea.caddy")
+		}, true, nil, ActionNone},
 		{"a volume was added to the manifest", deployedGitea, func(sim *hostSim, svc *config.ServiceConfig) {
 			svc.Volumes = append(svc.Volumes, config.VolumeMount{Name: "gitea-repos", Path: "/srv/repos", Pool: "default", Shifted: true})
 		}, true, []string{ChangeCreateVolume, ChangeAttachVolume}, ActionUpdate},
@@ -356,6 +370,48 @@ func TestPlanFlagsWhatApplyWouldRefuse(t *testing.T) {
 	})
 }
 
+func TestUsesOCIEnv(t *testing.T) {
+	if !usesOCIEnv(nil, "docker:postgres:16") || !usesOCIEnv(nil, "quay:minio/minio:latest") {
+		t.Fatal("a docker: or quay: reference is an OCI environment")
+	}
+	if usesOCIEnv(nil, "images:ubuntu/24.04") || usesOCIEnv(nil, fpA) {
+		t.Fatal("an images: reference or a fingerprint is a system container")
+	}
+	if !usesOCIEnv(&incus.InstanceState{OCI: true, Config: map[string]string{}}, fpA) {
+		t.Fatal("the live OCI marker counts")
+	}
+	recorded := &incus.InstanceState{Config: map[string]string{incus.ImageKey: "docker:outline:1"}}
+	if !usesOCIEnv(recorded, fpA) {
+		t.Fatal("a recorded docker: image counts")
+	}
+	liveKey := &incus.InstanceState{Config: map[string]string{"environment.POSTGRES_PASSWORD": "x"}}
+	if !usesOCIEnv(liveKey, fpA) {
+		t.Fatal("any live environment.* key counts")
+	}
+}
+
+func TestExternalRouteDoesNotNeedAnAddress(t *testing.T) {
+	sim, d, svc := deployedGitea(t)
+	svc.HealthCheck = config.HealthCheckConfig{}
+	svc.Routing.External = true
+	sim.ctrs["gitea"].status, sim.ctrs["gitea"].ip = "Stopped", ""
+	delete(sim.ctrs["edge"].files, "/etc/caddy/sites/gitea.caddy")
+	p := plan(t, sim, svc)
+	if p.Action != ActionNone || len(p.Blockers) != 0 || len(p.Changes) != 0 {
+		t.Fatalf("an external route is not published and does not need an address: %+v", p)
+	}
+	sim.reset()
+	if err := d.DeployService(context.Background(), svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if m := sim.mutations(); len(m) != 0 {
+		t.Fatalf("apply must not publish a site file: %v", m)
+	}
+	if _, ok := sim.ctrs["edge"].files["/etc/caddy/sites/gitea.caddy"]; ok {
+		t.Fatal("the site file must stay absent")
+	}
+}
+
 func TestPlanNotesWhatApplyWillNotAct_On(t *testing.T) {
 	t.Run("an image that cannot be identified", func(t *testing.T) {
 		sim, _, svc := deployedGitea(t)
@@ -371,15 +427,6 @@ func TestPlanNotesWhatApplyWillNotAct_On(t *testing.T) {
 		p := plan(t, sim, svc)
 		if p.Action != ActionNone || !strings.Contains(strings.Join(p.Notes, " "), "profiles of gitea differ") {
 			t.Fatalf("got %+v", p)
-		}
-	})
-	t.Run("an OCI container that reads environment.* config, not /etc/default", func(t *testing.T) {
-		sim, _, _ := deployedDB(t)
-		sim.ctrs["db"].config["environment.POSTGRES_PASSWORD"] = "x"
-		svc := &config.ServiceConfig{Name: "db", Image: "postgres:16", Env: map[string]string{"POSTGRES_DB": "app"}}
-		p := plan(t, sim, svc)
-		if !strings.Contains(strings.Join(p.Notes, " "), "environment.*") {
-			t.Fatalf("this is the gap that would silently do nothing useful: %+v", p)
 		}
 	})
 }
@@ -412,6 +459,32 @@ func TestPlanNeverContainsAnEnvironmentValue(t *testing.T) {
 	p2 := plan(t, fresh, svc2)
 	if strings.Contains((&FleetPlan{Services: []*ServicePlan{p2}}).Render(), "SENTINEL-DECLARED-91bc") {
 		t.Fatal("a create plan leaked an env value")
+	}
+
+	ociSim, _, ociSvc := deployedDB(t)
+	ociSim.ctrs["db"].config["environment.POSTGRES_PASSWORD"] = "SENTINEL-OCI-LIVE-a1b2"
+	ociSim.ctrs["db"].config["environment.POSTGRES_DB"] = "old"
+	ociSvc.Env = map[string]string{"POSTGRES_DB": "SENTINEL-OCI-DECLARED-c3d4", "POSTGRES_USER": "app"}
+	op := plan(t, ociSim, ociSvc)
+	otext := (&FleetPlan{Services: []*ServicePlan{op}}).Render()
+	ojs, _ := json.Marshal(op)
+	for _, secret := range []string{"SENTINEL-OCI-LIVE-a1b2", "SENTINEL-OCI-DECLARED-c3d4"} {
+		if strings.Contains(otext, secret) || strings.Contains(string(ojs), secret) {
+			t.Fatalf("the OCI plan leaked %s:\n%s", secret, otext)
+		}
+	}
+	od := detailOf(op, ChangeSetEnv)
+	if !strings.Contains(od, "environment.*") || !strings.Contains(od, "add POSTGRES_USER") || !strings.Contains(od, "change POSTGRES_DB") || !strings.Contains(od, "1 keys the manifest does not declare are kept") || strings.Contains(od, "/etc/default") {
+		t.Fatalf("OCI plan detail: %q", od)
+	}
+
+	freshOCI := newHostSim(t)
+	p3 := plan(t, freshOCI, &config.ServiceConfig{Name: "db", Image: "postgres:16", Env: map[string]string{"POSTGRES_DB": "SENTINEL-OCI-DECLARED-c3d4"}})
+	if strings.Contains((&FleetPlan{Services: []*ServicePlan{p3}}).Render(), "SENTINEL-OCI-DECLARED-c3d4") {
+		t.Fatal("a create plan leaked an OCI env value")
+	}
+	if d := detailOf(p3, ChangeSetEnv); !strings.Contains(d, "environment.*") || strings.Contains(d, "/etc/default") {
+		t.Fatalf("a fresh OCI container is environment.*: %q", d)
 	}
 }
 

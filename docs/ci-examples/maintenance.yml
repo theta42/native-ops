@@ -28,6 +28,8 @@ jobs:
       # Needs the daemon started with --enable-backup, and the backup keys and pins synced to it by an
       # admin (native-ops remote secret-sync; see docs/daemon.md). DNS records need no schedule: they are
       # part of the plan and change with a deploy tag.
+      # Or leave this step out and set backup.schedule in fleet.yml: the daemon then runs the same job on
+      # that schedule by itself (README, "Scheduled snapshots and backups").
       - name: Back up volumes and apply retention
         env:
           NATIVE_OPS_TOKEN: ${{ secrets.NATIVE_OPS_TOKEN }}

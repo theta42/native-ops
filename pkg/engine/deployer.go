@@ -204,21 +204,150 @@ func readEnvState(ctx context.Context, ic *incus.Client, container, service stri
 	if found {
 		liveEnv = incus.ParseEnv(live)
 	}
-	merged, differs := incus.MergeEnv(liveEnv, declared)
+	return diffEnv(found, liveEnv, declared), nil
+}
+
+// ociLiveEnv is the environment.* config of an instance, without the prefix.
+func ociLiveEnv(st *incus.InstanceState) map[string]string {
+	live := map[string]string{}
+	if st == nil {
+		return live
+	}
+	for k, v := range st.Config {
+		if key, ok := strings.CutPrefix(k, "environment."); ok {
+			live[key] = v
+		}
+	}
+	return live
+}
+
+// diffEnv is what converging declared onto live would change. Values are kept for the write; the
+// names in Added and Changed are what a plan may print.
+func diffEnv(found bool, live, declared map[string]string) *envState {
+	merged, differs := incus.MergeEnv(live, declared)
 	st := &envState{Found: found, Merged: merged, Differs: differs}
 	for _, k := range sortedKeys(declared) {
-		if cur, ok := liveEnv[k]; !ok {
+		if cur, ok := live[k]; !ok {
 			st.Added = append(st.Added, k)
 		} else if cur != declared[k] {
 			st.Changed = append(st.Changed, k)
 		}
 	}
-	for k := range liveEnv {
+	for k := range live {
 		if _, ok := declared[k]; !ok {
 			st.Kept++
 		}
 	}
-	return st, nil
+	return st
+}
+
+// envChangeDetail is the plan text for an environment change. Key names only, never values.
+func envChangeDetail(svc *config.ServiceConfig, es *envState, missing bool) string {
+	var parts []string
+	if missing {
+		parts = append(parts, "the file does not exist yet")
+	}
+	if len(es.Added) > 0 {
+		parts = append(parts, "add "+strings.Join(envKeyLabels(svc, es.Added), ", "))
+	}
+	if len(es.Changed) > 0 {
+		parts = append(parts, "change "+strings.Join(envKeyLabels(svc, es.Changed), ", "))
+	}
+	if es.Kept > 0 {
+		parts = append(parts, fmt.Sprintf("%d keys the manifest does not declare are kept", es.Kept))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// routeManaged reports whether native-ops publishes this service's site file. A route marked external is
+// served by the hand-maintained Caddyfile, and publishing a site file would shadow it.
+func routeManaged(svc *config.ServiceConfig) bool {
+	return svc.Routing != nil && !svc.Routing.External && svc.Routing.Domain != ""
+}
+
+// ociImageRef reports whether ref is an OCI remote (Docker Hub or Quay). Those containers read
+// environment.* instance config. A local alias or an images: reference is a system container.
+func ociImageRef(ref string) bool {
+	return strings.HasPrefix(ref, "docker:") || strings.HasPrefix(ref, "quay:")
+}
+
+// usesOCIEnv reports whether this instance's environment is environment.* rather than /etc/default.
+// The image reference, the recorded image, the OCI marker, or any live environment.* key is enough.
+func usesOCIEnv(st *incus.InstanceState, deployRef string) bool {
+	if ociImageRef(deployRef) {
+		return true
+	}
+	if st == nil {
+		return false
+	}
+	if st.OCI || ociImageRef(st.Config[incus.ImageKey]) {
+		return true
+	}
+	for k := range st.Config {
+		if strings.HasPrefix(k, "environment.") {
+			return true
+		}
+	}
+	return false
+}
+
+// applyEnv writes the declared environment where this instance reads it, and restarts so it is picked up.
+// A system container gets /etc/default/<unit> and a systemd restart. An OCI container gets environment.*
+// and an instance restart. Keys the manifest does not declare are left as they are. changed is false when
+// nothing differed. st may be nil (a fresh launch, or a replacement whose state must be read again).
+func (d *Deployer) applyEnv(ctx context.Context, svc *config.ServiceConfig, deployRef string, st *incus.InstanceState, declared map[string]string) (bool, error) {
+	if len(declared) == 0 {
+		return false, nil
+	}
+	if usesOCIEnv(st, deployRef) {
+		if st == nil {
+			var err error
+			st, err = d.incus.CaptureInstanceState(ctx, svc.Name)
+			if err != nil {
+				return false, err
+			}
+		}
+		changed, err := ensureOCIEnv(ctx, d.incus, svc.Name, st, declared)
+		if err != nil || !changed {
+			return changed, err
+		}
+		if err := d.incus.RestartInstance(ctx, svc.Name); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	changed, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), declared)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if err := d.incus.RestartService(ctx, svc.Name, svc.Unit()); err != nil {
+		if st == nil {
+			// A unit that is not enabled yet is reported; the health gate is what decides the launch.
+			d.log("    WARNING: %v\n", err)
+			return true, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// ensureOCIEnv sets environment.<KEY> for declared keys that are missing or different. Other
+// environment.* keys stay. Nothing is written when the declared keys already match.
+func ensureOCIEnv(ctx context.Context, ic *incus.Client, name string, st *incus.InstanceState, declared map[string]string) (bool, error) {
+	live := ociLiveEnv(st)
+	if _, differs := incus.MergeEnv(live, declared); !differs {
+		return false, nil
+	}
+	set := map[string]string{}
+	for k, v := range declared {
+		if cur, ok := live[k]; !ok || cur != v {
+			set[k] = v
+		}
+	}
+	if err := ic.SetEnvironment(ctx, name, set); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ensureEnv converges /etc/default/<service> to the declared environment:
@@ -358,6 +487,9 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 			return fmt.Errorf("ensure volume %s: %w", vol.Name, err)
 		}
 	}
+	if _, err := d.ensureVolumeSnapshots(ctx, svc.Volumes, configDir); err != nil {
+		return err
+	}
 	if svc.Hooks.PreDeploy != "" {
 		d.log("    Running pre-deploy hook for %s...\n", svc.Name)
 		if err := d.runHostHook(ctx, "pre-deploy", svc.Name, hookScript(configDir, svc.Name, svc.Hooks.PreDeploy)); err != nil {
@@ -411,13 +543,10 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 	if err != nil {
 		return err
 	}
-	if changed, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), freshEnv); err != nil {
-		return fmt.Errorf("write env file: %w", err)
+	if changed, err := d.applyEnv(ctx, svc, deployRef, nil, freshEnv); err != nil {
+		return err
 	} else if changed {
-		d.log("    Wrote /etc/default/%s\n", svc.Unit())
-		if err := d.incus.RestartService(ctx, svc.Name, svc.Unit()); err != nil {
-			d.log("    WARNING: %v\n", err)
-		}
+		d.log("    Environment for %s is in place\n", svc.Name)
 	}
 
 	ip, err := d.incus.GetContainerIP(ctx, svc.Name)
@@ -473,7 +602,7 @@ func (d *Deployer) checkHealth(ctx context.Context, svc *config.ServiceConfig, i
 }
 
 func (d *Deployer) publishRoute(ctx context.Context, svc *config.ServiceConfig, preferredIP string) error {
-	if svc.Routing == nil || svc.Routing.Domain == "" {
+	if !routeManaged(svc) {
 		return nil
 	}
 	ips, err := d.candidateIPs(ctx, svc.Name, preferredIP)
@@ -596,12 +725,8 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 			}
 		}
 		// The replacement carries the live env over; now apply what the manifest declares.
-		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), declaredEnv); err != nil {
+		if _, err := d.applyEnv(ctx, svc, deployRef, nil, declaredEnv); err != nil {
 			return err
-		} else if envChanged {
-			if err := d.incus.RestartService(ctx, svc.Name, svc.Unit()); err != nil {
-				return err
-			}
 		}
 	} else {
 		// Labels apply live, no restart.
@@ -634,13 +759,10 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 				}
 			}
 		}
-		if envChanged, err := ensureEnv(ctx, d.incus, svc.Name, svc.Unit(), declaredEnv); err != nil {
+		if envChanged, err := d.applyEnv(ctx, svc, deployRef, st, declaredEnv); err != nil {
 			return err
 		} else if envChanged {
-			d.log("    Environment changed; restarting %s\n", svc.Unit())
-			if err := d.incus.RestartService(ctx, svc.Name, svc.Unit()); err != nil {
-				return err
-			}
+			d.log("    Environment changed; restarted %s\n", svc.Name)
 			changed = true
 		}
 		if !sameProfiles(st.Profiles, d.profilesOf(svc)) {
@@ -655,6 +777,13 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 				return err
 			}
 		}
+	}
+
+	// Scheduled snapshots are the volumes' own config (Incus takes and expires them).
+	if snapChanged, err := d.ensureVolumeSnapshots(ctx, svc.Volumes, configDir); err != nil {
+		return err
+	} else if snapChanged {
+		changed = true
 	}
 
 	// Re-publish the declared host ports, so a forward added to the manifest (or one lost with a

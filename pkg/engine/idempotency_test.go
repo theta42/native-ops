@@ -25,6 +25,7 @@ type hostSim struct {
 	t       *testing.T
 	ctrs    map[string]*simCtr
 	volumes map[string]bool
+	volCfg  map[string]map[string]string // a volume's config keys (snapshots.*), by volume name
 	aliases map[string]string
 	cmds    []string
 	hooks   []string // host hook scripts executed, in order
@@ -53,7 +54,7 @@ type simCtr struct {
 var _ remote.Executor = (*hostSim)(nil)
 
 func newHostSim(t *testing.T) *hostSim {
-	s := &hostSim{t: t, ctrs: map[string]*simCtr{}, volumes: map[string]bool{}, aliases: map[string]string{}, nextIP: 30}
+	s := &hostSim{t: t, ctrs: map[string]*simCtr{}, volumes: map[string]bool{}, volCfg: map[string]map[string]string{}, aliases: map[string]string{}, nextIP: 30}
 	s.ctrs["edge"] = &simCtr{status: "Running", config: map[string]string{}, devices: map[string]map[string]string{}, profiles: []string{"default"},
 		files: map[string]string{"/etc/caddy/Caddyfile": "import /etc/caddy/sites/*.caddy\n"}, ip: "10.0.100.10"}
 	return s
@@ -74,7 +75,7 @@ var (
 	// then -- only when it differs -- a chown to the one asked for.
 	simStatRe    = regexp.MustCompile(`^stat -c %U '([^']*)'$`)
 	simChownRe   = regexp.MustCompile(`^chown '([^']*)' '([^']*)'$`)
-	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|unset|device add|device override|device remove) |^incus storage volume (create|snapshot create) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
+	simMutatorRe = regexp.MustCompile(`^incus (launch|delete|stop|start|restart) |^incus config (set|unset|device add|device override|device remove) |^incus storage volume (create|snapshot create|set|unset) |incus file push|systemctl restart|caddy reload|rm -f '/etc/caddy|ip addr add|\| bash$|-- bash$|-- chown `)
 )
 
 func (s *hostSim) get(name string) (*simCtr, bool) { c, ok := s.ctrs[name]; return c, ok }
@@ -122,9 +123,36 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		}}}})
 		return string(b), nil
 	case strings.HasPrefix(cmd, "incus storage volume show "):
-		if !s.volumes[q[len(q)-1][1]] {
+		name := q[len(q)-1][1]
+		if !s.volumes[name] {
 			return "", errors.New("Error: Storage volume not found")
 		}
+		var sb strings.Builder
+		sb.WriteString("config:\n")
+		keys := sortedKeys(s.volCfg[name])
+		for _, k := range keys {
+			fmt.Fprintf(&sb, "  %s: %q\n", k, s.volCfg[name][k])
+		}
+		if len(keys) == 0 {
+			sb.Reset()
+			sb.WriteString("config: {}\n")
+		}
+		fmt.Fprintf(&sb, "name: %s\ntype: custom\n", name)
+		return sb.String(), nil
+	case strings.HasPrefix(cmd, "incus storage volume set "):
+		if !s.volumes[arg(1)] {
+			return "", errors.New("Error: Storage volume not found")
+		}
+		if s.volCfg[arg(1)] == nil {
+			s.volCfg[arg(1)] = map[string]string{}
+		}
+		k, v, _ := strings.Cut(arg(2), "=")
+		s.volCfg[arg(1)][k] = v
+	case strings.HasPrefix(cmd, "incus storage volume unset "):
+		if !s.volumes[arg(1)] {
+			return "", errors.New("Error: Storage volume not found")
+		}
+		delete(s.volCfg[arg(1)], arg(2))
 	case strings.HasPrefix(cmd, "incus storage volume create "):
 		s.volumes[q[len(q)-1][1]] = true
 	case strings.HasPrefix(cmd, "incus storage volume delete "):
@@ -233,6 +261,13 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		} else if c, ok := s.get(name); ok {
 			c.status = "Stopped"
 		}
+	case strings.HasPrefix(cmd, "incus restart "):
+		c, ok := s.get(arg(0))
+		if !ok {
+			return "", errors.New("Error: Instance not found")
+		}
+		c.status = "Running"
+		c.restarts++
 	case simPullRe.MatchString(cmd):
 		m := simPullRe.FindStringSubmatch(cmd)
 		c, ok := s.get(m[1])
@@ -300,9 +335,42 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 }
 func (s *hostSim) RunWithInput(ctx context.Context, cmd string, in io.Reader) (string, error) {
 	b, _ := io.ReadAll(in)
-	s.stdin = string(b)
+	body := string(b)
+	// An OCI environment write is a bash -s script of `incus config set` lines, so the value stays
+	// off the command that CommandHead records. Apply those lines. Any other script is a hook.
+	if cmd == "bash -s" {
+		if lines, ok := ociEnvScript(body); ok {
+			var last string
+			var err error
+			for _, line := range lines {
+				last, err = s.Run(ctx, line)
+				if err != nil {
+					return last, err
+				}
+			}
+			return last, nil
+		}
+	}
+	s.stdin = body
 	defer func() { s.stdin = "" }()
 	return s.Run(ctx, cmd)
+}
+
+// ociEnvScript is the lines of a SetEnvironment script. Anything else (a host hook that happens to
+// mention incus) is left for the hook path.
+func ociEnvScript(body string) ([]string, bool) {
+	var lines []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "incus config set ") || !strings.Contains(line, "environment.") {
+			return nil, false
+		}
+		lines = append(lines, line)
+	}
+	return lines, len(lines) > 0
 }
 func (s *hostSim) WriteFile(context.Context, string, []byte, os.FileMode) error { return nil }
 func (s *hostSim) Close() error                                                 { return nil }
@@ -558,6 +626,37 @@ func TestApplyReplacesThroughTheSafeUpdatePathWhenTheImageMoves(t *testing.T) {
 	}
 	if m := sim.mutations(); len(m) != 0 {
 		t.Fatalf("the run after the replace must change nothing:\n%s", strings.Join(m, "\n"))
+	}
+}
+
+func TestApplyOCIEnvironmentConvergesAndLeavesUndeclaredKeys(t *testing.T) {
+	sim, d, svc := deployedDB(t)
+	sim.ctrs["db"].config["volatile.container.oci"] = "true"
+	sim.ctrs["db"].config["environment.POSTGRES_DB"] = "old"
+	sim.ctrs["db"].config["environment.POSTGRES_PASSWORD"] = "keep-me"
+	svc.Env = map[string]string{"POSTGRES_DB": "app", "POSTGRES_USER": "app"}
+	ctx := context.Background()
+
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	c := sim.ctrs["db"]
+	if c.config["environment.POSTGRES_DB"] != "app" || c.config["environment.POSTGRES_USER"] != "app" || c.config["environment.POSTGRES_PASSWORD"] != "keep-me" {
+		t.Fatalf("declared keys converge and the undeclared one stays: %v", c.config)
+	}
+	if _, wrote := c.files["/etc/default/db"]; wrote || sim.count("systemctl restart") != 0 {
+		t.Fatalf("an OCI container has no unit and no /etc/default file: files=%v\n%s", c.files, strings.Join(sim.mutations(), "\n"))
+	}
+	if c.restarts != 1 || sim.count("incus restart") != 1 {
+		t.Fatalf("a changed environment restarts the instance once: restarts=%d\n%s", c.restarts, strings.Join(sim.mutations(), "\n"))
+	}
+
+	sim.reset()
+	if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if m := sim.mutations(); len(m) != 0 || c.restarts != 1 {
+		t.Fatalf("the second apply must issue no mutating command:\n%s", strings.Join(m, "\n"))
 	}
 }
 
