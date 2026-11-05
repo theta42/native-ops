@@ -597,13 +597,22 @@ func loadBackupStoreWith(configDir string, exec remote.Executor) (*backup.Manage
 	if fleet.Backup == nil {
 		return nil, fmt.Errorf("no 'backup:' section in %s/fleet.yml", configDir)
 	}
-	return backupManagerFor(fleet.Backup, exec, os.Getenv)
+	return backupManagerFor(fleet.Backup, exec, os.Getenv, backupHostName())
 }
 
-// backupManagerFor builds a backup manager for a backup section, reading the keys with get.
-func backupManagerFor(cfg *config.BackupConfig, exec remote.Executor, get func(string) string) (*backup.Manager, error) {
+// backupHostName is the host name in this host's backup object keys (<prefix>/<host>/<volume>/...):
+// NATIVE_OPS_HOST_NAME, else (empty) the OS host name. The CLI and the daemon on one host read the same
+// value, so they find each other's backups.
+func backupHostName() string { return strings.TrimSpace(os.Getenv("NATIVE_OPS_HOST_NAME")) }
+
+// backupManagerFor builds a backup manager for a backup section, reading the keys with get. host is the
+// host name in the object keys ("" falls back to the OS host name).
+func backupManagerFor(cfg *config.BackupConfig, exec remote.Executor, get func(string) string, host string) (*backup.Manager, error) {
 	if err := cfg.ValidateForBackup(); err != nil {
 		return nil, err
+	}
+	if host != "" {
+		cfg.HostName = host
 	}
 	access, secret, err := cfg.CredentialsFrom(get)
 	if err != nil {

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // CreateVolumeSnapshot creates a named snapshot of a custom volume.
@@ -159,6 +161,52 @@ func (c *Client) StartContainer(ctx context.Context, name string) error {
 	_, err := c.exec.Run(ctx, fmt.Sprintf("incus start %s", ShQuote(name)))
 	if err != nil && !strings.Contains(err.Error(), "already running") {
 		return fmt.Errorf("start %s: %w", name, err)
+	}
+	return nil
+}
+
+// VolumeConfig returns a custom volume's config keys (`incus storage volume show`), and whether the
+// volume exists. Only "not found" means absent; any other failure is an error.
+func (c *Client) VolumeConfig(ctx context.Context, pool, volume string) (map[string]string, bool, error) {
+	if pool == "" {
+		pool = "default"
+	}
+	if !ValidName(pool) || !ValidName(volume) {
+		return nil, false, fmt.Errorf("invalid pool/volume name %q/%q", pool, volume)
+	}
+	out, err := c.exec.Run(ctx, fmt.Sprintf("incus storage volume show %s %s", ShQuote(pool), ShQuote(volume)))
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("look up volume %s on pool %s: %w", volume, pool, err)
+	}
+	var doc struct {
+		Config map[string]string `yaml:"config"`
+	}
+	if err := yaml.Unmarshal([]byte(out), &doc); err != nil {
+		return nil, true, fmt.Errorf("parse volume %s on pool %s: %w", volume, pool, err)
+	}
+	if doc.Config == nil {
+		doc.Config = map[string]string{}
+	}
+	return doc.Config, true, nil
+}
+
+// SetVolumeConfig sets one config key of a custom volume, or unsets it when value is empty.
+func (c *Client) SetVolumeConfig(ctx context.Context, pool, volume, key, value string) error {
+	if pool == "" {
+		pool = "default"
+	}
+	if !ValidName(pool) || !ValidName(volume) || !ValidName(key) {
+		return fmt.Errorf("invalid pool/volume/key %q/%q/%q", pool, volume, key)
+	}
+	cmd := fmt.Sprintf("incus storage volume set %s %s %s", ShQuote(pool), ShQuote(volume), ShQuote(key+"="+value))
+	if value == "" {
+		cmd = fmt.Sprintf("incus storage volume unset %s %s %s", ShQuote(pool), ShQuote(volume), ShQuote(key))
+	}
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("set %s on volume %s/%s: %w", key, pool, volume, err)
 	}
 	return nil
 }

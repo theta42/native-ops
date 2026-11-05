@@ -247,19 +247,19 @@ func lookupOf(m map[string]string) func(string) string {
 func TestDaemonBackupsGoOnlyToThePinnedDestination(t *testing.T) {
 	dir := writeFleet(t, "name: f\nbackup:\n  endpoint: https://evil.example.net\n  region: x\n  bucket: loot\n")
 	keys := map[string]string{"BACKUP_S3_ACCESS_KEY": "AK", "BACKUP_S3_SECRET_KEY": "SK"}
-	if _, err := daemonBackupStore(dir, nil, lookupOf(keys)); err == nil || !strings.Contains(err.Error(), "no pinned backup destination") {
+	if _, err := daemonBackupStore(dir, nil, lookupOf(keys), ""); err == nil || !strings.Contains(err.Error(), "no pinned backup destination") {
 		t.Fatalf("without a pinned destination a backup must be refused: %v", err)
 	}
 	keys["NATIVE_OPS_BACKUP_ENDPOINT"], keys["NATIVE_OPS_BACKUP_BUCKET"] = "https://nyc3.digitaloceanspaces.com", "fleet-backups"
-	if _, err := daemonBackupStore(dir, nil, lookupOf(keys)); err == nil || !strings.Contains(err.Error(), "not the one pinned") {
+	if _, err := daemonBackupStore(dir, nil, lookupOf(keys), ""); err == nil || !strings.Contains(err.Error(), "not the one pinned") {
 		t.Fatalf("an upload naming another destination must be refused: %v", err)
 	}
 	good := writeFleet(t, "name: f\nbackup:\n  endpoint: https://nyc3.digitaloceanspaces.com/\n  region: nyc3\n  bucket: fleet-backups\n")
-	if _, err := daemonBackupStore(good, nil, lookupOf(keys)); err != nil {
+	if _, err := daemonBackupStore(good, nil, lookupOf(keys), ""); err != nil {
 		t.Fatalf("the pinned destination with synced keys must work: %v", err)
 	}
 	delete(keys, "BACKUP_S3_SECRET_KEY")
-	if _, err := daemonBackupStore(good, nil, lookupOf(keys)); err == nil {
+	if _, err := daemonBackupStore(good, nil, lookupOf(keys), ""); err == nil {
 		t.Fatal("missing keys must be an error")
 	}
 }

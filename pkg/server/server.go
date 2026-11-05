@@ -82,6 +82,9 @@ type Options struct {
 	// POST /v1/backups and POST /v1/backups/restore.
 	Backup  BackupFunc
 	Restore RestoreFunc
+	// BackupScheduleDir, with Backup and Jobs, is where the daemon keeps the backup schedule a deploy
+	// tag's fleet.yml declared (backup.schedule); RunBackupSchedule runs it (see backup_schedule.go).
+	BackupScheduleDir string
 	// Users, with Sessions, enables local sign-in for the UI (POST /api/login, GET /api/session). OIDC,
 	// with Sessions, adds a generic OpenID Connect sign-in. Either way a signed-in person may call the
 	// API with a session cookie instead of a pasted token; API tokens keep working unchanged.
@@ -114,6 +117,7 @@ type Server struct {
 	// eventPending bounds the event connections still waiting for a token.
 	eventPending chan struct{}
 	jobsWG       sync.WaitGroup
+	sched        backupSched // the scheduled off-host backup (backup_schedule.go)
 }
 
 func New(opts Options) (*Server, error) {
