@@ -34,9 +34,20 @@ func GenerateCloudInitUserData(sshPubKey string) string {
 }
 
 // GenerateCloudInitUserDataWith is GenerateCloudInitUserData that also installs the native-ops daemon
-// when daemon is not nil (see DaemonInstall).
+// when daemon is not nil (see DaemonInstall). The host gets the default bridge (incusbr0).
 func GenerateCloudInitUserDataWith(sshPubKey string, daemon *DaemonInstall) (string, error) {
-	base := baseCloudInit(sshPubKey)
+	return GenerateCloudInitUserDataFor(sshPubKey, config.NetworkConfig{BridgeName: config.DefaultBridgeName, IPv4CIDR: config.DefaultIPv4CIDR}, daemon)
+}
+
+// GenerateCloudInitUserDataFor is GenerateCloudInitUserDataWith for a host whose instance bridge is
+// network (its `network:` in fleet.yml, see FleetConfig.HostNetwork): the firewall lets that bridge's
+// traffic in and through.
+func GenerateCloudInitUserDataFor(sshPubKey string, network config.NetworkConfig, daemon *DaemonInstall) (string, error) {
+	bridge, _, err := network.Bridge()
+	if err != nil {
+		return "", fmt.Errorf("network: %w", err)
+	}
+	base := baseCloudInit(sshPubKey, bridge)
 	if daemon == nil {
 		return base, nil
 	}
@@ -50,7 +61,7 @@ func GenerateCloudInitUserDataWith(sshPubKey string, daemon *DaemonInstall) (str
 	return base + section, nil
 }
 
-func baseCloudInit(sshPubKey string) string {
+func baseCloudInit(sshPubKey, bridge string) string {
 	var sb strings.Builder
 	sb.WriteString("#cloud-config\n")
 	sb.WriteString("chpasswd:\n  expire: false\n")
@@ -85,9 +96,9 @@ runcmd:
   # 2. Configure Firewall
   - ufw default deny incoming
   - ufw default allow outgoing
-  - ufw allow in on incusbr0
-  - ufw route allow in on incusbr0
-  - ufw route allow out on incusbr0
+  - ufw allow in on ` + bridge + `
+  - ufw route allow in on ` + bridge + `
+  - ufw route allow out on ` + bridge + `
   - ufw allow 22/tcp
   - ufw allow 80/tcp
   - ufw allow 443/tcp
