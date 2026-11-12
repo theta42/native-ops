@@ -231,6 +231,11 @@ func handleServeCommand(ctx context.Context, args []string) {
 	}
 	if managed.Managed {
 		log.Printf("flags from fleet.yml (applied by a deploy) replace the unit's: %s", managed.Text)
+		if kept, err := serveflags.PersistHostName(unitStateDir, args, managed.Args); err != nil {
+			log.Printf("could not keep the daemon's host name: %v", err)
+		} else if kept {
+			log.Printf("kept --host-name for this host in %s", unitStateDir)
+		}
 		args = serveflags.Merge(args, managed.Args, unitStateDir)
 	}
 

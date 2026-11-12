@@ -26,10 +26,11 @@ import (
 )
 
 const (
-	FileName     = "serve.flags"          // the committed set
-	PendingName  = "serve.flags.pending"  // a set a deploy staged; empty means "back to the unit's flags"
-	AttemptsName = "serve.flags.attempts" // how many times the pending set was started
-	MaxAttempts  = 3
+	FileName         = "serve.flags"          // the committed set
+	PendingName      = "serve.flags.pending"  // a set a deploy staged; empty means "back to the unit's flags"
+	AttemptsName     = "serve.flags.attempts" // how many times the pending set was started
+	HostNameFileName = "host-name"            // a host name kept from an applied set, like the unit's --host-name
+	MaxAttempts      = 3
 )
 
 // CommitAfter is how long a pending set must serve before it is committed (a variable for tests).
@@ -150,9 +151,10 @@ func Value(args []string, name string) (string, bool) {
 }
 
 // Merge is the command line a managed set runs with: the unit's --addr (unless the set has its own), the
-// set, then the unit's --host-name, if it has one, and its --state-dir, last, so the set can change neither
-// where the state is, nor which host the daemon is, nor, without saying so, where the daemon listens.
-// (fleet.yml's daemon.flags are the same for every host's daemon, so a host's name belongs on its unit.)
+// set, then a kept --host-name (unless the unit has one, which still wins), and the unit's --state-dir,
+// last, so the set can change neither where the state is, nor which host the daemon is, nor, without
+// saying so, where the daemon listens. (fleet.yml's daemon.flags are the same for every host's daemon,
+// so a host's name belongs on its unit — or in its state dir, kept from a set that named it.)
 func Merge(unitArgs, set []string, stateDir string) []string {
 	var out []string
 	if addr, ok := Value(unitArgs, "addr"); ok {
@@ -161,8 +163,46 @@ func Merge(unitArgs, set []string, stateDir string) []string {
 		}
 	}
 	out = append(out, set...)
+	if _, own := Value(unitArgs, "host-name"); !own {
+		if kept := keptHostName(stateDir); kept != "" {
+			out = append(out, "--host-name", kept)
+		}
+	}
 	if host, ok := Value(unitArgs, "host-name"); ok {
 		out = append(out, "--host-name", host)
 	}
 	return append(out, "--state-dir", stateDir)
+}
+
+// keptHostName is the host name kept in the state dir, or "" when there is none or it is not a single
+// name (an empty or multi-word file is ignored, never guessed from).
+func keptHostName(stateDir string) string {
+	b, err := os.ReadFile(filepath.Join(stateDir, HostNameFileName))
+	if err != nil {
+		return ""
+	}
+	if f := strings.Fields(string(b)); len(f) == 1 {
+		return f[0]
+	}
+	return ""
+}
+
+// PersistHostName keeps the applied set's host name in the state dir when the unit has none, so a later
+// set without the flag (or none) keeps it. It reports whether it wrote. A unit flag, a missing or
+// multi-word set name, or no name at all means nothing to keep. A set carries --host-name only while
+// the fleet has the single host it names (ValidateHosts refuses it otherwise), so a written name is
+// always that fleet's one host.
+func PersistHostName(stateDir string, unitArgs, setArgs []string) (bool, error) {
+	if _, ok := Value(unitArgs, "host-name"); ok {
+		return false, nil
+	}
+	name, ok := Value(setArgs, "host-name")
+	if !ok || len(strings.Fields(name)) != 1 {
+		return false, nil
+	}
+	name = strings.Fields(name)[0]
+	if err := os.WriteFile(filepath.Join(stateDir, HostNameFileName), []byte(name+"\n"), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
 }
