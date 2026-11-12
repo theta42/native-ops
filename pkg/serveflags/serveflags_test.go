@@ -114,3 +114,59 @@ func TestValueAndMerge(t *testing.T) {
 		t.Fatalf("a unit without a host name takes the set's: %q", v)
 	}
 }
+
+// A host name the daemon kept in <state-dir>/host-name acts like the unit's: a later set without the
+// flag keeps it, and it wins over the set's, while the unit's own flag still wins over both.
+func TestMergeKeepsAHostNameFromTheStateDirFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, HostNameFileName), []byte("host-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := Merge([]string{"--state-dir", dir}, []string{"--enable-apply"}, dir)
+	if want := []string{"--enable-apply", "--host-name", "host-a", "--state-dir", dir}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("the kept host name is kept: %v", got)
+	}
+	// The unit's flag still wins over the kept one, and the kept one over the set's.
+	unit := []string{"--host-name", "host-b", "--state-dir", dir}
+	if v, _ := Value(Merge(unit, []string{"--enable-apply"}, dir), "host-name"); v != "host-b" {
+		t.Fatalf("the unit's host name wins over the kept one: %q", v)
+	}
+	if v, _ := Value(Merge(nil, []string{"--host-name", "host-c"}, dir), "host-name"); v != "host-a" {
+		t.Fatalf("the kept host name wins over the set's: %q", v)
+	}
+	// An empty or multi-word file is ignored, never guessed from.
+	empty := t.TempDir()
+	if err := os.WriteFile(filepath.Join(empty, HostNameFileName), []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := Value(Merge(nil, []string{"--enable-apply"}, empty), "host-name"); v != "" {
+		t.Fatalf("an empty kept name is ignored: %q", v)
+	}
+	if err := os.WriteFile(filepath.Join(empty, HostNameFileName), []byte("host-a host-b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := Value(Merge(nil, []string{"--enable-apply"}, empty), "host-name"); v != "" {
+		t.Fatalf("a multi-word kept name is ignored: %q", v)
+	}
+}
+
+func TestPersistHostNameWritesTheSetsName(t *testing.T) {
+	dir := t.TempDir()
+	ok, err := PersistHostName(dir, nil, []string{"--host-name", "host-a"})
+	if err != nil || !ok {
+		t.Fatalf("a set's host name with no unit flag is kept: %v %v", ok, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, HostNameFileName)); string(b) != "host-a\n" {
+		t.Fatalf("the kept file: %q", b)
+	}
+	// The unit's own flag means there is nothing to keep.
+	ok, err = PersistHostName(dir, []string{"--host-name", "host-b"}, []string{"--host-name", "host-a"})
+	if err != nil || ok {
+		t.Fatalf("a unit flag means nothing to keep: %v %v", ok, err)
+	}
+	// No name anywhere means nothing to keep.
+	ok, err = PersistHostName(dir, nil, []string{"--enable-apply"})
+	if err != nil || ok {
+		t.Fatalf("no host name means nothing to keep: %v %v", ok, err)
+	}
+}
