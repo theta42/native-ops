@@ -117,6 +117,10 @@ var reasonRe = regexp.MustCompile(`[^A-Za-z0-9 .,:;'()/@+_-]`)
 
 const maxReasonChars = 120
 
+// suspendedMarker is the stable part of a suspended site's body (RenderSuspendedSiteBlock): a site file
+// carrying it is a 503, not a route, so a plan can tell "already suspended" from "still published".
+const suspendedMarker = "This site is suspended:"
+
 // SanitizeSuspendReason narrows reason to a safe, printable allowlist for use inside a Caddy site file.
 // Never empty: a reason that sanitizes away to nothing becomes "suspended".
 func SanitizeSuspendReason(reason string) string {
@@ -564,6 +568,20 @@ func optionFor(module string) string {
 		return "cache"
 	}
 	return "rate_limit"
+}
+
+// SiteState reports whether a site file is published for siteName and, when it is, whether it is the
+// suspended form (a static 503) rather than a route to an upstream. A plan for a paused service uses it
+// so that "suspend the route" is proposed once and then reads as done.
+func (e *EdgeManager) SiteState(ctx context.Context, siteName string) (exists, suspended bool, err error) {
+	if !incus.ValidName(siteName) {
+		return false, false, fmt.Errorf("invalid site name %q", siteName)
+	}
+	content, found, err := e.incus.PullFile(ctx, e.edgeContainer, sitePathFor(siteName))
+	if err != nil || !found {
+		return found, false, err
+	}
+	return true, strings.Contains(content, suspendedMarker), nil
 }
 
 // RemoveSite deletes a site file and reloads Caddy. Removing a site that is not

@@ -552,6 +552,12 @@ type ServiceConfig struct {
 	// that host's daemon plans and applies it (see FleetConfig.DaemonHost); the others show it as skipped.
 	// json omitempty: a manifest without host: digests (bindOf) exactly as it did before the field existed.
 	Host string `yaml:"host,omitempty" json:",omitempty"`
+	// Paused declares a service deliberately out of service without deleting it: apply stops its instance
+	// and answers its route with a 503, and converges nothing else about it. A paused service never blocks
+	// a plan (a stopped instance has no IPv4 address, which is what used to block whole deploys) and a
+	// moved `:latest` does not roll it. Removing the line resumes it: the next plan starts the instance,
+	// republishes the route and converges the manifest like any other service. Data volumes are untouched.
+	Paused bool `yaml:"paused,omitempty" json:"paused,omitempty"`
 }
 
 // Unit is the systemd unit (and /etc/default/<name>) this service runs: Service when set, else the

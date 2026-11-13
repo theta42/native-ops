@@ -464,6 +464,11 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 	if !incus.ValidName(svc.Name) {
 		return fmt.Errorf("invalid service name %q", svc.Name)
 	}
+	// Paused is the one manifest line that outranks every deploy path: a tag roll, a reconcile or a direct
+	// deploy must not start a service the fleet says is out of service.
+	if svc.Paused {
+		return d.PauseService(ctx, svc)
+	}
 	d.log("==> [Deploy] Reconciling service: %s\n", svc.Name)
 	deployRef, fp := d.resolveServiceImage(ctx, svc.Image)
 	exists, err := d.incus.InstanceExists(ctx, svc.Name)
@@ -474,6 +479,40 @@ func (d *Deployer) DeployService(ctx context.Context, svc *config.ServiceConfig,
 		return d.deployFresh(ctx, svc, configDir, deployRef)
 	}
 	return d.converge(ctx, svc, configDir, deployRef, fp)
+}
+
+// PauseService puts a paused service out of service and nothing more: an existing instance is stopped and
+// its route is replaced with a static 503. It never creates, replaces or converges anything, and the data
+// volumes stay attached to the (stopped) instance, so resuming is removing `paused:` from the manifest.
+func (d *Deployer) PauseService(ctx context.Context, svc *config.ServiceConfig) error {
+	if !incus.ValidName(svc.Name) {
+		return fmt.Errorf("invalid service name %q", svc.Name)
+	}
+	d.log("==> [Deploy] %s is paused\n", svc.Name)
+	status, exists, err := d.incus.InstanceStatus(ctx, svc.Name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		d.log("    %s does not exist and is paused; it is not created\n", svc.Name)
+	} else if status == "Running" {
+		d.log("    stopping %s (paused)\n", svc.Name)
+		if err := d.incus.StopInstance(ctx, "", svc.Name, 0); err != nil {
+			return err
+		}
+	}
+	if svc.Routing == nil || svc.Routing.External || svc.Routing.Domain == "" || svc.Name == d.caddy.Container() {
+		return nil
+	}
+	edge, err := d.incus.InstanceExists(ctx, d.caddy.Container())
+	if err != nil {
+		return err
+	}
+	if !edge {
+		d.log("    there is no edge to answer %s\n", svc.Routing.Domain)
+		return nil
+	}
+	return d.caddy.Suspend(ctx, svc.Name, *svc.Routing, "paused by the fleet configuration")
 }
 
 func (d *Deployer) profilesOf(svc *config.ServiceConfig) []string {
@@ -682,6 +721,20 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 	st, err := d.incus.CaptureInstanceState(ctx, svc.Name)
 	if err != nil {
 		return err
+	}
+	// A stopped instance is started, not converged around: `paused:` was removed, or the host rebooted
+	// without it. Start it and wait for its address so the health check and the route have something to
+	// talk to; the rest of this function then converges the manifest as usual.
+	if status, _, err := d.incus.InstanceStatus(ctx, svc.Name); err != nil {
+		return err
+	} else if status != "Running" {
+		d.log("    %s is stopped; starting it\n", svc.Name)
+		if err := d.incus.StartInstance(ctx, "", svc.Name); err != nil {
+			return err
+		}
+		if _, err := d.incus.ContainerIPv4(ctx, svc.Name, 60*time.Second); err != nil {
+			return err
+		}
 	}
 
 	// Which image is wanted, and is that what runs?

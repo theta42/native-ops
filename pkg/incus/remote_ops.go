@@ -133,8 +133,12 @@ func (c *Client) SnapshotVolumeAt(ctx context.Context, remote, pool, volume, sna
 
 // StopInstance stops an instance and waits up to timeoutSec for a clean shutdown.
 func (c *Client) StopInstance(ctx context.Context, remote, name string, timeoutSec int) error {
-	if err := checkRemote(remote); err != nil {
-		return err
+	// An empty remote is the local one (Ref and CaptureInstanceStateAt agree); only a named remote is
+	// checked, so a caller converging a local service does not have to invent a remote name.
+	if remote != "" {
+		if err := checkRemote(remote); err != nil {
+			return err
+		}
 	}
 	cmd := "incus stop " + ShQuote(Ref(remote, name))
 	if timeoutSec > 0 {
@@ -148,8 +152,10 @@ func (c *Client) StopInstance(ctx context.Context, remote, name string, timeoutS
 
 // StartInstance starts an instance.
 func (c *Client) StartInstance(ctx context.Context, remote, name string) error {
-	if err := checkRemote(remote); err != nil {
-		return err
+	if remote != "" {
+		if err := checkRemote(remote); err != nil {
+			return err
+		}
 	}
 	if _, err := c.exec.Run(ctx, "incus start "+ShQuote(Ref(remote, name))); err != nil {
 		return fmt.Errorf("start %s: %w", Ref(remote, name), err)

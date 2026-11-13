@@ -351,12 +351,24 @@ func TestPlanFlagsWhatApplyWouldRefuse(t *testing.T) {
 		}
 	})
 
-	t.Run("a stopped instance cannot be health-checked or routed to", func(t *testing.T) {
-		sim, _, svc := deployedGitea(t)
+	t.Run("a stopped instance is started, not blocked", func(t *testing.T) {
+		// It used to block: a stopped instance has no address, so apply could not health-check or route it.
+		// That made a deliberately stopped service (or a host that rebooted) dead-end every deploy, and a
+		// resumed one impossible. A stopped instance the manifest still declares is started instead.
+		sim, d, svc := deployedGitea(t)
 		sim.ctrs["gitea"].status, sim.ctrs["gitea"].ip = "Stopped", ""
 		p := plan(t, sim, svc)
-		if p.Action != ActionBlocked || !strings.Contains(strings.Join(p.Blockers, " "), "no IPv4") {
-			t.Fatalf("got %+v", p)
+		if len(p.Blockers) != 0 {
+			t.Fatalf("a stopped instance must not block: %+v", p)
+		}
+		if p.Action != ActionUpdate || !sameKinds(kindsOf(p), ChangeStart) {
+			t.Fatalf("want a single start change, got %+v", p)
+		}
+		if err := d.DeployService(ctx, svc, t.TempDir()); err != nil {
+			t.Fatalf("apply must start it: %v", err)
+		}
+		if sim.ctrs["gitea"].status != "Running" {
+			t.Fatal("apply left it stopped")
 		}
 	})
 
@@ -397,15 +409,19 @@ func TestExternalRouteDoesNotNeedAnAddress(t *testing.T) {
 	sim.ctrs["gitea"].status, sim.ctrs["gitea"].ip = "Stopped", ""
 	delete(sim.ctrs["edge"].files, "/etc/caddy/sites/gitea.caddy")
 	p := plan(t, sim, svc)
-	if p.Action != ActionNone || len(p.Blockers) != 0 || len(p.Changes) != 0 {
+	// A stopped instance is started (see the paused/resume tests); an external route still publishes no
+	// site file and needs no address of its own.
+	if len(p.Blockers) != 0 || !sameKinds(kindsOf(p), ChangeStart) {
 		t.Fatalf("an external route is not published and does not need an address: %+v", p)
 	}
 	sim.reset()
 	if err := d.DeployService(context.Background(), svc, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	if m := sim.mutations(); len(m) != 0 {
-		t.Fatalf("apply must not publish a site file: %v", m)
+	for _, m := range sim.mutations() {
+		if strings.Contains(m, "/etc/caddy") {
+			t.Fatalf("apply must not publish a site file for an external route: %s", m)
+		}
 	}
 	if _, ok := sim.ctrs["edge"].files["/etc/caddy/sites/gitea.caddy"]; ok {
 		t.Fatal("the site file must stay absent")

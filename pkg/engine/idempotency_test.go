@@ -268,6 +268,18 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		}
 		c.status = "Running"
 		c.restarts++
+	case strings.HasPrefix(cmd, "incus start "):
+		// A stopped instance that comes back up: incus assigns it an address when it starts, and a test
+		// that resumes a paused service depends on that (the route is published to it).
+		c, ok := s.get(arg(0))
+		if !ok {
+			return "", errors.New("Error: Instance not found")
+		}
+		c.status = "Running"
+		if c.ip == "" {
+			s.nextIP++
+			c.ip = fmt.Sprintf("10.0.100.%d", s.nextIP)
+		}
 	case simPullRe.MatchString(cmd):
 		m := simPullRe.FindStringSubmatch(cmd)
 		c, ok := s.get(m[1])

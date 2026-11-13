@@ -31,6 +31,12 @@ const (
 	ChangeUpdateRoute    = "update-route"
 	ChangeBaseCaddyfile  = "create-base-caddyfile"
 	ChangeRunHook        = "run-hook"
+	// ChangeStop and ChangeSuspendRoute belong to a paused service: the instance is stopped, and its route
+	// answers 503 until the manifest stops saying paused. ChangeStart is the way back: a stopped instance
+	// the manifest still declares is started rather than reported as a blocker.
+	ChangeStop         = "stop"
+	ChangeStart        = "start"
+	ChangeSuspendRoute = "suspend-route"
 )
 
 // Actions a service plan can have.
@@ -99,6 +105,14 @@ func (d *Deployer) PlanService(ctx context.Context, svc *config.ServiceConfig, c
 	if !incus.ValidName(svc.Name) {
 		return nil, fmt.Errorf("invalid service name %q", svc.Name)
 	}
+	if svc.Paused {
+		p, err := d.planPaused(ctx, svc)
+		if err != nil {
+			return nil, err
+		}
+		p.bind = d.bindOf(svc, configDir)
+		return p, nil
+	}
 	p := &ServicePlan{Service: svc.Name}
 	deployRef, fp := d.resolveServiceImage(ctx, svc.Image)
 	exists, err := d.incus.InstanceExists(ctx, svc.Name)
@@ -115,6 +129,50 @@ func (d *Deployer) PlanService(ctx context.Context, svc *config.ServiceConfig, c
 	}
 	p.finish(exists)
 	p.bind = d.bindOf(svc, configDir)
+	return p, nil
+}
+
+// planPaused plans a service whose manifest says `paused:`. It is never created, and an existing instance
+// is stopped and its route answered with a 503; nothing else about it is planned. That is what keeps a
+// deliberately stopped service from blocking every deploy: a stopped instance has no IPv4 address, so the
+// converge path would refuse to health-check or route it. An image that moved is not rolled either, since
+// the image is never compared while the service stays paused.
+func (d *Deployer) planPaused(ctx context.Context, svc *config.ServiceConfig) (*ServicePlan, error) {
+	p := &ServicePlan{Service: svc.Name, Action: ActionNone}
+	status, exists, err := d.incus.InstanceStatus(ctx, svc.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		p.note("paused: not created while it stays paused")
+	} else if status == "Running" {
+		p.add(ChangeStop, "paused: the instance is stopped")
+	}
+	if svc.Routing != nil && !svc.Routing.External && svc.Routing.Domain != "" && svc.Name != d.caddy.Container() {
+		edge, err := d.incus.InstanceExists(ctx, d.caddy.Container())
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case !edge:
+			p.note("paused: there is no edge to answer %s, so no route is published", svc.Routing.Domain)
+		default:
+			published, suspended, err := d.caddy.SiteState(ctx, svc.Name)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case published && !suspended:
+				p.add(ChangeSuspendRoute, "%s answers 503 while %s is paused", svc.Routing.Domain, svc.Name)
+			case !published:
+				p.note("paused: no route is published for %s", svc.Routing.Domain)
+			}
+		}
+	}
+	p.note("paused: image, environment, volumes, limits and hooks are not converged")
+	if len(p.Changes) > 0 {
+		p.Action = ActionUpdate
+	}
 	return p, nil
 }
 
@@ -253,6 +311,11 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 	if err != nil {
 		return err
 	}
+	status, _, err := d.incus.InstanceStatus(ctx, svc.Name)
+	if err != nil {
+		return err
+	}
+	stopped := status != "Running"
 
 	replace := false
 	switch imageDecision(st, fp, deployRef) {
@@ -344,18 +407,31 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 		p.note("profiles of %s differ (live %v, declared %v); apply does not change profiles", svc.Name, st.Profiles, d.profilesOf(svc))
 	}
 
-	// A running instance is health-checked and routed to by address. A stopped one has none, and
-	// apply would fail waiting for it, unless it is being replaced (the replacement gets its own).
+	// A running instance is health-checked and routed to by address. A stopped one is STARTED rather than
+	// blocked: it having no address is a reason to bring it up, not a reason to refuse the deploy. That is
+	// what makes `paused:` reversible and a rebooted service converge again.
 	var ips []string
+	if stopped && !replace {
+		p.add(ChangeStart, "%s is stopped; apply starts it, then health-checks and routes it as the manifest says", svc.Name)
+	}
 	if svc.HealthCheck.Path != "" || routeManaged(svc) {
-		ips, err = d.incus.GlobalIPv4s(ctx, svc.Name)
-		if err != nil {
-			return err
+		if stopped && !replace {
+			// No address to plan a route against; apply publishes it once the instance is up (converge starts
+			// the instance before it reaches the route step).
+			p.note("the route of %s is published after it is started", svc.Name)
+		} else {
+			ips, err = d.incus.GlobalIPv4s(ctx, svc.Name)
+			if err != nil {
+				return err
+			}
+			if len(ips) == 0 && !replace {
+				p.block("%s has no IPv4 address (is it stopped?), so apply could not health-check it or route to it", svc.Name)
+				return nil
+			}
 		}
-		if len(ips) == 0 && !replace {
-			p.block("%s has no IPv4 address (is it stopped?), so apply could not health-check it or route to it", svc.Name)
-			return nil
-		}
+	}
+	if stopped && !replace {
+		return nil
 	}
 	mode := routeExisting
 	if replace {
@@ -780,6 +856,14 @@ func (d *Deployer) ApplyPlan(ctx context.Context, configDir string, plan *FleetP
 		svcs, err := config.LoadServices(configDir, sp.Service)
 		if err != nil || len(svcs) != 1 {
 			return fmt.Errorf("service %s is in the plan but its manifest could not be loaded", sp.Service)
+		}
+		// A paused service is put out of service, never converged: stop the instance and answer its route
+		// with 503, so a deliberate downtime cannot start it or roll an image onto it.
+		if svcs[0].Paused {
+			if err := d.PauseService(ctx, svcs[0]); err != nil {
+				return fmt.Errorf("apply %s: %w", sp.Service, err)
+			}
+			continue
 		}
 		if err := d.DeployService(ctx, svcs[0], configDir); err != nil {
 			return fmt.Errorf("apply %s: %w", sp.Service, err)

@@ -404,6 +404,11 @@ env_from:
 labels:
   environment: production
   app: gitea
+# Out of service on purpose, without deleting anything: apply stops the instance and its route answers a
+# 503, and nothing else about it is converged - a moved `:latest` does not roll it, and being stopped does
+# not block other services' deploys (a stopped instance has no address, which used to block the whole plan).
+# Remove the line to resume: the next apply starts it, republishes its route and converges the manifest.
+# paused: true
 healthcheck:
   path: /
   port: 3000

@@ -92,6 +92,33 @@ forwards:
 	}
 }
 
+func TestAServiceCanBeDeclaredPaused(t *testing.T) {
+	tmpDir := t.TempDir()
+	svcPath := filepath.Join(tmpDir, "service.yml")
+	if err := os.WriteFile(svcPath, []byte("name: twenty\nimage: docker:twentycrm/twenty:v2.50.1\npaused: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := LoadServiceConfig(svcPath)
+	if err != nil {
+		t.Fatalf("LoadServiceConfig: %v", err)
+	}
+	if !svc.Paused {
+		t.Fatal("paused: true must load as Paused")
+	}
+	// The default is not paused, so every manifest written before the field existed plans as it did.
+	other := filepath.Join(tmpDir, "other.yml")
+	if err := os.WriteFile(other, []byte("name: crew\nimage: opsavor-crew:latest\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := LoadServiceConfig(other)
+	if err != nil {
+		t.Fatalf("LoadServiceConfig: %v", err)
+	}
+	if plain.Paused {
+		t.Fatal("a manifest without paused: must not be paused")
+	}
+}
+
 func TestServiceUnitOverride(t *testing.T) {
 	// Unit() falls back to the instance name, or uses Service when it is set.
 	if got := (ServiceConfig{Name: "git-mcp"}).Unit(); got != "git-mcp" {
