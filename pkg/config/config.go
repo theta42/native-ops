@@ -552,7 +552,20 @@ type ServiceConfig struct {
 	// that host's daemon plans and applies it (see FleetConfig.DaemonHost); the others show it as skipped.
 	// json omitempty: a manifest without host: digests (bindOf) exactly as it did before the field existed.
 	Host string `yaml:"host,omitempty" json:",omitempty"`
+	// State declares whether the container runs: "running" (the default when absent), or "stopped".
+	// A stopped service is left in place with its volumes: plan shows a stop, apply stops it, and a
+	// later deploy with state running (or the field removed) starts it again. Anything else is
+	// refused at load.
+	State string `yaml:"state,omitempty" json:",omitempty"`
 }
+
+// Desired states a service manifest may declare for its container. Absent
+// (empty) behaves exactly as before: whatever runs is converged, never
+// started or stopped for the field's sake.
+const (
+	ServiceStateRunning = "running"
+	ServiceStateStopped = "stopped"
+)
 
 // Unit is the systemd unit (and /etc/default/<name>) this service runs: Service when set, else the
 // instance Name. A service whose unit is not named after its instance (env file, restart) declares
@@ -677,6 +690,9 @@ func LoadServiceConfig(path string) (*ServiceConfig, error) {
 	}
 	if err := validateVolumeSnapshots(svc.Volumes); err != nil {
 		return nil, fmt.Errorf("service config %s: %w", path, err)
+	}
+	if svc.State != "" && svc.State != ServiceStateRunning && svc.State != ServiceStateStopped {
+		return nil, fmt.Errorf("service config %s: state %q must be %q or %q", path, svc.State, ServiceStateRunning, ServiceStateStopped)
 	}
 
 	return &svc, nil

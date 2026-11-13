@@ -261,6 +261,12 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 		} else if c, ok := s.get(name); ok {
 			c.status = "Stopped"
 		}
+	case strings.HasPrefix(cmd, "incus start "):
+		c, ok := s.get(arg(0))
+		if !ok {
+			return "", errors.New("Error: Instance not found")
+		}
+		c.status = "Running"
 	case strings.HasPrefix(cmd, "incus restart "):
 		c, ok := s.get(arg(0))
 		if !ok {

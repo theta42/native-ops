@@ -31,6 +31,8 @@ const (
 	ChangeUpdateRoute    = "update-route"
 	ChangeBaseCaddyfile  = "create-base-caddyfile"
 	ChangeRunHook        = "run-hook"
+	ChangeStopService    = "stop-service"
+	ChangeStartService   = "start-service"
 )
 
 // Actions a service plan can have.
@@ -252,6 +254,30 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 	st, err := d.incus.CaptureInstanceState(ctx, svc.Name)
 	if err != nil {
 		return err
+	}
+
+	// A declared state is converged before anything else: a stopped service is
+	// stopped in place (volumes, image and env are left for its next start),
+	// and an explicitly started one is started before the rest is converged.
+	if svc.State == config.ServiceStateStopped {
+		running, err := d.containerRunning(ctx, svc.Name)
+		if err != nil {
+			return err
+		}
+		if running {
+			p.add(ChangeStopService, "stop %s (the container and its volumes are kept)", svc.Name)
+			return nil
+		}
+		return nil
+	}
+	if svc.State == config.ServiceStateRunning {
+		running, err := d.containerRunning(ctx, svc.Name)
+		if err != nil {
+			return err
+		}
+		if !running {
+			p.add(ChangeStartService, "start %s", svc.Name)
+		}
 	}
 
 	replace := false
