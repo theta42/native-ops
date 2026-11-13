@@ -483,6 +483,34 @@ func (d *Deployer) profilesOf(svc *config.ServiceConfig) []string {
 	return svc.Profiles
 }
 
+// containerRunning reports whether the named container exists and is running.
+func (d *Deployer) containerRunning(ctx context.Context, name string) (bool, error) {
+	status, exists, err := d.incus.InstanceStatus(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	return exists && status == "Running", nil
+}
+
+// stopService stops a container in place: it is never deleted, its volumes
+// are never touched, and nothing is purged.
+func (d *Deployer) stopService(ctx context.Context, svc *config.ServiceConfig) error {
+	d.log("    Stopping %s (declared stopped; the container and its volumes are kept)\n", svc.Name)
+	if _, err := d.exec.Run(ctx, fmt.Sprintf("incus stop %s", incus.ShQuote(svc.Name))); err != nil {
+		return fmt.Errorf("stop %s: %w", svc.Name, err)
+	}
+	return nil
+}
+
+// startService starts a stopped container.
+func (d *Deployer) startService(ctx context.Context, svc *config.ServiceConfig) error {
+	d.log("    Starting %s (declared running)\n", svc.Name)
+	if _, err := d.exec.Run(ctx, fmt.Sprintf("incus start %s", incus.ShQuote(svc.Name))); err != nil {
+		return fmt.Errorf("start %s: %w", svc.Name, err)
+	}
+	return nil
+}
+
 func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, configDir, deployRef string) error {
 	d.log("    %s does not exist yet; launching\n", svc.Name)
 	for _, vol := range svc.Volumes {
@@ -550,6 +578,17 @@ func (d *Deployer) deployFresh(ctx context.Context, svc *config.ServiceConfig, c
 		return err
 	} else if changed {
 		d.log("    Environment for %s is in place\n", svc.Name)
+	}
+
+	// A fresh container that declares stopped never serves: stop it here, so
+	// one deploy converges fully. Health, route and post-deploy need a live
+	// service; they run on the deploy that starts it.
+	if svc.State == config.ServiceStateStopped {
+		if err := d.stopService(ctx, svc); err != nil {
+			return err
+		}
+		d.log("    %s stays unpublished until it is started (declared stopped)\n", svc.Name)
+		return nil
 	}
 
 	ip, err := d.incus.GetContainerIP(ctx, svc.Name)
@@ -679,6 +718,31 @@ func limitsDrift(st *incus.InstanceState, limits map[string]string) map[string]s
 }
 
 func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, configDir, deployRef, fp string) error {
+	// A declared stop wins over every other convergence: stop the container
+	// in place and leave the image, env, volumes and route for its next start.
+	if svc.State == config.ServiceStateStopped {
+		running, err := d.containerRunning(ctx, svc.Name)
+		if err != nil {
+			return err
+		}
+		if running {
+			return d.stopService(ctx, svc)
+		}
+		d.log("    %s is already stopped (declared stopped)\n", svc.Name)
+		return nil
+	}
+	// An explicit start happens before the rest is converged.
+	if svc.State == config.ServiceStateRunning {
+		running, err := d.containerRunning(ctx, svc.Name)
+		if err != nil {
+			return err
+		}
+		if !running {
+			if err := d.startService(ctx, svc); err != nil {
+				return err
+			}
+		}
+	}
 	st, err := d.incus.CaptureInstanceState(ctx, svc.Name)
 	if err != nil {
 		return err

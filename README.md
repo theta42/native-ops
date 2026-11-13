@@ -426,6 +426,12 @@ forwards:
     protocol: tcp   # optional; tcp (default) or udp
     listen: 2222    # host port, or "address:port" (default 0.0.0.0)
     target: 2222    # instance port, or "address:port" (default 127.0.0.1)
+# Whether the container runs. Absent (the default) changes nothing: whatever runs is
+# converged, never started or stopped for this field. `stopped` stops a running container
+# in place (never deleted, volumes and route kept; health, route and post-deploy are skipped
+# for a fresh container that declares stopped). `running` starts a stopped one before the
+# rest is converged. Anything else is refused when the manifest loads.
+# state: stopped
 ```
 
 A route's `cache` and `rate_limit` are rendered into the site file native-ops publishes, inside a
