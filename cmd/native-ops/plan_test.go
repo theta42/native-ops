@@ -21,7 +21,7 @@ func fakeIncus(t *testing.T, edgeExists, webExists bool) (logFile string) {
 		edge = `[{"name":"edge"}]`
 	}
 	if webExists {
-		web = `[{"name":"web","state":{"network":{"eth0":{"addresses":[{"family":"inet","address":"10.0.100.5","scope":"global"}]}}}}]`
+		web = `[{"name":"web","status":"Running","state":{"network":{"eth0":{"addresses":[{"family":"inet","address":"10.0.100.5","scope":"global"}]}}}}]`
 	}
 	script := `#!/bin/bash
 echo "$*" >> ` + logFile + `
