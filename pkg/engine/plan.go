@@ -257,8 +257,7 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 	}
 
 	// A declared state is converged before anything else: a stopped service is
-	// stopped in place (volumes, image and env are left for its next start),
-	// and an explicitly started one is started before the rest is converged.
+	// stopped in place (volumes, image and env are left for its next start).
 	if svc.State == config.ServiceStateStopped {
 		running, err := d.containerRunning(ctx, svc.Name)
 		if err != nil {
@@ -270,15 +269,17 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 		}
 		return nil
 	}
-	if svc.State == config.ServiceStateRunning {
-		running, err := d.containerRunning(ctx, svc.Name)
-		if err != nil {
-			return err
-		}
-		if !running {
-			p.add(ChangeStartService, "start %s", svc.Name)
-		}
+
+	// Running is the default: `state: running` or no `state:` at all means the container should be up, so
+	// one that is down is started. That covers removing `state: stopped` (resuming a paused service), a
+	// host that rebooted, and a container stopped by hand. It must be a start and not a blocker: a stopped
+	// container has no address, so the route check below cannot pass, and blocking here is what used to
+	// make one stopped service refuse every other service's deploy.
+	running, err := d.containerRunning(ctx, svc.Name)
+	if err != nil {
+		return err
 	}
+	starting := !running
 
 	replace := false
 	switch imageDecision(st, fp, deployRef) {
@@ -298,6 +299,11 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 		for _, h := range hooksOf(svc) {
 			p.add(ChangeRunHook, "%s", h)
 		}
+	}
+	// A replacement is launched anyway, so it brings the service up by itself; a start is a change only
+	// when nothing else does.
+	if starting && !replace {
+		p.add(ChangeStartService, "start %s", svc.Name)
 	}
 
 	// Labels are applied live whether or not the image is replaced (a replacement carries the old ones over,
@@ -370,18 +376,25 @@ func (d *Deployer) planConverge(ctx context.Context, p *ServicePlan, svc *config
 		p.note("profiles of %s differ (live %v, declared %v); apply does not change profiles", svc.Name, st.Profiles, d.profilesOf(svc))
 	}
 
-	// A running instance is health-checked and routed to by address. A stopped one has none, and
-	// apply would fail waiting for it, unless it is being replaced (the replacement gets its own).
+	// A running instance is health-checked and routed to by address. A stopped one has none: apply starts
+	// it first, so its route is published after that, not planned against an address it does not have yet.
 	var ips []string
 	if svc.HealthCheck.Path != "" || routeManaged(svc) {
-		ips, err = d.incus.GlobalIPv4s(ctx, svc.Name)
-		if err != nil {
-			return err
+		if starting && !replace {
+			p.note("the route of %s is published after it is started", svc.Name)
+		} else {
+			ips, err = d.incus.GlobalIPv4s(ctx, svc.Name)
+			if err != nil {
+				return err
+			}
+			if len(ips) == 0 && !replace {
+				p.block("%s has no IPv4 address (is it stopped?), so apply could not health-check it or route to it", svc.Name)
+				return nil
+			}
 		}
-		if len(ips) == 0 && !replace {
-			p.block("%s has no IPv4 address (is it stopped?), so apply could not health-check it or route to it", svc.Name)
-			return nil
-		}
+	}
+	if starting && !replace {
+		return nil
 	}
 	mode := routeExisting
 	if replace {

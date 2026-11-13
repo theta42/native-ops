@@ -267,6 +267,11 @@ func (s *hostSim) Run(_ context.Context, cmd string) (string, error) {
 			return "", errors.New("Error: Instance not found")
 		}
 		c.status = "Running"
+		if c.ip == "" {
+			// incus gives a started container an address; a route published after a start needs one.
+			s.nextIP++
+			c.ip = fmt.Sprintf("10.0.100.%d", s.nextIP)
+		}
 	case strings.HasPrefix(cmd, "incus restart "):
 		c, ok := s.get(arg(0))
 		if !ok {

@@ -732,15 +732,17 @@ func (d *Deployer) converge(ctx context.Context, svc *config.ServiceConfig, conf
 		return nil
 	}
 	// An explicit start happens before the rest is converged.
-	if svc.State == config.ServiceStateRunning {
-		running, err := d.containerRunning(ctx, svc.Name)
-		if err != nil {
+	running, err := d.containerRunning(ctx, svc.Name)
+	if err != nil {
+		return err
+	}
+	if !running {
+		if err := d.startService(ctx, svc); err != nil {
 			return err
 		}
-		if !running {
-			if err := d.startService(ctx, svc); err != nil {
-				return err
-			}
+		// The route is published to an address, and a container that has just started has none yet.
+		if _, err := d.incus.ContainerIPv4(ctx, svc.Name, 60*time.Second); err != nil {
+			return err
 		}
 	}
 	st, err := d.incus.CaptureInstanceState(ctx, svc.Name)

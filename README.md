@@ -426,11 +426,14 @@ forwards:
     protocol: tcp   # optional; tcp (default) or udp
     listen: 2222    # host port, or "address:port" (default 0.0.0.0)
     target: 2222    # instance port, or "address:port" (default 127.0.0.1)
-# Whether the container runs. Absent (the default) changes nothing: whatever runs is
-# converged, never started or stopped for this field. `stopped` stops a running container
-# in place (never deleted, volumes and route kept; health, route and post-deploy are skipped
-# for a fresh container that declares stopped). `running` starts a stopped one before the
-# rest is converged. Anything else is refused when the manifest loads.
+# Whether the container runs. Absent (the default) means running: a stopped container is
+# started (a host reboot, a manual stop, or a service coming back from `stopped`), and a
+# running one is converged as usual. `stopped` stops a running container in place (never
+# deleted, volumes and route kept; health, route and post-deploy are skipped for a fresh
+# container that declares stopped). `running` says the same as absent, explicitly. A
+# stopped container is never a blocker: apply starts it before it health-checks or routes
+# it, so one paused service cannot refuse every other service's deploy. Anything else is
+# refused when the manifest loads.
 # state: stopped
 ```
 
