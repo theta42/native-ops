@@ -23,7 +23,11 @@ custom_volumes() {
   incus storage volume list "$POOL" --format json | python3 -c '
 import json, sys
 for v in json.load(sys.stdin):
-    if v.get("type") == "custom":
+    # Only volumes an instance actually uses. A detached custom volume is a leftover (a deleted tenant, an
+    # old volume name): snapshotting it copies nothing forward and keeps the leftover alive for ever, one
+    # full copy per night on the dir driver. Attached volumes include stopped instances, whose data still
+    # matters; a tenant volume that was purged is not listed at all.
+    if v.get("type") == "custom" and v.get("used_by"):
         print(v["name"])
 '
 }
